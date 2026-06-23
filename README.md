@@ -94,7 +94,7 @@ Tests generate FM-modulated synthetic IQ data programmatically — no large fixt
 
 ### End-to-end decode check
 
-For a visual sanity check, use the workspace's `fpv_viewer` binary with `--debug`, which renders the full DDC → FM-demod → reconstruction pipeline live and dumps the first three frames to `/tmp/fpv_frame_*.png` before auto-exiting. See the top-level README for the full flag set.
+For a visual sanity check, use the [fpv-viewer-rs](https://github.com/isaacbentley/fpv-viewer-rs) binary with `--debug`, which renders the full DDC → FM-demod → reconstruction pipeline live and dumps the first three frames to `/tmp/fpv_frame_*.png` before auto-exiting. See the `fpv-viewer-rs` README for the full flag set.
 
 See [DESIGN.md](./DESIGN.md) for the full architecture and math.
 
