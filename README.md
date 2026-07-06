@@ -3,7 +3,6 @@
 [![CI](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-fpv-drone-analog-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
-[![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A high-performance Rust crate for detecting analog FPV drone video signals using FM demodulation and spectral sync-pulse analysis.
 
@@ -96,6 +95,15 @@ For a visual sanity check, use the [fpv-viewer-rs](https://github.com/isaacbentl
 
 See [DESIGN.md](./DESIGN.md) for the full architecture and math.
 
+## MSRV & Semver Policy
+
+- **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
+- **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`).
+
+## Contributing
+
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite and formatting your code before submitting a Pull Request.
+
 ## License
 
-This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](../../LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](LICENSE) file for details.
