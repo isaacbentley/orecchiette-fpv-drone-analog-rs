@@ -1,6 +1,6 @@
-use fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
-use fpv_drone_analog_rs::types::SignalType;
 use num_complex::Complex;
+use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
+use orecchiette_fpv_drone_analog_rs::types::SignalType;
 use std::f32::consts::PI;
 
 // ── Helper: generate FM-modulated IQ from a baseband sync signal ──────────
@@ -89,7 +89,7 @@ fn detect_sync_pulses_ntsc_narrowband() {
 
 #[test]
 fn detect_sync_pulses_noise_only_returns_unknown() {
-    use rand::Rng;
+    use rand::RngExt;
     let detector = AnalogFpvDetector::default();
     let sample_rate = 1_000_000u32;
     let n = 16384;
@@ -222,7 +222,7 @@ fn detect_from_iq_empty_signal_returns_nothing() {
     let n = 262_144;
 
     // Pure noise at -80 dBm level
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let iq: Vec<Complex<f32>> = (0..n)
         .map(|_| {

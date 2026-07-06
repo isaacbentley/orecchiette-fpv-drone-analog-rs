@@ -1,10 +1,8 @@
-# fpv-drone-analog-rs
+# orecchiette-fpv-drone-analog-rs
 
-[![CI](https://github.com/isaacbentley/orecchiette/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/fpv-drone-analog-rs.svg)](https://crates.io/crates/fpv-drone-analog-rs)
-[![Docs.rs](https://docs.rs/fpv-drone-analog-rs/badge.svg)](https://docs.rs/fpv-drone-analog-rs)
-[![Codecov](https://codecov.io/gh/isaacbentley/orecchiette/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/orecchiette)
-[![License](https://img.shields.io/crates/l/fpv-drone-analog-rs.svg)](https://crates.io/crates/fpv-drone-analog-rs)
+[![CI](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-fpv-drone-analog-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 [![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 A high-performance Rust crate for detecting analog FPV drone video signals using FM demodulation and spectral sync-pulse analysis.
@@ -27,7 +25,7 @@ A high-performance Rust crate for detecting analog FPV drone video signals using
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-fpv-drone-analog-rs = "0.1.0"
+orecchiette-fpv-drone-analog-rs = "0.1.0"
 num-complex = "0.4"
 ```
 
@@ -37,7 +35,7 @@ num-complex = "0.4"
 For isolated baseband signals where the FM carrier is already centered:
 
 ```rust
-use fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
+use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
 use num_complex::Complex;
 
 let detector = AnalogFpvDetector::default();
@@ -55,7 +53,7 @@ for res in &results {
 For wideband captures containing multiple signals at arbitrary frequencies:
 
 ```rust
-use fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
+use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
 use num_complex::Complex;
 
 let detector = AnalogFpvDetector::default();
@@ -87,7 +85,7 @@ Use `SignalType::is_analog_video()` to gate on "is this an analog FPV signal at 
 ## Testing
 
 ```bash
-cargo test -p fpv-drone-analog-rs
+cargo test -p orecchiette-fpv-drone-analog-rs
 ```
 
 Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), and PAL parity self-correction under 1-line V-sync offset.

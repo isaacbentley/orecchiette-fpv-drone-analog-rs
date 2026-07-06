@@ -1,12 +1,12 @@
-# Contributing to fpv-drone-analog-rs
+# Contributing to orecchiette-fpv-drone-analog-rs
 
-First off, thank you for considering contributing to `fpv-drone-analog-rs`! It's people like you that make the open-source SDR community thrive. This document explains how to set up your environment and verify your changes locally before opening a pull request.
+First off, thank you for considering contributing to `orecchiette-fpv-drone-analog-rs`! It's people like you that make the open-source SDR community thrive. This document explains how to set up your environment and verify your changes locally before opening a pull request.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/isaacbentley/fpv-drone-analog-rs.git
-cd fpv-drone-analog-rs
+git clone https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs.git
+cd orecchiette-fpv-drone-analog-rs
 
 # Run the standard validation suite
 cargo test

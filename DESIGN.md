@@ -1,6 +1,6 @@
-# Design: FPV Analog Drone Detection (fpv-drone-analog-rs)
+# Design: FPV Analog Drone Detection (orecchiette-fpv-drone-analog-rs)
 
-This document outlines the architectural and mathematical design of the `fpv-drone-analog-rs` crate, a high-confidence detection system for analog FPV drone video signals.
+This document outlines the architectural and mathematical design of the `orecchiette-fpv-drone-analog-rs` crate, a high-confidence detection system for analog FPV drone video signals.
 
 ## 1. Introduction
 Detecting analog FPV (First Person View) drones requires distinguishing a wideband FM video signal (typically 10-20 MHz wide) from common interference like Wi-Fi (20/40 MHz) and narrowband noise. This crate employs a **sliding DDC probe** pipeline that sweeps across the capture bandwidth, FM-demodulates at each position, and searches for characteristic video sync line rates.
