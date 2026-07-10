@@ -43,7 +43,7 @@ graph TD
 ## 3. Detection Logic
 
 ### Narrowband Fast Path
-When `sample_rate < min_bandwidth` (3 MHz), the signal is assumed to already be isolated at baseband. The detector runs FM demodulation and sync pulse detection directly.
+When `sample_rate < min_bandwidth` (default 3 MHz), the signal is assumed to already be isolated at baseband. The detector runs FM demodulation and sync pulse detection directly.
 
 ### Wideband Sliding DDC Probe
 For wideband captures (e.g., 100 MSPS), the detector sweeps the entire capture bandwidth:
@@ -52,7 +52,9 @@ For wideband captures (e.g., 100 MSPS), the detector sweeps the entire capture b
 
 2. **DDC + Decimation**: At each probe position, a Digital Down-Converter (NCO mixer) shifts the probe frequency to DC, then a boxcar low-pass filter decimates to 10 MSPS. This isolates a ~10 MHz slice around each probe center.
 
-3. **Energy Gating**: Mean power is computed at each probe position. The **25th percentile** of all probe energies is used as a robust noise floor estimate (resistant to FM signals covering large fractions of the bandwidth). Probes with energy ≥ 3 dB above this noise floor proceed to sync validation.
+3. **Energy Gating**: Mean power is computed at each probe position. The **25th percentile** of all probe energies is used as a robust noise floor estimate (resistant to FM signals covering large fractions of the bandwidth). Probes with energy exceeding the noise floor by `energy_threshold_db` (default 3.0 dB, linear multiplier: $10^{\text{energy\_threshold\_db} / 10.0}$) proceed to sync validation.
+
+Additionally, all finalized detection events are filtered to only return results whose bandwidth falls within the `min_bandwidth` and `max_bandwidth` thresholds.
 
 4. **FM Demodulation**: The isolated I/Q is FM-demodulated via the differentiate-and-multiply discriminator: `arg(z[n] × conj(z[n-1]))`. This recovers the baseband video signal where sync pulses are encoded as instantaneous frequency excursions.
 

@@ -187,11 +187,13 @@ pub fn get_all_channels() -> Vec<FpvChannel> {
 /// viewer and the main orchestrator can use it.
 pub fn lookup_channel_by_name(name: &str) -> Option<u64> {
     let name = name.trim().to_uppercase();
-    if name.len() < 2 {
+    let mut chars = name.chars();
+    let first_char = chars.next()?;
+    let channel_str: String = chars.collect();
+    if !first_char.is_ascii() {
         return None;
     }
-    let band_char = name.as_bytes()[0];
-    let channel_str = &name[1..];
+    let band_char = first_char as u8;
     let channel_num: usize = channel_str.parse().ok()?;
     if !(1..=8).contains(&channel_num) {
         return None;
@@ -234,6 +236,13 @@ mod tests {
         assert_eq!(lookup_channel_by_name(""), None);
         assert_eq!(lookup_channel_by_name("A"), None);
         assert_eq!(lookup_channel_by_name("1A"), None);
+    }
+
+    #[test]
+    fn lookup_non_ascii_safety() {
+        assert_eq!(lookup_channel_by_name("你好"), None);
+        assert_eq!(lookup_channel_by_name("A\u{301}"), None);
+        assert_eq!(lookup_channel_by_name("東1"), None);
     }
 
     #[test]

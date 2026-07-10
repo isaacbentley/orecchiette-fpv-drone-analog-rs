@@ -31,7 +31,7 @@ pub struct AnalogFpvDetector {
 impl Default for AnalogFpvDetector {
     fn default() -> Self {
         Self {
-            energy_threshold_db: 6.0, // 6dB above noise floor (FM video is wideband, lower SNR per bin)
+            energy_threshold_db: 3.0, // 3dB above noise floor (FM video is wideband, lower SNR per bin)
             min_bandwidth: 3_000_000, // 3 MHz
             max_bandwidth: 30_000_000, // 30 MHz (FM video can be ~20 MHz wide)
             planner: RefCell::new(FftPlanner::new()),
@@ -534,6 +534,25 @@ impl FpvDetector for AnalogFpvDetector {
             return vec![];
         }
 
+        let nan_count = iq_data.iter().filter(|s| !s.re.is_finite() || !s.im.is_finite()).count();
+        let sanitized_iq;
+        let iq_data = if nan_count > 0 {
+            log::warn!("Sanitized {} non-finite samples (NaN/Inf) to zero in Analog processing", nan_count);
+            sanitized_iq = iq_data
+                .iter()
+                .map(|s| {
+                    if s.re.is_finite() && s.im.is_finite() {
+                        *s
+                    } else {
+                        Complex::new(0.0, 0.0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            &sanitized_iq[..]
+        } else {
+            iq_data
+        };
+
         let mut final_results = Vec::new();
 
         // Fast path for narrow-band / already-baseband signals. The
@@ -607,7 +626,8 @@ impl FpvDetector for AnalogFpvDetector {
                 0.0
             };
             let max_energy = sorted_e.last().copied().unwrap_or(0.0);
-            let energy_thresh = (noise_floor * 2.0).max(0.001).min(max_energy * 0.5); // ≥3 dB above noise, but don't exclude the peak
+            let multiplier = 10.0f32.powf(self.energy_threshold_db / 10.0);
+            let energy_thresh = (noise_floor * multiplier).max(0.001).min(max_energy * 0.5); // ≥3 dB above noise, but don't exclude the peak
 
             // Collect all positive detections from the sweep
             let mut sweep_hits: Vec<(f64, f32, SignalType, f32)> = Vec::new(); // (freq_hz, energy, type, conf)
@@ -694,6 +714,10 @@ impl FpvDetector for AnalogFpvDetector {
             }
             deduped.push(r);
         }
+
+        deduped.retain(|r| {
+            r.bandwidth_hz >= self.min_bandwidth && r.bandwidth_hz <= self.max_bandwidth
+        });
 
         deduped
     }
