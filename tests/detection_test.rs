@@ -434,14 +434,17 @@ fn is_analog_video_accepts_only_video_variants() {
 fn test_bandwidth_and_energy_threshold_filtering() {
     let mut detector = AnalogFpvDetector::default();
     detector.min_bandwidth = 5_000_000; // Filter out detections with bandwidth < 5 MHz
-    
+
     let sample_rate = 1_000_000u32; // narrowband, bandwidth = 1 MHz
     let n = 65536;
     let iq = make_fm_sync_iq(sample_rate, n, 15625.0, 75_000.0, 0.0);
     let results = detector.detect_from_iq(&iq, 5_800_000_000, sample_rate);
-    
+
     // Since 1 MHz < 5 MHz, it should be filtered out!
-    assert!(results.is_empty(), "Result should be filtered out because bandwidth 1 MHz < min_bandwidth 5 MHz");
+    assert!(
+        results.is_empty(),
+        "Result should be filtered out because bandwidth 1 MHz < min_bandwidth 5 MHz"
+    );
 
     // But if we lower min_bandwidth to 500_000 (500 kHz), it should succeed
     detector.min_bandwidth = 500_000;

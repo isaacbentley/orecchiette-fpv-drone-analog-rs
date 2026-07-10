@@ -534,10 +534,16 @@ impl FpvDetector for AnalogFpvDetector {
             return vec![];
         }
 
-        let nan_count = iq_data.iter().filter(|s| !s.re.is_finite() || !s.im.is_finite()).count();
+        let nan_count = iq_data
+            .iter()
+            .filter(|s| !s.re.is_finite() || !s.im.is_finite())
+            .count();
         let sanitized_iq;
         let iq_data = if nan_count > 0 {
-            log::warn!("Sanitized {} non-finite samples (NaN/Inf) to zero in Analog processing", nan_count);
+            log::warn!(
+                "Sanitized {} non-finite samples (NaN/Inf) to zero in Analog processing",
+                nan_count
+            );
             sanitized_iq = iq_data
                 .iter()
                 .map(|s| {
