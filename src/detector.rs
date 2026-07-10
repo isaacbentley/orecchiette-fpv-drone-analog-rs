@@ -32,7 +32,7 @@ impl Default for AnalogFpvDetector {
     fn default() -> Self {
         Self {
             energy_threshold_db: 3.0, // 3dB above noise floor (FM video is wideband, lower SNR per bin)
-            min_bandwidth: 3_000_000, // 3 MHz
+            min_bandwidth: 1_000_000, // 1 MHz
             max_bandwidth: 30_000_000, // 30 MHz (FM video can be ~20 MHz wide)
             planner: RefCell::new(FftPlanner::new()),
         }
@@ -576,6 +576,9 @@ impl FpvDetector for AnalogFpvDetector {
                     signal_type: sig_type,
                 });
             }
+            final_results.retain(|r| {
+                r.bandwidth_hz >= self.min_bandwidth && r.bandwidth_hz <= self.max_bandwidth
+            });
             return final_results;
         }
 
