@@ -470,6 +470,14 @@ impl FrameReconstructor {
         if demod_data.is_empty() {
             return None;
         }
+        // `frame` is a caller-supplied buffer; every write below indexes
+        // it assuming exactly `width * height` elements (the field-merge
+        // step even `copy_from_slice`s into `self.field_buf`, which is
+        // fixed at that size), so a mismatched buffer must be rejected
+        // here rather than panicking partway through.
+        if frame.len() != self.width * self.height {
+            return None;
+        }
 
         let fs = self.sample_rate as f32;
         let radians_per_volt = 2.0 * std::f32::consts::PI * self.fm_deviation / fs;
@@ -1211,5 +1219,51 @@ impl FrameReconstructor {
             file.write_all(&[r, g, b])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstruct_frame_into_rejects_mismatched_frame_buffer() {
+        let mut fr = FrameReconstructor::new(20_000_000, false, 200_000.0, false);
+        let demod_data = vec![0.0f32; 10_000];
+        // Deliberately not width * height.
+        let mut wrong_size_frame = vec![0u32; 10];
+        assert!(
+            fr.reconstruct_frame_into(&demod_data, &mut wrong_size_frame)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconstruct_frame_into_rejects_empty_demod_data() {
+        let mut fr = FrameReconstructor::new(20_000_000, false, 200_000.0, false);
+        let mut frame = vec![0u32; fr.width * fr.height];
+        assert!(fr.reconstruct_frame_into(&[], &mut frame).is_none());
+    }
+
+    #[test]
+    fn reconstruct_frame_handles_short_noise_without_panicking() {
+        // Regression test for the video reconstruction path: feed input
+        // far too short to contain a real field through the convenience
+        // wrapper (which sizes its own buffer correctly) and confirm it
+        // degrades to `None` rather than panicking on any of the
+        // internal index arithmetic.
+        let mut fr = FrameReconstructor::new(20_000_000, false, 200_000.0, false);
+        let demod_data = vec![0.01f32; 500];
+        assert!(fr.reconstruct_frame(&demod_data).is_none());
+    }
+
+    #[test]
+    fn reconstruct_frame_handles_degenerate_zero_sample_rate_without_panicking() {
+        // sample_rate = 0 makes samples_per_line / line_period 0 — an
+        // invalid config, but one that must degrade gracefully rather
+        // than panic (e.g. via division-by-zero-derived index math).
+        let mut fr = FrameReconstructor::new(0, false, 200_000.0, false);
+        let demod_data = vec![0.0f32; 1000];
+        assert!(fr.reconstruct_frame(&demod_data).is_none());
     }
 }

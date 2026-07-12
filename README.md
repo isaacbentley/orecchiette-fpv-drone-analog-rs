@@ -89,6 +89,8 @@ cargo test -p orecchiette-fpv-drone-analog-rs
 
 Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), and PAL parity self-correction under 1-line V-sync offset.
 
+`video::FrameReconstructor` additionally has regression tests confirming `reconstruct_frame_into` degrades to `None` rather than panicking on a mismatched output-buffer size, empty input, and degenerate configuration (`sample_rate = 0`).
+
 ### End-to-end decode check
 
 For a visual sanity check, use the [fpv-viewer-rs](https://github.com/isaacbentley/fpv-viewer-rs) binary with `--debug`, which renders the full DDC → FM-demod → reconstruction pipeline live and dumps the first three frames to `/tmp/fpv_frame_*.png` before auto-exiting. See the `fpv-viewer-rs` README for the full flag set.

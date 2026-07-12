@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "log",
  "num-complex",
