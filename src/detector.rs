@@ -153,7 +153,11 @@ impl AnalogFpvDetector {
         sample_rate: u32,
     ) -> (SignalType, f32) {
         let n = iq_data.len();
-        if n < 2048 {
+        // `sample_rate == 0` would make `bin_hz` zero and the line-rate bin
+        // indices (`15625 / bin_hz`) evaluate to `Inf as usize == usize::MAX`,
+        // overflowing `bin + range` in `get_peak_energy` (a debug panic).
+        // A zero-rate capture carries no meaning anyway — reject it up front.
+        if n < 2048 || sample_rate == 0 {
             return (SignalType::Unknown, 0.0);
         }
 
@@ -782,6 +786,18 @@ mod tests {
             "PAL pulse train rejected; sig={sig:?}, conf={conf}"
         );
         assert!(conf > 0.0);
+    }
+
+    /// A `sample_rate` of 0 must not panic (it would make the line-rate
+    /// bin index `Inf as usize` and overflow `bin + range`). Both the
+    /// direct classifier and the full `detect_from_iq` entry point must
+    /// degrade to "nothing" instead.
+    #[test]
+    fn zero_sample_rate_does_not_panic() {
+        let iq = vec![Complex::new(0.5, -0.5); 4096];
+        let det = AnalogFpvDetector::new(-20.0);
+        assert_eq!(det.detect_sync_pulses(&iq, 0).0, SignalType::Unknown);
+        assert!(det.detect_from_iq(&iq, 5_800_000_000, 0).is_empty());
     }
 
     #[test]

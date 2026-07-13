@@ -623,7 +623,11 @@ impl FrameReconstructor {
             let stabilised_period = sorted_history[sorted_history.len() / 2];
             self.line_period = stabilised_period;
 
-            if !self.has_prev {
+            // Debug telemetry only. This is a library — writing to the
+            // caller's stdout (the `fpv_viewer` TUI renders there) would
+            // corrupt their output, so gate on `debug_dump` like the
+            // `[SYNC RESID]` print below, not on `!has_prev`.
+            if self.debug_dump && !self.has_prev {
                 let _ = writeln!(
                     std::io::stdout(),
                     "TBC: median line period = {:.3} samples ({} intervals, {} history frames)",

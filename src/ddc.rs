@@ -100,12 +100,23 @@ impl StreamingDDC {
     /// Construct with a caller-specified tap count. Use this when
     /// the default 63 taps don't fit a particular SNR / latency
     /// budget. Odd tap counts give a true linear-phase response.
+    ///
+    /// `num_taps` is clamped to a minimum of 3: fewer taps make the
+    /// Blackman window collapse to all-zeros (its endpoints are ~0 by
+    /// construction), which would normalise the impulse response to
+    /// `NaN`, and `num_taps == 0` would underflow the tap-design
+    /// arithmetic. A sub-3-tap anti-alias FIR is meaningless anyway.
     pub fn with_taps(
         freq_offset_hz: f32,
         sample_rate: u32,
         cutoff_hz: f32,
         num_taps: usize,
     ) -> Self {
+        let num_taps = num_taps.max(3);
+        // `sample_rate` is a divisor for both the LO phase advance and the
+        // normalised cutoff; a 0 rate would make `phase_adv` / `cutoff_norm`
+        // ±Inf → NaN taps and a NaN LO. Clamp to 1 Hz (degenerate but finite).
+        let sample_rate = sample_rate.max(1);
         let phase_adv = -2.0 * PI * freq_offset_hz / sample_rate as f32;
         let (step_im, step_re) = phase_adv.sin_cos();
         let step_phasor = Complex::new(step_re, step_im);
@@ -127,10 +138,20 @@ impl StreamingDDC {
                 + 0.08 * (4.0 * PI * i as f32 / (num_taps - 1) as f32).cos();
             taps[i] = sinc * window;
         }
-        // Normalise to unity gain at DC.
+        // Normalise to unity gain at DC. A degenerate design (e.g.
+        // `cutoff_hz == 0`, which zeros every sinc term → `sum == 0`) would
+        // otherwise divide by zero and yield NaN taps; fall back to a centred
+        // unit impulse (unity-gain passthrough) so the filter stays finite.
         let sum: f32 = taps.iter().sum();
-        for t in &mut taps {
-            *t /= sum;
+        if sum.is_finite() && sum.abs() > 1e-20 {
+            for t in &mut taps {
+                *t /= sum;
+            }
+        } else {
+            for t in taps.iter_mut() {
+                *t = 0.0;
+            }
+            taps[num_taps / 2] = 1.0;
         }
 
         // Pre-reversed taps for the doubled-buffer convolution.
@@ -179,6 +200,10 @@ impl StreamingDDC {
         iq: &[Complex<f32>],
         decimation_factor: usize,
     ) -> Vec<Complex<f32>> {
+        // `decimation_factor` of 0 is nonsensical (and would divide by
+        // zero in the capacity estimate); treat it as 1 (no decimation),
+        // matching the clamp in `process_into_decimated`.
+        let decimation_factor = decimation_factor.max(1);
         let mut output = Vec::with_capacity(iq.len() / decimation_factor + 1);
         self.process_into_decimated(iq, &mut output, decimation_factor);
         output
@@ -191,6 +216,10 @@ impl StreamingDDC {
         output: &mut Vec<Complex<f32>>,
         decimation_factor: usize,
     ) {
+        // Guard the stride: a factor of 0 would make `decimation_counter
+        // >= decimation_factor` always true (resetting to 0 every sample,
+        // i.e. no decimation) but is a caller error — normalise to 1.
+        let decimation_factor = decimation_factor.max(1);
         let num_taps = self.taps.len();
         for &sample in iq {
             // Mix: sample × phasor.
@@ -358,6 +387,58 @@ mod tests {
                 i,
                 c,
                 expected,
+            );
+        }
+    }
+
+    /// A `decimation_factor` of 0 is a caller error but must not panic
+    /// (it divides the capacity estimate). It is normalised to 1, so the
+    /// output length equals the input length.
+    #[test]
+    fn decimation_factor_zero_does_not_panic() {
+        let mut ddc = StreamingDDC::new(0.0, 1_000_000, 100_000.0);
+        let iq = vec![Complex::new(1.0, 0.0); 256];
+        let out = ddc.process_decimated(&iq, 0);
+        assert_eq!(out.len(), iq.len(), "factor 0 should behave like factor 1");
+    }
+
+    /// Degenerate tap counts must not produce a `NaN` filter. The
+    /// Blackman window is ~0 at its endpoints, so a 1- or 2-tap design
+    /// would normalise to `NaN`; `with_taps` clamps to 3.
+    #[test]
+    fn degenerate_tap_counts_are_clamped_not_nan() {
+        for n in [0usize, 1, 2, 3] {
+            let ddc = StreamingDDC::with_taps(0.0, 1_000_000, 100_000.0, n);
+            assert!(ddc.num_taps() >= 3, "tap count {n} not clamped");
+            let dc_gain: f32 = ddc.taps.iter().sum();
+            assert!(
+                dc_gain.is_finite() && (dc_gain - 1.0).abs() < 1e-4,
+                "taps for n={n} not unity-gain/finite: sum={dc_gain}"
+            );
+        }
+    }
+
+    /// Degenerate design parameters (`sample_rate == 0`, `cutoff_hz == 0`)
+    /// must yield a finite, unity-DC-gain filter and a finite LO step,
+    /// never NaN taps or a NaN phasor.
+    #[test]
+    fn degenerate_design_params_dont_nan() {
+        for (fs, cutoff) in [(0u32, 100_000.0f32), (1_000_000, 0.0), (0, 0.0)] {
+            let mut ddc = StreamingDDC::with_taps(50_000.0, fs, cutoff, 63);
+            let dc_gain: f32 = ddc.taps.iter().sum();
+            assert!(
+                dc_gain.is_finite() && (dc_gain - 1.0).abs() < 1e-4,
+                "fs={fs} cutoff={cutoff}: taps not finite unity-gain (sum={dc_gain})"
+            );
+            assert!(
+                ddc.step_phasor.re.is_finite() && ddc.step_phasor.im.is_finite(),
+                "fs={fs} cutoff={cutoff}: LO step phasor is not finite"
+            );
+            // Filtering must stay finite too.
+            let out = ddc.process(&[Complex::new(1.0, 0.0); 128]);
+            assert!(
+                out.iter().all(|c| c.re.is_finite() && c.im.is_finite()),
+                "fs={fs} cutoff={cutoff}: DDC output contains non-finite samples"
             );
         }
     }
