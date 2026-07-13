@@ -451,3 +451,43 @@ fn test_bandwidth_and_energy_threshold_filtering() {
     let results = detector.detect_from_iq(&iq, 5_800_000_000, sample_rate);
     assert!(!results.is_empty(), "Result should not be filtered out");
 }
+
+#[test]
+fn default_min_confidence_excludes_the_weak_fallback_paths_only() {
+    let d = AnalogFpvDetector::default();
+    // 0.7 sits strictly between detect_sync_pulses's two confidence tiers:
+    // 0.8 for a clean harmonic-comb match at the exact line rate, 0.6 for
+    // its weaker fallbacks (bare 50/60 Hz vsync tone, or "periodic but
+    // couldn't disambiguate PAL from NTSC"). Landing exactly on either
+    // tier would silently turn the floor into a no-op or a blanket reject.
+    assert!(d.min_confidence > 0.6 && d.min_confidence < 0.8);
+}
+
+#[test]
+fn detect_from_iq_filters_results_below_min_confidence() {
+    // A clean synthetic PAL signal — the same fixture
+    // `detect_from_iq_single_pal_narrowband` uses — scores the strong
+    // harmonic-comb confidence (0.8). At the default floor (0.7) it's
+    // reported normally; raise the floor just above 0.8 and the exact
+    // same signal must now be filtered out, proving `min_confidence` is
+    // actually enforced as a gate on `detect_from_iq`'s output and not
+    // just a stored-but-unused field.
+    let sample_rate = 1_000_000u32;
+    let n = 65536;
+    let iq = make_fm_sync_iq(sample_rate, n, 15625.0, 75_000.0, 0.0);
+
+    let default_detector = AnalogFpvDetector::default();
+    let results = default_detector.detect_from_iq(&iq, 5_800_000_000, sample_rate);
+    assert!(
+        !results.is_empty(),
+        "sanity check: the default detector should still find this clean PAL signal"
+    );
+
+    let mut strict_detector = AnalogFpvDetector::default();
+    strict_detector.min_confidence = 0.85;
+    let results = strict_detector.detect_from_iq(&iq, 5_800_000_000, sample_rate);
+    assert!(
+        results.is_empty(),
+        "a 0.85 floor should reject a signal at the 0.8 harmonic-comb confidence tier"
+    );
+}

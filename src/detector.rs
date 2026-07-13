@@ -25,6 +25,18 @@ pub struct AnalogFpvDetector {
     pub energy_threshold_db: f32,
     pub min_bandwidth: u32,
     pub max_bandwidth: u32,
+    /// Floor on `detect_sync_pulses`'s reported confidence before a hit
+    /// becomes a `DetectionResult`. `detect_sync_pulses` returns 0.8 for a
+    /// clean harmonic-comb match at the exact PAL/NTSC line rate, but only
+    /// 0.6 for its two weaker fallback paths (a bare 50/60 Hz vertical-sync
+    /// tone, or "periodic but couldn't disambiguate PAL from NTSC"). Both
+    /// still pass the cepstrum structural gate, but a strong, spectrally
+    /// broad, genuinely periodic interferer (cellular OFDM symbol/frame
+    /// timing is the classic case) can produce a cepstral peak convincing
+    /// enough to clear that gate through the 0.6 paths without being real
+    /// H-sync. Filtering below 0.7 keeps the 0.8 path (clean harmonic
+    /// match) while dropping both 0.6 fallbacks.
+    pub min_confidence: f32,
     planner: RefCell<FftPlanner<f32>>,
 }
 
@@ -34,6 +46,7 @@ impl Default for AnalogFpvDetector {
             energy_threshold_db: 3.0, // 3dB above noise floor (FM video is wideband, lower SNR per bin)
             min_bandwidth: 1_000_000, // 1 MHz
             max_bandwidth: 30_000_000, // 30 MHz (FM video can be ~20 MHz wide)
+            min_confidence: 0.7,
             planner: RefCell::new(FftPlanner::new()),
         }
     }
@@ -451,16 +464,23 @@ impl AnalogFpvDetector {
         let median = cepstrum_mag[mid];
 
         // ---- Step 6: threshold check ----
-        // A real pulse train produces a cepstral peak 5–20× above
-        // the median.  Multi-tone interferers spread energy across
-        // many quefrencies and never produce such a peak.
+        // A real pulse train produces a cepstral peak 5–20× above the
+        // median. The bottom of that range is also where a strong,
+        // spectrally broad, genuinely periodic *non-video* interferer can
+        // land (cellular OFDM symbol/frame timing is the classic case) —
+        // wide enough energy across the sweep clears the harmonic-comb gate
+        // at enough probes that a 5× cepstral peak stops being reliably
+        // diagnostic. Sitting further up the documented real-signal range
+        // trades a little sensitivity on very weak/distant VTX signals for
+        // rejecting that class of false positive.
+        const CEPSTRAL_RATIO_THRESHOLD: f32 = 7.0;
         let ratio = if median > 1e-10 {
             peak_val / median
         } else {
             peak_val * 1e10 // effectively infinite if median is zero
         };
 
-        ratio >= 5.0
+        ratio >= CEPSTRAL_RATIO_THRESHOLD
     }
 
     /// Mix `freq_offset` Hz down to baseband then decimate to
@@ -587,7 +607,9 @@ impl FpvDetector for AnalogFpvDetector {
                 });
             }
             final_results.retain(|r| {
-                r.bandwidth_hz >= self.min_bandwidth && r.bandwidth_hz <= self.max_bandwidth
+                r.bandwidth_hz >= self.min_bandwidth
+                    && r.bandwidth_hz <= self.max_bandwidth
+                    && r.confidence >= self.min_confidence
             });
             return final_results;
         }
@@ -729,7 +751,9 @@ impl FpvDetector for AnalogFpvDetector {
         }
 
         deduped.retain(|r| {
-            r.bandwidth_hz >= self.min_bandwidth && r.bandwidth_hz <= self.max_bandwidth
+            r.bandwidth_hz >= self.min_bandwidth
+                && r.bandwidth_hz <= self.max_bandwidth
+                && r.confidence >= self.min_confidence
         });
 
         deduped
