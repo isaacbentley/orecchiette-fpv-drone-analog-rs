@@ -1,7 +1,7 @@
 [package]
 name = "orecchiette-fpv-drone-analog-rs"
 license = "GPL-3.0-or-later"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Analog FPV drone video signal detection via FM demodulation and spectral sync-pulse analysis."
 repository = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs"
@@ -11,18 +11,22 @@ categories = ["science", "algorithms"]
 
 [dependencies]
 rustfft = "6.2"
-num-complex = "0.4"
+num-complex = { version = "0.4", features = ["bytemuck"] }
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
 rayon = "1"
 log = "0.4"
+# Portable SIMD for the DDC's FIR kernel (see `ddc::StreamingDDC`): a
+# float dot-product reduction can't be auto-vectorised (LLVM may not
+# reassociate FP adds), so the lanes are written explicitly.
+wide = "0.7"
+bytemuck = { version = "1.0", features = ["derive"] }
 # Optional GPU compute back-end (`gpu` feature) for the wideband sweep's
 # per-probe DDC. Kept optional so the default published crate stays pure
 # CPU + rayon with no GPU-driver dependency for callers who don't need it.
 wgpu = { version = "29.0", optional = true }
 pollster = { version = "0.4", optional = true }
-bytemuck = { version = "1.0", features = ["derive"], optional = true }
 
 [features]
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:pollster"]
 

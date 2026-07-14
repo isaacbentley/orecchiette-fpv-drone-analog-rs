@@ -569,3 +569,47 @@ fn wideband_sweep_confirms_vbi_structure_at_an_offset() {
         "expected a VBI-confirmed (boosted) detection, got {results:?}"
     );
 }
+
+/// Zero-padding the classification FFT to a power of two (added in
+/// 0.1.7 to keep rustfft off Rader's algorithm) must not change what
+/// the detector *concludes*. The transform is only ever padded, never
+/// truncated, so the same capture has to classify identically whether
+/// its length lands exactly on a power of two, one sample under it
+/// (the shape the default 65536-sample block actually produces, since
+/// `fm_demod` returns n-1), or awkwardly between two.
+///
+/// This is the guard on the padding's central claim: padding
+/// interpolates the spectrum but adds no information, so every
+/// resolution-dependent decision stays pinned to the real record
+/// length rather than the padded one.
+///
+/// Lengths are all kept in the regime where the record is long enough
+/// to carry the harmonic comb the detector gates on (~2.6 ms / ~40 PAL
+/// lines at 25 MSPS). Much shorter records classify Unknown regardless
+/// of padding — verified to be pre-existing behaviour on 0.1.6, not a
+/// padding artefact — so they'd test the record-length floor rather
+/// than the invariant this test is about.
+#[test]
+fn padding_does_not_change_classification_across_record_lengths() {
+    let sample_rate = 25_000_000u32;
+    let detector = AnalogFpvDetector::default();
+
+    // 65536: exact power of two. 65535: one under — the shape the
+    // default block size really hits, since `fm_demod` returns n-1.
+    // 49152 / 40000: awkwardly between powers of two, exercising the
+    // `search_range` compensation at pad ratios of ~1.33 and ~1.64.
+    for &n in &[65_536usize, 65_535, 49_152, 40_000] {
+        let iq = make_fm_sync_iq(sample_rate, n, 15_625.0, 4.0e6, 0.0);
+        let (sig, conf) = detector.detect_sync_pulses(&iq, sample_rate);
+        assert_ne!(
+            sig,
+            SignalType::Unknown,
+            "n={n}: a clean PAL-rate sync train must still be detected \
+             (record length must not decide the outcome)"
+        );
+        assert!(
+            conf > 0.0,
+            "n={n}: detection must carry nonzero confidence, got {conf}"
+        );
+    }
+}

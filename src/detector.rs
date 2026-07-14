@@ -50,6 +50,11 @@ pub struct AnalogFpvDetector {
     /// presence as reassuring.
     pub demote_unconfirmed_video: bool,
     planner: RefCell<FftPlanner<f32>>,
+    /// Cached Hann window, keyed by length. `detect_sync_pulses` runs on
+    /// every capture block at one steady length, so a single slot hits
+    /// ~100% and saves a `cosf` per sample per call (65 k of them at the
+    /// default block size).
+    hann: RefCell<Option<(usize, Vec<f32>)>>,
     /// Optional GPU handle for the wideband sweep's batched DDC (see
     /// [`crate::gpu::GpuAnalog`], behind the `gpu` feature). `None` — the
     /// default — runs the existing sequential-per-probe CPU sweep
@@ -70,6 +75,7 @@ impl Default for AnalogFpvDetector {
             min_confidence: 0.7,
             demote_unconfirmed_video: false,
             planner: RefCell::new(FftPlanner::new()),
+            hann: RefCell::new(None),
             #[cfg(feature = "gpu")]
             gpu: None,
         }
@@ -240,13 +246,44 @@ impl AnalogFpvDetector {
             return (SignalType::Unknown, 0.0);
         }
 
-        let fft_len = demod_len;
+        if demod_len < 2 {
+            return (SignalType::Unknown, 0.0);
+        }
+
+        // Zero-pad the transform to the next power of two. `fm_demod`
+        // returns `n - 1` samples, so the default 65536-sample capture
+        // block lands on a 65535-point FFT — and 65535 = 3·5·17·257,
+        // whose 257 factor drops rustfft onto Rader's algorithm at ~6×
+        // the cost of the 65536-point radix-4 NEON path (1009 µs vs
+        // 168 µs measured). One zero sample buys that back.
+        //
+        // Padding adds no information: it sinc-interpolates the same
+        // spectrum onto a finer bin grid. True resolution stays
+        // `sample_rate / demod_len` (the Rayleigh limit of the record
+        // length), so every decision below that depends on *resolution*
+        // rather than on bin indexing is pinned to `demod_len` — see
+        // `search_range` and `bins_distinct`.
+        let fft_len = demod_len.next_power_of_two();
         let fft = self.planner.borrow_mut().plan_fft_forward(fft_len);
         let mut buffer: Vec<FftComplex<f32>> = vec![FftComplex { re: 0.0, im: 0.0 }; fft_len];
 
-        for i in 0..fft_len {
-            let window = 0.5 * (1.0 - (2.0 * PI * i as f32 / (fft_len - 1) as f32).cos());
-            buffer[i].re = (demod[i] - avg_demod) * window;
+        // Hann spans the real samples only; the pad tail stays zero.
+        // (The window is ~0 at the edges, so the join is continuous.)
+        {
+            let mut cache = self.hann.borrow_mut();
+            if cache.as_ref().is_none_or(|(n, _)| *n != demod_len) {
+                let denom = (demod_len - 1) as f32;
+                *cache = Some((
+                    demod_len,
+                    (0..demod_len)
+                        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / denom).cos()))
+                        .collect(),
+                ));
+            }
+            let w = &cache.as_ref().unwrap().1;
+            for i in 0..demod_len {
+                buffer[i].re = (demod[i] - avg_demod) * w[i];
+            }
         }
 
         fft.process(&mut buffer);
@@ -255,7 +292,15 @@ impl AnalogFpvDetector {
         let bin_pal = (15625.0 / bin_hz).round() as usize;
         let bin_ntsc = (15734.0 / bin_hz).round() as usize;
 
-        let search_range = 1;
+        // ±1 bin of the *unpadded* grid, expressed in padded bins, so the
+        // peak search covers the same absolute Hz window it always has
+        // regardless of how much padding was added. Rounded, not floored
+        // or ceiled: `fft_len / demod_len` is in [1, 2), so integer
+        // division would pin this to 1 and silently shrink the window for
+        // a heavily-padded record, while `div_ceil` would pin it to 2 and
+        // double the window for the barely-padded 65535→65536 case that
+        // the default block size actually hits.
+        let search_range = ((fft_len as f32 / demod_len as f32).round() as usize).max(1);
 
         let pal_energy = self.get_peak_energy(&buffer, bin_pal, search_range);
         let ntsc_energy = self.get_peak_energy(&buffer, bin_ntsc, search_range);
@@ -318,7 +363,16 @@ impl AnalogFpvDetector {
         let mut sig_type = SignalType::Unknown;
         let mut conf = 0.0;
 
-        let bins_distinct = bin_pal != bin_ntsc;
+        // Pinned to the *unpadded* grid: this asks "is our record long
+        // enough to actually resolve 15625 from 15734 Hz?", which is a
+        // Rayleigh-limit question about `demod_len`. Zero-padding
+        // interpolates but resolves nothing, so deciding this on the
+        // padded grid would let two merely-interpolated bins claim a
+        // separation the data cannot support — and misclassify PAL as
+        // NTSC or vice versa.
+        let true_bin_hz = sample_rate as f32 / demod_len as f32;
+        let bins_distinct =
+            (15625.0f32 / true_bin_hz).round() != (15734.0f32 / true_bin_hz).round();
 
         if bins_distinct {
             if pal_energy > thresh_strong && pal_energy > ntsc_energy * 1.2 && pal_harmonics >= 2 {
@@ -379,7 +433,7 @@ impl AnalogFpvDetector {
                 SignalType::AnalogVideoNtsc => NTSC_LINE_HZ,
                 _ => PAL_LINE_HZ, // AnalogVideoUnknown — check PAL as proxy
             };
-            if !self.verify_cepstrum(&buffer, sample_rate, candidate_line_hz) {
+            if !self.verify_cepstrum(&buffer, sample_rate, candidate_line_hz, demod_len) {
                 sig_type = SignalType::Unknown;
                 conf = 0.0;
             }
@@ -442,21 +496,31 @@ impl AnalogFpvDetector {
     ///
     /// Returns `true` if the cepstral peak-to-median ratio at the
     /// expected quefrency exceeds a threshold.
+    /// `record_len` is the number of *real* (unpadded) samples behind
+    /// `fft_buffer` — see the zero-padding note in `detect_sync_pulses`.
+    /// Quefrency spacing is `1/sample_rate` no matter how much the
+    /// spectrum was padded, so the peak's index is unaffected; but
+    /// padding extends the quefrency *range* with interpolation
+    /// artefact the record cannot support. Everything below is bounded
+    /// to `record_len / 2` so that tail can't dilute the median noise
+    /// floor and inflate the peak-to-median ratio this gate turns on.
     fn verify_cepstrum(
         &self,
         fft_buffer: &[FftComplex<f32>],
         sample_rate: u32,
         candidate_line_hz: f32,
+        record_len: usize,
     ) -> bool {
         let fft_len = fft_buffer.len();
         if fft_len < 64 {
             return true; // too short for meaningful cepstrum
         }
+        let half = (record_len / 2).min(fft_len / 2);
 
         // Expected quefrency (in samples) for the line rate.
         let expected_q = sample_rate as f32 / candidate_line_hz;
         let q_idx = expected_q.round() as usize;
-        if q_idx < 2 || q_idx >= fft_len / 2 {
+        if q_idx < 2 || q_idx >= half {
             return true; // can't measure at this resolution
         }
 
@@ -485,9 +549,9 @@ impl AnalogFpvDetector {
         let scale = 1.0 / fft_len as f32;
 
         // ---- Step 3: extract real cepstrum magnitudes ----
-        // Only need the first half (positive quefrencies).
+        // Only need the first half (positive quefrencies), bounded to
+        // the record's own support — see the fn doc.
         // Written as a branchless multiply — auto-vectorises.
-        let half = fft_len / 2;
         let mut cepstrum_mag: Vec<f32> = Vec::with_capacity(half);
         for val in log_power.iter().take(half) {
             let v = val.re * scale;
@@ -1139,14 +1203,14 @@ mod tests {
         }
 
         assert!(
-            det.verify_cepstrum(&fft_buf, sr, line_hz),
+            det.verify_cepstrum(&fft_buf, sr, line_hz, fft_len),
             "harmonic comb should pass cepstrum check"
         );
 
         // Flat spectrum — no periodic structure.
         let flat_buf = vec![FftC { re: 1.0, im: 0.0 }; fft_len];
         assert!(
-            !det.verify_cepstrum(&flat_buf, sr, line_hz),
+            !det.verify_cepstrum(&flat_buf, sr, line_hz, fft_len),
             "flat spectrum should fail cepstrum check"
         );
     }
