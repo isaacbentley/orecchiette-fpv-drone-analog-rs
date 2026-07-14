@@ -491,3 +491,47 @@ fn detect_from_iq_filters_results_below_min_confidence() {
         "a 0.85 floor should reject a signal at the 0.8 harmonic-comb confidence tier"
     );
 }
+
+#[test]
+fn wideband_sweep_confirms_vbi_structure_at_an_offset() {
+    // Same shape as detect_from_iq_wideband_sliding_ddc_finds_offset_signal
+    // (50 MSPS, signal at -15 MHz), but with a real VBI-structured
+    // signal instead of a bare line-rate comb -- the sweep's per-probe
+    // DDC'd segment (decimated to the 10 MHz wideband target rate) must
+    // still confirm the vertical-sync structure and boost confidence.
+    use orecchiette_fpv_drone_analog_rs::synthetic::{
+        SyntheticVideoConfig, TestPattern, generate_iq,
+    };
+    use orecchiette_fpv_drone_analog_rs::vbi::FieldParity;
+
+    let sample_rate = 50_000_000u32;
+    let offset_hz = -15_000_000.0f32;
+    let cfg = SyntheticVideoConfig {
+        sample_rate,
+        is_pal: false,
+        deviation_hz: 5e6,
+        pattern: TestPattern::Bars,
+        start_field: FieldParity::First,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    };
+    // 2 fields: the harmonic classifier's single whole-capture FFT
+    // needs at least two field periods to resolve a clean comb -- with
+    // only one, the vertical-sync trio's disruption of the otherwise-
+    // periodic H-sync train is a large enough fraction of that one
+    // window to dilute the harmonic peaks below threshold (confirmed
+    // empirically: identical single-field input at both 15.36 and
+    // 50 MSPS fails to classify at all, while two fields succeeds).
+    let iq = generate_iq(&cfg, 2, offset_hz);
+
+    let detector = AnalogFpvDetector::default();
+    let results = detector.detect_from_iq(&iq, 5_800_000_000, sample_rate);
+    assert!(
+        !results.is_empty(),
+        "expected the offset signal to be detected"
+    );
+    assert!(
+        results.iter().any(|r| r.confidence >= 0.9),
+        "expected a VBI-confirmed (boosted) detection, got {results:?}"
+    );
+}

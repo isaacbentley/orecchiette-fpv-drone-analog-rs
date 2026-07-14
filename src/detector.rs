@@ -28,15 +28,27 @@ pub struct AnalogFpvDetector {
     /// Floor on `detect_sync_pulses`'s reported confidence before a hit
     /// becomes a `DetectionResult`. `detect_sync_pulses` returns 0.8 for a
     /// clean harmonic-comb match at the exact PAL/NTSC line rate, but only
-    /// 0.6 for its two weaker fallback paths (a bare 50/60 Hz vertical-sync
-    /// tone, or "periodic but couldn't disambiguate PAL from NTSC"). Both
-    /// still pass the cepstrum structural gate, but a strong, spectrally
-    /// broad, genuinely periodic interferer (cellular OFDM symbol/frame
-    /// timing is the classic case) can produce a cepstral peak convincing
-    /// enough to clear that gate through the 0.6 paths without being real
-    /// H-sync. Filtering below 0.7 keeps the 0.8 path (clean harmonic
-    /// match) while dropping both 0.6 fallbacks.
+    /// 0.6 for its weaker fallback path ("periodic but couldn't
+    /// disambiguate PAL from NTSC"). Both still pass the cepstrum
+    /// structural gate, but a strong, spectrally broad, genuinely
+    /// periodic interferer (cellular OFDM symbol/frame timing is the
+    /// classic case) can produce a cepstral peak convincing enough to
+    /// clear that gate through the 0.6 path without being real H-sync.
+    /// Filtering below 0.7 keeps the 0.8 path (clean harmonic match)
+    /// while dropping the 0.6 fallback — unless the VBI confirm stage
+    /// (see [`crate::vbi::confirm_field_sync`]) promotes it to 0.75 by
+    /// finding a real periodic field structure underneath.
     pub min_confidence: f32,
+    /// When `true`, an 0.8-confidence harmonic-comb match spanning at
+    /// least 2.5 field periods with *zero* confirmed vertical-sync
+    /// groups is demoted to 0.6 (and filtered out by the default
+    /// `min_confidence`). Default `false`: the crate's own line-rate-
+    /// only test fixtures (`make_fm_sync_iq`, `make_pal_pulse_train`)
+    /// are exactly this shape and would fail if this were on
+    /// unconditionally. Enable it once real-world false-positive data
+    /// justifies trusting VBI absence as disqualifying, not just VBI
+    /// presence as reassuring.
+    pub demote_unconfirmed_video: bool,
     planner: RefCell<FftPlanner<f32>>,
 }
 
@@ -47,6 +59,7 @@ impl Default for AnalogFpvDetector {
             min_bandwidth: 1_000_000, // 1 MHz
             max_bandwidth: 30_000_000, // 30 MHz (FM video can be ~20 MHz wide)
             min_confidence: 0.7,
+            demote_unconfirmed_video: false,
             planner: RefCell::new(FftPlanner::new()),
         }
     }
@@ -215,8 +228,6 @@ impl AnalogFpvDetector {
         let bin_hz = sample_rate as f32 / fft_len as f32;
         let bin_pal = (15625.0 / bin_hz).round() as usize;
         let bin_ntsc = (15734.0 / bin_hz).round() as usize;
-        let bin_vsync_50 = (50.0 / bin_hz).round() as usize;
-        let bin_vsync_60 = (60.0 / bin_hz).round() as usize;
 
         let search_range = 1;
 
@@ -243,13 +254,6 @@ impl AnalogFpvDetector {
         } else {
             1e-6
         };
-
-        let mut vsync_pal = 0.0;
-        let mut vsync_ntsc = 0.0;
-        if bin_hz < 10.0 && bin_vsync_60 < fft_len / 2 {
-            vsync_pal = self.get_peak_energy(&buffer, bin_vsync_50, 1);
-            vsync_ntsc = self.get_peak_energy(&buffer, bin_vsync_60, 1);
-        }
 
         let thresh_strong = noise_floor * 5.0;
         let thresh_weak = noise_floor * 2.5;
@@ -337,16 +341,6 @@ impl AnalogFpvDetector {
             }
         }
 
-        if sig_type == SignalType::Unknown && bin_hz < 10.0 && bin_vsync_60 < fft_len / 2 {
-            if vsync_pal > thresh_weak && vsync_pal > vsync_ntsc * 1.2 {
-                sig_type = SignalType::AnalogVideoPal;
-                conf = 0.6;
-            } else if vsync_ntsc > thresh_weak && vsync_ntsc > vsync_pal * 1.2 {
-                sig_type = SignalType::AnalogVideoNtsc;
-                conf = 0.6;
-            }
-        }
-
         // ---- Cepstrum structural gate ----
         // If the harmonic classifier found a candidate, verify it
         // structurally via the cepstrum.  Multi-tone interferers
@@ -363,6 +357,31 @@ impl AnalogFpvDetector {
                 sig_type = SignalType::Unknown;
                 conf = 0.0;
             }
+        }
+
+        // ---- VBI confirm stage ----
+        // The harmonic-comb + cepstrum checks above only ever see a
+        // ~2-8 ms slice of one FFT's worth of data, so they can only
+        // confirm the *line rate* is present, not that it belongs to a
+        // real interlaced field structure. A field is ~16.7 ms (NTSC) /
+        // 20 ms (PAL), and orecchiette's batches are ~68 ms, so multiple
+        // complete vertical syncs are usually available in the same
+        // slice already handed to this function — checking for them
+        // costs one more pulse scan and turns "plausible line-rate
+        // comb" into "confirmed periodic field structure", which is
+        // essentially unfakeable by a non-video interferer.
+        if sig_type.is_analog_video()
+            && let Some(levels) = crate::levels::estimate_sync_levels(&demod, sample_rate)
+        {
+            let is_pal_hint = match sig_type {
+                SignalType::AnalogVideoPal => Some(true),
+                SignalType::AnalogVideoNtsc => Some(false),
+                _ => None,
+            };
+            let evidence =
+                crate::vbi::confirm_field_sync(&demod, sample_rate, &levels, is_pal_hint);
+            conf =
+                apply_vbi_confidence_tier(sig_type, conf, &evidence, self.demote_unconfirmed_video);
         }
 
         (sig_type, conf)
@@ -554,6 +573,52 @@ impl AnalogFpvDetector {
         let cutoff_hz = (target_rate as f32) / 3.0;
         let mut ddc = crate::ddc::StreamingDDC::new(freq_offset, sample_rate, cutoff_hz);
         ddc.process_decimated(iq_data, decimation_factor)
+    }
+}
+
+/// The confidence-tier decision the VBI confirm stage applies, factored
+/// out as a pure function of `(sig_type, conf, evidence, demote_flag)`
+/// so it's directly unit-testable against synthetic
+/// [`crate::vbi::FieldSyncEvidence`] values — constructing a real IQ
+/// signal that's simultaneously "confirmable VBI structure" *and*
+/// "genuinely PAL/NTSC-ambiguous" (the promote case) is a contrived
+/// combination in practice, since a real, well-formed line rate is
+/// exactly what lets the harmonic/time-domain classifiers resolve the
+/// standard confidently in the first place.
+///
+/// - **Boost**: an 0.8+ (strong-path) hit with confirmed field-sync
+///   structure — two or more groups spaced a real field period apart,
+///   or one group when the slice is too short to possibly contain a
+///   second — becomes 0.95.
+/// - **Promote**: an `AnalogVideoUnknown` (standard-ambiguous, 0.6) hit
+///   with confirmed structure becomes 0.75, clearing the default 0.7
+///   floor — the slice is definitely analog video, just not tagged
+///   PAL vs NTSC.
+/// - **Demote** (opt-in via `demote_unconfirmed_video`): an 0.8+ hit
+///   spanning at least 2.5 field periods with *zero* confirmed groups
+///   drops to 0.6.
+fn apply_vbi_confidence_tier(
+    sig_type: SignalType,
+    conf: f32,
+    evidence: &crate::vbi::FieldSyncEvidence,
+    demote_unconfirmed: bool,
+) -> f32 {
+    let short_slice = evidence.slice_field_periods < 2.2;
+    let confirmed =
+        (evidence.groups >= 2 && evidence.spacing_ok) || (evidence.groups >= 1 && short_slice);
+
+    if conf >= 0.8 && confirmed {
+        0.95
+    } else if sig_type == SignalType::AnalogVideoUnknown && confirmed {
+        0.75
+    } else if demote_unconfirmed
+        && conf >= 0.8
+        && evidence.slice_field_periods >= 2.5
+        && evidence.groups == 0
+    {
+        0.6
+    } else {
+        conf
     }
 }
 
@@ -1063,6 +1128,146 @@ mod tests {
         assert!(
             results.is_empty(),
             "empty band produced detections: {results:?}"
+        );
+    }
+
+    // ── Phase 3: VBI confirm confidence tiers ──────────────────────────
+
+    use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+    use crate::vbi::{FieldParity, FieldSyncEvidence};
+
+    fn evidence(groups: usize, spacing_ok: bool, slice_field_periods: f32) -> FieldSyncEvidence {
+        FieldSyncEvidence {
+            groups,
+            spacing_ok,
+            slice_field_periods,
+        }
+    }
+
+    #[test]
+    fn tier_boosts_strong_confirmed_hit() {
+        let e = evidence(2, true, 4.0);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoNtsc, 0.8, &e, false),
+            0.95
+        );
+    }
+
+    #[test]
+    fn tier_boosts_single_group_on_a_short_slice() {
+        // Too short to possibly contain a second group -- one confirmed
+        // group is all the evidence that could exist.
+        let e = evidence(1, false, 1.5);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoPal, 0.8, &e, false),
+            0.95
+        );
+    }
+
+    #[test]
+    fn tier_does_not_boost_a_single_group_on_a_long_slice() {
+        // Long enough that a real periodic vsync should have produced a
+        // second confirmable group; one alone isn't enough evidence.
+        let e = evidence(1, false, 4.0);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoNtsc, 0.8, &e, false),
+            0.8
+        );
+    }
+
+    #[test]
+    fn tier_promotes_standard_ambiguous_hit_when_confirmed() {
+        let e = evidence(2, true, 4.0);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoUnknown, 0.6, &e, false),
+            0.75
+        );
+    }
+
+    #[test]
+    fn tier_leaves_standard_ambiguous_hit_alone_when_unconfirmed() {
+        let e = evidence(0, false, 4.0);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoUnknown, 0.6, &e, false),
+            0.6
+        );
+    }
+
+    #[test]
+    fn tier_demotes_unconfirmed_strong_hit_only_when_flag_is_set() {
+        let e = evidence(0, false, 3.0);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoNtsc, 0.8, &e, false),
+            0.8
+        );
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoNtsc, 0.8, &e, true),
+            0.6
+        );
+    }
+
+    #[test]
+    fn tier_does_not_demote_a_short_slice_even_with_the_flag_set() {
+        // Too short to expect a second group -- absence of one isn't
+        // evidence of anything.
+        let e = evidence(0, false, 1.5);
+        assert_eq!(
+            apply_vbi_confidence_tier(SignalType::AnalogVideoNtsc, 0.8, &e, true),
+            0.8
+        );
+    }
+
+    fn synth_config(is_pal: bool, sample_rate: u32) -> SyntheticVideoConfig {
+        SyntheticVideoConfig {
+            sample_rate,
+            is_pal,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        }
+    }
+
+    #[test]
+    fn full_field_ntsc_signal_boosts_to_0_95_via_detect_sync_pulses() {
+        let sample_rate = 15_360_000u32;
+        let cfg = synth_config(false, sample_rate);
+        // 2 fields: enough for two field-period-spaced confirmed groups.
+        let iq = generate_iq(&cfg, 2, 0.0);
+        let det = AnalogFpvDetector::default();
+        let (sig_type, conf) = det.detect_sync_pulses(&iq, sample_rate);
+        assert_eq!(sig_type, SignalType::AnalogVideoNtsc);
+        assert_eq!(conf, 0.95, "expected the VBI-confirmed boost");
+    }
+
+    #[test]
+    fn line_rate_comb_without_vbi_structure_stays_at_0_8_by_default() {
+        let sr = 15_360_000u32;
+        // Line-rate-only comb (no equalizing/broad-pulse groups) --
+        // exactly the shape make_fm_sync_iq / make_pal_pulse_train
+        // fixtures already exercise elsewhere in this module.
+        let iq = make_pal_pulse_train(sr, 800); // ~51 ms, > 2.5 field periods
+        let det = AnalogFpvDetector::default();
+        let (sig_type, conf) = det.detect_sync_pulses(&iq, sr);
+        assert_eq!(sig_type, SignalType::AnalogVideoPal);
+        assert_eq!(conf, 0.8, "unconfirmed comb should be untouched by default");
+    }
+
+    #[test]
+    fn line_rate_comb_demotes_below_the_floor_when_flag_enabled() {
+        let sr = 15_360_000u32;
+        let iq = make_pal_pulse_train(sr, 800); // ~51 ms, > 2.5 field periods
+        let det = AnalogFpvDetector {
+            demote_unconfirmed_video: true,
+            ..AnalogFpvDetector::default()
+        };
+        let (sig_type, conf) = det.detect_sync_pulses(&iq, sr);
+        assert_eq!(sig_type, SignalType::AnalogVideoPal);
+        assert_eq!(conf, 0.6, "unconfirmed comb should demote once opted in");
+        assert!(
+            det.min_confidence > conf,
+            "demoted confidence should fail the default floor"
         );
     }
 }

@@ -20,10 +20,20 @@
 /// `-SYNC_TO_BLANK_FRACTION · radians_per_volt`.
 pub const SYNC_TO_BLANK_FRACTION: f32 = 0.4;
 
-/// Minimum capture length required to estimate levels/deviation: ~40 ms,
-/// enough to see multiple sync pulses (a single video line is far
-/// shorter) regardless of standard.
-const MIN_ESTIMATE_SAMPLES_DIVISOR: u32 = 25; // sample_rate / 25 ≈ 40 ms
+/// Minimum capture length required to estimate levels/deviation: ~5 ms,
+/// enough for a comfortable multiple of [`MIN_PULSES`] (a busy field
+/// delivers ~1 H-sync-class pulse every line period, so even 5 ms
+/// yields on the order of 60-80 candidates at typical video line
+/// rates). The real protection against a bad estimate is the pulse
+/// count / bimodality gates further down, not this floor — it only
+/// needs to rule out pathologically short inputs. Deliberately kept
+/// under ~9 ms: that's the shortest duration at which
+/// `detect_sync_pulses_with_cepstrum`'s FFT bins can still fail to
+/// resolve PAL from NTSC (see its `AnalogVideoUnknown` path), and the
+/// VBI-confirm stage needs to run on exactly those slices to promote a
+/// standard-ambiguous hit — a higher floor here would make that
+/// promotion unreachable by construction.
+const MIN_ESTIMATE_SAMPLES_DIVISOR: u32 = 200; // sample_rate / 200 = 5 ms
 
 /// Minimum number of surviving sync-like pulses required before trusting
 /// the estimate. Real video delivers hundreds of pulses in 40 ms; a

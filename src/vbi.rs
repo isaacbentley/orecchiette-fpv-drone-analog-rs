@@ -320,6 +320,107 @@ fn count_adjacent_run(
     count
 }
 
+/// Find every run of at least [`MIN_BROAD_RUN`] consecutive broad
+/// pulses spaced `half_period` apart, returning `(start_idx, end_idx)`
+/// pairs (inclusive, indexing into `broads`) in order. Shared by
+/// [`find_vertical_sync`] (which only needs the first) and
+/// [`confirm_field_sync`] (which needs all of them, to check that
+/// successive vertical syncs land a full field period apart).
+fn find_broad_groups(broads: &[&SyncPulse], half_period: f32) -> Vec<(usize, usize)> {
+    let mut groups = Vec::new();
+    let mut i = 0usize;
+    while i < broads.len() {
+        let mut j = i;
+        while j + 1 < broads.len() {
+            let gap = broads[j + 1].start as f32 - broads[j].start as f32;
+            if (gap - half_period).abs() <= half_period * BROAD_SPACING_TOLERANCE {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j - i + 1 >= MIN_BROAD_RUN {
+            groups.push((i, j));
+        }
+        i = j + 1;
+    }
+    groups
+}
+
+/// Evidence that a demod slice contains genuine, periodic field-sync
+/// structure — not just one plausible-looking broad-pulse run, which a
+/// non-video interferer with the right comb spacing could in principle
+/// fake, but *multiple* such runs spaced a real field period apart.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldSyncEvidence {
+    /// Number of qualifying broad-pulse groups found in the slice.
+    pub groups: usize,
+    /// `true` when at least two groups were found and every consecutive
+    /// pair is spaced within 5% of a field period — i.e. this isn't
+    /// just one lucky comb, it's a genuinely periodic vertical sync.
+    pub spacing_ok: bool,
+    /// How many field periods the slice covers, for callers deciding
+    /// how much evidence to expect (a short slice can't produce a
+    /// second group to confirm spacing against).
+    pub slice_field_periods: f32,
+}
+
+/// Confirm periodic field-sync structure in a demod slice without
+/// committing to a PAL/NTSC standard up front (`is_pal: None` averages
+/// the two nominal line periods — the ~0.7% difference between them is
+/// far inside [`BROAD_SPACING_TOLERANCE`], so grouping still works).
+/// Used by the detector's confidence boost: a slice with two or more
+/// field-period-spaced vertical syncs is essentially unfakeable by a
+/// non-video interferer, which is a stronger signal than the harmonic-
+/// comb classifier alone provides.
+pub fn confirm_field_sync(
+    demod: &[f32],
+    sample_rate: u32,
+    levels: &SyncLevels,
+    is_pal: Option<bool>,
+) -> FieldSyncEvidence {
+    if sample_rate == 0 || demod.is_empty() {
+        return FieldSyncEvidence {
+            groups: 0,
+            spacing_ok: false,
+            slice_field_periods: 0.0,
+        };
+    }
+    let pulses = extract_pulses(demod, sample_rate, levels);
+    let nominal_line_hz = match is_pal {
+        Some(true) => consts::PAL_LINE_HZ,
+        Some(false) => consts::NTSC_LINE_HZ,
+        None => (consts::PAL_LINE_HZ + consts::NTSC_LINE_HZ) / 2.0,
+    };
+    let field_total_lines = match is_pal {
+        Some(true) => consts::PAL_FIELD_TOTAL_LINES,
+        Some(false) => consts::NTSC_FIELD_TOTAL_LINES,
+        None => (consts::PAL_FIELD_TOTAL_LINES + consts::NTSC_FIELD_TOTAL_LINES) / 2.0,
+    };
+    let nominal_period = sample_rate as f32 / nominal_line_hz as f32;
+    let half_period = nominal_period * 0.5;
+    let field_period_samples = field_total_lines as f32 * nominal_period;
+
+    let broads: Vec<&SyncPulse> = pulses
+        .iter()
+        .filter(|p| p.kind == PulseKind::Broad)
+        .collect();
+    let group_ranges = find_broad_groups(&broads, half_period);
+    let groups = group_ranges.len();
+
+    let spacing_ok = groups >= 2
+        && group_ranges.windows(2).all(|w| {
+            let gap = broads[w[1].0].start as f32 - broads[w[0].0].start as f32;
+            (gap - field_period_samples).abs() < field_period_samples * 0.05
+        });
+
+    FieldSyncEvidence {
+        groups,
+        spacing_ok,
+        slice_field_periods: demod.len() as f32 / field_period_samples,
+    }
+}
+
 /// Parse a demod slice's vertical-sync structure: locate the serrated
 /// broad-pulse group, determine field parity, and derive where active
 /// video starts.
@@ -364,25 +465,7 @@ pub fn find_vertical_sync(
         .iter()
         .filter(|p| p.kind == PulseKind::Broad)
         .collect();
-    let mut group: Option<(usize, usize)> = None; // (start_idx, end_idx_inclusive) into `broads`
-    let mut i = 0usize;
-    while i < broads.len() {
-        let mut j = i;
-        while j + 1 < broads.len() {
-            let gap = broads[j + 1].start as f32 - broads[j].start as f32;
-            if (gap - half_period).abs() <= half_period * BROAD_SPACING_TOLERANCE {
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        if j - i + 1 >= MIN_BROAD_RUN {
-            group = Some((i, j));
-            break;
-        }
-        i = j + 1;
-    }
-    let (gi, gj) = group?;
+    let (gi, gj) = *find_broad_groups(&broads, half_period).first()?;
     let n_broad = gj - gi + 1;
     let broad_start = broads[gi].start as f32;
     let last_start = broads[gj].start as f32;
