@@ -168,6 +168,40 @@ fn detect_from_iq_wideband_sliding_ddc_finds_offset_signal() {
     );
 }
 
+/// Regression: the wideband sweep used to *assume* each probe was
+/// decimated to exactly `WIDEBAND_TARGET_RATE_HZ` (10 MHz) whenever
+/// `sample_rate > 2 * target_rate`, but the real decimation factor is
+/// `sample_rate / target_rate` truncated to an integer — exact only
+/// when `sample_rate` is a clean multiple of 10 MHz (50, 100, ... MSPS,
+/// which is what every other wideband test here happens to use). At
+/// 25 MSPS the factor truncates from 2.5 to 2, so probes were actually
+/// decimated to 12.5 MHz but analysed as if they were 10 MHz — a 25%
+/// rate error that corrupts every frequency-derived computation inside
+/// `detect_sync_pulses` (FFT bin width, line-rate bin indices, harmonic
+/// bins) enough to misclassify real signals outright.
+#[test]
+fn detect_from_iq_wideband_sweep_handles_non_exact_decimation_ratio() {
+    let detector = AnalogFpvDetector::default();
+    let sample_rate = 25_000_000u32; // 25 / 10 = 2.5, truncates to 2
+    let n = 400_000;
+    let offset_hz = -7_500_000.0f32;
+
+    let iq = make_fm_sync_iq(sample_rate, n, 15734.0, 4_000_000.0, offset_hz);
+    let results = detector.detect_from_iq(&iq, 5_800_000_000, sample_rate);
+
+    assert!(
+        !results.is_empty(),
+        "signal at a non-exact-multiple sample rate (25 MSPS) should still be detected"
+    );
+    let detected_freq = results[0].frequency_hz;
+    let expected_freq = 5_800_000_000u64 - 7_500_000;
+    let diff_mhz = (detected_freq as f64 - expected_freq as f64).abs() / 1e6;
+    assert!(
+        diff_mhz < 10.0,
+        "detected frequency {detected_freq} should be within 10 MHz of expected {expected_freq}, diff was {diff_mhz} MHz"
+    );
+}
+
 #[test]
 fn detect_from_iq_wideband_two_signals_found() {
     // Two FM video signals separated by 50 MHz in a 100 MSPS capture.

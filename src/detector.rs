@@ -569,10 +569,31 @@ impl AnalogFpvDetector {
         freq_offset: f32,
         target_rate: u32,
     ) -> Vec<Complex<f32>> {
-        let decimation_factor = (sample_rate / target_rate).max(1) as usize;
+        let decimation_factor = Self::decimation_factor(sample_rate, target_rate);
         let cutoff_hz = (target_rate as f32) / 3.0;
         let mut ddc = crate::ddc::StreamingDDC::new(freq_offset, sample_rate, cutoff_hz);
         ddc.process_decimated(iq_data, decimation_factor)
+    }
+
+    /// Integer decimation factor `ddc_and_decimate` actually divides by.
+    /// Shared with [`Self::decimated_rate`] so a probe's assumed sample
+    /// rate can never drift from what the DDC really produced.
+    fn decimation_factor(sample_rate: u32, target_rate: u32) -> usize {
+        (sample_rate / target_rate).max(1) as usize
+    }
+
+    /// The *true* rate of a `ddc_and_decimate(..., target_rate)` output.
+    /// `sample_rate / decimation_factor` is not necessarily exactly
+    /// `target_rate` — integer division truncates whenever `sample_rate`
+    /// isn't an exact multiple of it (e.g. 25 MSPS / 10 MHz truncates
+    /// the factor to 2, giving 12.5 MHz actual output, not 10 MHz).
+    /// Passing the wrong assumed rate into `detect_sync_pulses`
+    /// corrupts every frequency-derived computation in there (FFT bin
+    /// width, line-rate bin indices, harmonic bins) by the same
+    /// fraction, which silently broke detection on any wideband-sweep
+    /// capture rate that wasn't a clean multiple of `target_rate`.
+    fn decimated_rate(sample_rate: u32, target_rate: u32) -> u32 {
+        sample_rate / Self::decimation_factor(sample_rate, target_rate) as u32
     }
 }
 
@@ -745,21 +766,32 @@ impl FpvDetector for AnalogFpvDetector {
                 return final_results;
             }
 
-            // First pass: measure energy at each probe position
-            let mut probes: Vec<(f64, f32, Vec<Complex<f32>>)> = Vec::with_capacity(n_steps);
+            // First pass: measure energy at each probe position. Track the
+            // *actual* rate each probe was decimated to alongside it (see
+            // `decimated_rate`'s doc) rather than re-deriving/assuming it
+            // later — that assumption used to silently diverge from
+            // reality whenever `sample_rate` wasn't an exact multiple of
+            // `target_rate`.
+            let mut probes: Vec<(f64, f32, Vec<Complex<f32>>, u32)> = Vec::with_capacity(n_steps);
             for step in 0..n_steps {
                 let offset_hz = scan_start + step as f64 * step_hz;
-                let isolated_iq = if sample_rate > target_rate * 2 {
-                    Self::ddc_and_decimate(iq_data, sample_rate, offset_hz as f32, target_rate)
+                let (isolated_iq, isolated_rate) = if sample_rate > target_rate * 2 {
+                    (
+                        Self::ddc_and_decimate(iq_data, sample_rate, offset_hz as f32, target_rate),
+                        Self::decimated_rate(sample_rate, target_rate),
+                    )
                 } else {
-                    Self::ddc_and_decimate(iq_data, sample_rate, offset_hz as f32, sample_rate)
+                    (
+                        Self::ddc_and_decimate(iq_data, sample_rate, offset_hz as f32, sample_rate),
+                        sample_rate,
+                    )
                 };
                 let energy: f32 = isolated_iq
                     .iter()
                     .map(|s| s.re * s.re + s.im * s.im)
                     .sum::<f32>()
                     / isolated_iq.len() as f32;
-                probes.push((offset_hz, energy, isolated_iq));
+                probes.push((offset_hz, energy, isolated_iq, isolated_rate));
             }
 
             // Noise floor: 25th percentile of probe energies (robust to FM
@@ -790,16 +822,11 @@ impl FpvDetector for AnalogFpvDetector {
 
             // Collect all positive detections from the sweep
             let mut sweep_hits: Vec<(f64, f32, SignalType, f32)> = Vec::new(); // (freq_hz, energy, type, conf)
-            for (offset_hz, energy, isolated_iq) in &probes {
+            for (offset_hz, energy, isolated_iq, isolated_rate) in &probes {
                 if *energy <= energy_thresh {
                     continue;
                 }
-                let isolated_rate = if sample_rate > target_rate * 2 {
-                    target_rate
-                } else {
-                    sample_rate
-                };
-                let (sig_type, conf) = self.detect_sync_pulses(isolated_iq, isolated_rate);
+                let (sig_type, conf) = self.detect_sync_pulses(isolated_iq, *isolated_rate);
                 if sig_type != SignalType::Unknown {
                     let freq_hz = center_freq as f64 + offset_hz;
                     sweep_hits.push((freq_hz, *energy, sig_type, conf));
