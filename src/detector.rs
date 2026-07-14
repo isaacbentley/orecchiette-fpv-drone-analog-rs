@@ -131,6 +131,17 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     const PAL_HZ: f64 = 15625.0;
     const NTSC_HZ: f64 = 15734.0;
     const MIDPOINT_HZ: f64 = (PAL_HZ + NTSC_HZ) / 2.0;
+    // Reject medians far from BOTH standards outright. On FM-demodulated
+    // noise the dips below threshold occur essentially continuously, so
+    // the `min_gap` skip makes the median interval collapse to just
+    // above `min_gap` (30 µs → ~33 kHz "line rate"). Without this bound
+    // that absurd rate still classified as NTSC — it merely had to be
+    // *closer* to 15734 than to 15625 — which is exactly how empty-band
+    // noise got reported as a video signal on live captures. Real
+    // crystal error on a VTX is a few Hz; ±~250 Hz is already generous.
+    if !(15_400.0..=16_000.0).contains(&line_hz) {
+        return None;
+    }
     if (line_hz - MIDPOINT_HZ).abs() < 30.0 {
         return None;
     }
@@ -634,6 +645,41 @@ impl FpvDetector for AnalogFpvDetector {
             // itself; its `target_rate/3` passband stays inside Nyquist.
             let n_steps = ((scan_end - scan_start) / step_hz).round() as usize + 1;
 
+            // A 10–25 MHz capture yields only 1–3 probe positions — too
+            // few for the percentile noise floor below to mean anything
+            // (`sorted_e[len/4]` was 0.0 for < 4 probes, which let the
+            // strongest probe through the gate on a completely empty
+            // band, every batch). A video signal is ~20 MHz wide anyway,
+            // so at these rates it spans the whole capture: classify the
+            // capture as one baseband slice at the tuned centre instead,
+            // exactly like the ≤ 10 MHz fast path. This also reports ONE
+            // stable frequency (the centre) rather than 2-3 fake probe
+            // offsets that deduped into separate detections downstream.
+            if n_steps < 4 {
+                let (sig_type, conf) = self.detect_sync_pulses(iq_data, sample_rate);
+                if sig_type != SignalType::Unknown {
+                    let energy: f32 = iq_data
+                        .iter()
+                        .map(|s| s.re * s.re + s.im * s.im)
+                        .sum::<f32>()
+                        / iq_data.len() as f32;
+                    final_results.push(DetectionResult {
+                        channel: None,
+                        frequency_hz: center_freq,
+                        confidence: conf,
+                        rssi_dbm: 10.0 * energy.log10(),
+                        bandwidth_hz: sample_rate,
+                        signal_type: sig_type,
+                    });
+                }
+                final_results.retain(|r| {
+                    r.bandwidth_hz >= self.min_bandwidth
+                        && r.bandwidth_hz <= self.max_bandwidth
+                        && r.confidence >= self.min_confidence
+                });
+                return final_results;
+            }
+
             // First pass: measure energy at each probe position
             let mut probes: Vec<(f64, f32, Vec<Complex<f32>>)> = Vec::with_capacity(n_steps);
             for step in 0..n_steps {
@@ -652,17 +698,30 @@ impl FpvDetector for AnalogFpvDetector {
             }
 
             // Noise floor: 25th percentile of probe energies (robust to FM
-            // signals covering a large fraction of the bandwidth)
+            // signals covering a large fraction of the bandwidth).
+            // `n_steps >= 4` is guaranteed by the narrow-capture return
+            // above, so the percentile is always meaningful here.
             let mut sorted_e: Vec<f32> = probes.iter().map(|p| p.1).collect();
             sorted_e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let noise_floor = if sorted_e.len() >= 4 {
-                sorted_e[sorted_e.len() / 4]
-            } else {
-                0.0
-            };
+            let noise_floor = sorted_e[sorted_e.len() / 4];
             let max_energy = sorted_e.last().copied().unwrap_or(0.0);
             let multiplier = 10.0f32.powf(self.energy_threshold_db / 10.0);
-            let energy_thresh = (noise_floor * multiplier).max(0.001).min(max_energy * 0.5); // ≥3 dB above noise, but don't exclude the peak
+            // The threshold used to be capped at `max_energy * 0.5`
+            // ("don't exclude the peak"), but on a FLAT band — empty
+            // spectrum, every probe ≈ the same noise energy — that cap
+            // pulled the threshold BELOW the noise floor, so the
+            // strongest probe (i.e. some noise window) was analysed on
+            // every batch. A real signal clears floor + threshold_db on
+            // its own; a band where nothing does is a band with nothing
+            // in it. The one case the cap legitimately served — a floor
+            // of digital silence (0.0), where floor × multiplier gates
+            // nothing — keeps a half-max rescue so a lone strong signal
+            // over silence is still analysed.
+            let energy_thresh = if noise_floor > 0.0 {
+                noise_floor * multiplier
+            } else {
+                max_energy * 0.5
+            };
 
             // Collect all positive detections from the sweep
             let mut sweep_hits: Vec<(f64, f32, SignalType, f32)> = Vec::new(); // (freq_hz, energy, type, conf)
@@ -935,5 +994,75 @@ mod tests {
         let demod = make_synthetic_demod(sr, 15679.5, 80);
         let class = classify_pal_ntsc_time_domain(&demod, sr);
         assert_eq!(class, None);
+    }
+
+    /// Regression: a pulse train far from BOTH line rates must return
+    /// `None`, not "whichever standard is closer". FM-demodulated noise
+    /// produces dips continuously, so the scan's `min_gap` skip makes
+    /// the median interval collapse to ≈ 30 µs (~33 kHz) — which used
+    /// to classify as NTSC purely because 33 kHz is nearer 15734 than
+    /// 15625. That was the engine behind empty-band false positives on
+    /// live captures.
+    #[test]
+    fn time_domain_disambig_rejects_rates_far_from_both_standards() {
+        let sr = 25_000_000u32;
+        // ~28.6 kHz pulse train — a plausible noise/seam artifact rate,
+        // nowhere near a real video line rate.
+        let demod = make_synthetic_demod(sr, 28_600.0, 200);
+        let class = classify_pal_ntsc_time_domain(&demod, sr);
+        assert_eq!(class, None);
+    }
+
+    /// A 10–25 MHz capture (too narrow for a meaningful probe sweep)
+    /// must classify the whole slice and report the TUNED CENTRE, not
+    /// a probe-grid offset. At 15.36 MSPS the old sweep had exactly two
+    /// probes (centre −2.68 / +2.32 MHz) whose fake frequencies deduped
+    /// into separate downstream detections of the same transmitter.
+    #[test]
+    fn narrow_wideband_capture_reports_center_frequency() {
+        let sr = 15_360_000u32;
+        // 64 lines ≈ 63 k samples → bin_hz ≈ 244 Hz, so the PAL and
+        // NTSC line-rate bins collide and classification goes through
+        // the time-domain disambiguator — the same shape a live 15.36
+        // MSPS batch (~65 k samples) takes.
+        let iq = make_pal_pulse_train(sr, 64);
+        let det = AnalogFpvDetector::new(3.0);
+        let results = det.detect_from_iq(&iq, 5_800_000_000, sr);
+        assert_eq!(results.len(), 1, "expected exactly one detection");
+        assert_eq!(results[0].frequency_hz, 5_800_000_000);
+        assert_eq!(results[0].signal_type, SignalType::AnalogVideoPal);
+    }
+
+    /// Regression: a flat, empty band at a narrow-wideband rate must
+    /// yield NO detections. The old <4-probe path set `noise_floor` to
+    /// 0.0 and capped the threshold at `max_energy * 0.5`, so the
+    /// strongest noise window was analysed on every single batch —
+    /// which, combined with the unbounded time-domain classifier,
+    /// reported phantom PAL/NTSC video on live empty-spectrum captures.
+    #[test]
+    fn flat_noise_band_at_narrow_wideband_rate_yields_nothing() {
+        let sr = 15_360_000u32;
+        let n = 150_000;
+        let mut iq = Vec::with_capacity(n);
+        let mut seed = 0xDEADBEEFu64;
+        for _ in 0..n {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let re = (seed as f32 / u64::MAX as f32) * 2.0 - 1.0;
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let im = (seed as f32 / u64::MAX as f32) * 2.0 - 1.0;
+            // Scale to the low amplitudes an int16-quantised empty band
+            // actually delivers.
+            iq.push(Complex::new(re * 1e-3, im * 1e-3));
+        }
+        let det = AnalogFpvDetector::default();
+        let results = det.detect_from_iq(&iq, 3_650_000_000, sr);
+        assert!(
+            results.is_empty(),
+            "empty band produced detections: {results:?}"
+        );
     }
 }
