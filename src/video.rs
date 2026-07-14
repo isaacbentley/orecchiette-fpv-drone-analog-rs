@@ -413,6 +413,17 @@ impl FrameReconstructor {
         self.line_period
     }
 
+    /// Override the FM peak-deviation estimate used to scale the sync
+    /// thresholds, AGC, and DOC rails (see [`crate::levels`]). Safe to
+    /// call at any time, including between calls to
+    /// `reconstruct_frame_into` — every threshold derived from
+    /// `radians_per_volt` is recomputed from `self.fm_deviation` at the
+    /// start of each call, so there's no stale cached state to
+    /// invalidate.
+    pub fn set_fm_deviation(&mut self, deviation_hz: f32) {
+        self.fm_deviation = deviation_hz;
+    }
+
     /// Latest field's sync-extraction confidence in `[0, 1]`. 1.0
     /// means every sync tip in the field passed the MAD-outlier
     /// check; 0.0 means catastrophic dropout. Reads the metadata
