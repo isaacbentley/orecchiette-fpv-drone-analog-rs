@@ -21,6 +21,7 @@ A high-performance Rust crate for detecting analog FPV drone video signals using
 - **Signal Clustering**: Aggregates proximate DDC probe hits (within 25 MHz) to emit single, consolidated detection events.
 - **Standardized Scoring**: Employs a 0.0–1.0 confidence scoring model consistent across workspace detection heuristics.
 - **Hardware Agnostic**: Processes standard complex I/Q samples independent of the underlying SDR hardware.
+- **Optional GPU Acceleration** (`gpu` feature, off by default): batches the wideband sweep's per-probe DDC mixer + FIR + decimate across every probe in one wgpu compute dispatch, instead of running it sequentially per probe on the CPU — the sweep's dominant cost on wide (50+ MSPS) captures. See `DESIGN.md` §10 for the numerical-precision approach and why classification stays on the CPU either way.
 
 ## Installation
 
@@ -29,6 +30,26 @@ Add this to your `Cargo.toml`:
 [dependencies]
 orecchiette-fpv-drone-analog-rs = "0.1.0"
 num-complex = "0.4"
+```
+
+To enable the optional GPU-accelerated wideband sweep:
+```toml
+[dependencies]
+orecchiette-fpv-drone-analog-rs = { version = "0.1.0", features = ["gpu"] }
+```
+```rust
+use orecchiette_fpv_drone_analog_rs::detector::AnalogFpvDetector;
+use orecchiette_fpv_drone_analog_rs::gpu::GpuAnalog;
+use std::sync::Arc;
+
+// Build once (opens a GPU device) and share across every detector —
+// AnalogFpvDetector itself stays per-thread (it holds an FftPlanner),
+// but GpuAnalog is Send + Sync and meant to be Arc-shared.
+if let Some(gpu) = GpuAnalog::try_new() {
+    let detector = AnalogFpvDetector::with_gpu(Arc::new(gpu));
+    // ... detector.detect_from_iq(...) as usual — falls back to the
+    // CPU sweep automatically if GpuAnalog::try_new() returns None.
+}
 ```
 
 ## Usage
@@ -95,6 +116,8 @@ cargo test -p orecchiette-fpv-drone-analog-rs
 Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. `synthetic::generate_fields`/`generate_iq` build standards-shaped NTSC/PAL fields with real vertical-sync structure (equalizing/serrated-broad pulses, correct blanking, interlace parity), shared by every module's tests so generator and parser can't independently drift. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), the VBI parser (broad-group location, field-parity hypothesis test for both standards and parities, noise robustness), the confidence-tier policy (boost/promote/demote, as a pure function independent of any specific IQ signal), the FM-deviation estimator's accuracy across a range of deviation/sample-rate pairs, and the deemphasis filter's DC gain / −3 dB point / streaming continuity.
 
 `video::FrameReconstructor` additionally has regression tests confirming `reconstruct_frame_into` degrades to `None` rather than panicking on a mismatched output-buffer size, empty input, and degenerate configuration (`sample_rate = 0`), plus geometry tests proving a test pattern lands on the correct output row for both NTSC and PAL (the standards-correct-blanking fix) and a dropped-field test proving the VBI parser's parity override — not a naive per-call toggle — recovers correct interlacing after a lost field.
+
+With `--features gpu`, `cargo test --features gpu` additionally runs `detector::tests::gpu_ddc_matches_cpu_ddc_and_decimate` (a stage-level check comparing the batched GPU DDC directly against the CPU's `ddc_and_decimate`) and `tests/gpu_equivalence.rs`'s two end-to-end tests (`AnalogFpvDetector::with_gpu` vs `::default()` agreeing on signal type and frequency for a single-signal and a two-signal wideband capture). All three skip gracefully with no GPU adapter.
 
 ### End-to-end decode check
 

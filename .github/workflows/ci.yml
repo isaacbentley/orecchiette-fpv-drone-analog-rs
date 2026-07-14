@@ -49,6 +49,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Software Vulkan (lavapipe) so the `gpu`-feature equivalence
+      # tests in tests/gpu_equivalence.rs actually exercise the wgpu
+      # path here instead of only skipping via their "no adapter"
+      # branch. This is necessary, not sufficient, for GPU correctness:
+      # lavapipe is a different backend from the Metal path the crate
+      # actually ships on — see gpu.rs's module doc comment for a case
+      # where a bug only showed up on real hardware over a full-size
+      # buffer.
+      - name: Install Vulkan (lavapipe) drivers
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+
       - name: cargo test
         run: cargo test --all-features
 

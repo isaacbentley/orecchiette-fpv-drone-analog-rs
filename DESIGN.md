@@ -287,3 +287,52 @@ re-filter already-filtered samples on every call. `demod::Deemphasis`
 is instead applied exactly once, stream-side, immediately after
 `demod::fm_demod` and before samples ever enter that persistent
 buffer.
+
+## 10. Optional GPU Acceleration (`gpu` feature)
+
+§6's per-probe DDC mixer + FIR pass (`ddc_and_decimate`) is the wideband
+sweep's dominant cost: it runs once per probe, sequentially, over the
+*entire* un-decimated input batch. The `gpu` feature (off by default;
+adds `wgpu`, `pollster`, `bytemuck` as optional deps) batches every
+probe's DDC into one wgpu compute dispatch via `gpu::GpuAnalog`,
+constructed once with `GpuAnalog::try_new()` and shared (via `Arc`)
+across every worker's `AnalogFpvDetector::with_gpu(...)`. Falls back to
+the existing sequential CPU sweep automatically — both when the feature
+is off and when `try_new()` finds no adapter.
+
+**What moves to the GPU:** the mixer + 63-tap Blackman-sinc FIR +
+decimate, batched across every probe *and* every output sample
+(`src/shaders/ddc_decimate.wgsl`). **What stays on the CPU, unchanged:**
+`fm_demod`, the classification FFT, harmonic-comb checks, and the
+cepstrum gate — all arbitrary-length (not power-of-two, so a GPU FFT
+library doesn't apply) and carrying the delicate PAL/NTSC bin math.
+Only 0–3 probes typically clear the energy gate per batch, so keeping
+classification on CPU costs almost nothing while making GPU/CPU parity
+trivial to verify (`GpuAnalog::sweep` only has to reproduce
+`ddc_and_decimate`'s decimated IQ, not the classification logic).
+
+**Phase precision.** Each output sample's mixer needs the phasor at its
+anchor input index `i0 = out_idx * decimation_factor`, which reaches
+~1e6 for a full-size batch. Computing `phase_adv * f32(i0)` directly in
+the shader — or accumulating it via a long GPU-side recursive-phasor
+pass — both lose enough absolute precision at that magnitude (f32's
+~24-bit mantissa) to measurably corrupt the output; an earlier version
+of this feature that tried the latter drifted by several degrees of
+phase by mid-buffer, caught by
+`detector::tests::gpu_ddc_matches_cpu_ddc_and_decimate` comparing
+directly against `ddc_and_decimate`. The fix: `gpu::build_phase_table`
+computes the anchor phasor for every `(probe, out_idx)` directly, in
+`f64`, on the CPU host — no accumulation, so no drift, and cheap
+relative to the GPU-offloaded work (`n_probes * out_len` vs. `n_probes *
+total_iq_len * num_taps`). The GPU kernel then only ever walks that
+anchor backward by up to `num_taps` (63) small, bounded steps to reach
+any tap in its window.
+
+**Testing.** `detector::tests::gpu_ddc_matches_cpu_ddc_and_decimate`
+checks the GPU kernel directly against `ddc_and_decimate` (RMS tolerance
+1%, well above the < 0.1% actually observed). `tests/gpu_equivalence.rs`
+checks `AnalogFpvDetector::with_gpu` against `::default()` end-to-end on
+single- and two-signal wideband captures. All skip gracefully with no
+adapter — and, as with the DJI crate's own GPU front-end, CI's lavapipe
+backend is a different code path from Metal, so these are only fully
+conclusive when run locally on real hardware.

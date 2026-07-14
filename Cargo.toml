@@ -16,4 +16,13 @@ serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
 rayon = "1"
 log = "0.4"
+# Optional GPU compute back-end (`gpu` feature) for the wideband sweep's
+# per-probe DDC. Kept optional so the default published crate stays pure
+# CPU + rayon with no GPU-driver dependency for callers who don't need it.
+wgpu = { version = "29.0", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 

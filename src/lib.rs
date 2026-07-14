@@ -3,6 +3,8 @@ pub mod ddc;
 pub mod demod;
 pub mod detector;
 pub mod frame_history;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod levels;
 pub mod scanner;
 pub mod synthetic;

@@ -50,6 +50,15 @@ pub struct AnalogFpvDetector {
     /// presence as reassuring.
     pub demote_unconfirmed_video: bool,
     planner: RefCell<FftPlanner<f32>>,
+    /// Optional GPU handle for the wideband sweep's batched DDC (see
+    /// [`crate::gpu::GpuAnalog`], behind the `gpu` feature). `None` — the
+    /// default — runs the existing sequential-per-probe CPU sweep
+    /// unchanged. Meant to be shared via `Arc` across every worker's
+    /// detector instance (unlike the detector itself, which stays
+    /// per-worker because of `planner`'s `RefCell`); build one with
+    /// [`Self::with_gpu`].
+    #[cfg(feature = "gpu")]
+    gpu: Option<std::sync::Arc<crate::gpu::GpuAnalog>>,
 }
 
 impl Default for AnalogFpvDetector {
@@ -61,6 +70,23 @@ impl Default for AnalogFpvDetector {
             min_confidence: 0.7,
             demote_unconfirmed_video: false,
             planner: RefCell::new(FftPlanner::new()),
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl AnalogFpvDetector {
+    /// Build a detector that offloads the wideband sweep's DDC to `gpu`.
+    /// `gpu` is typically one process-wide [`crate::gpu::GpuAnalog`]
+    /// shared across every worker's detector via `Arc::clone` — building
+    /// a `GpuAnalog` opens a GPU device, so callers should construct it
+    /// once, not per detector.
+    pub fn with_gpu(gpu: std::sync::Arc<crate::gpu::GpuAnalog>) -> Self {
+        Self {
+            gpu: Some(gpu),
+            ..Self::default()
         }
     }
 }
@@ -772,26 +798,61 @@ impl FpvDetector for AnalogFpvDetector {
             // later — that assumption used to silently diverge from
             // reality whenever `sample_rate` wasn't an exact multiple of
             // `target_rate`.
+            //
+            // `target_rate_prime` is the same for every probe in this
+            // call (only the mixing offset varies), matching the choice
+            // the pre-GPU per-probe loop below made independently each
+            // iteration — hoisted out so the batched GPU path can pass
+            // one shared `decimation_factor`/`cutoff_hz` for the whole
+            // sweep.
+            let target_rate_prime = if sample_rate > target_rate * 2 {
+                target_rate
+            } else {
+                sample_rate
+            };
+            let isolated_rate = Self::decimated_rate(sample_rate, target_rate_prime);
+            let offsets: Vec<f64> = (0..n_steps)
+                .map(|step| scan_start + step as f64 * step_hz)
+                .collect();
+
             let mut probes: Vec<(f64, f32, Vec<Complex<f32>>, u32)> = Vec::with_capacity(n_steps);
-            for step in 0..n_steps {
-                let offset_hz = scan_start + step as f64 * step_hz;
-                let (isolated_iq, isolated_rate) = if sample_rate > target_rate * 2 {
-                    (
-                        Self::ddc_and_decimate(iq_data, sample_rate, offset_hz as f32, target_rate),
-                        Self::decimated_rate(sample_rate, target_rate),
-                    )
-                } else {
-                    (
-                        Self::ddc_and_decimate(iq_data, sample_rate, offset_hz as f32, sample_rate),
+
+            #[cfg(feature = "gpu")]
+            let gpu_decimated: Option<Vec<Vec<Complex<f32>>>> = self.gpu.as_ref().map(|gpu| {
+                let decimation_factor = Self::decimation_factor(sample_rate, target_rate_prime);
+                let cutoff_hz = target_rate_prime as f32 / 3.0;
+                gpu.sweep(iq_data, sample_rate, &offsets, decimation_factor, cutoff_hz)
+            });
+            #[cfg(not(feature = "gpu"))]
+            let gpu_decimated: Option<Vec<Vec<Complex<f32>>>> = None;
+
+            if let Some(decimated) = gpu_decimated {
+                // Batched GPU sweep: one DDC dispatch for every probe,
+                // instead of `n_steps` sequential CPU passes over the
+                // whole input.
+                for (&offset_hz, isolated_iq) in offsets.iter().zip(decimated) {
+                    let energy: f32 = isolated_iq
+                        .iter()
+                        .map(|s| s.re * s.re + s.im * s.im)
+                        .sum::<f32>()
+                        / isolated_iq.len() as f32;
+                    probes.push((offset_hz, energy, isolated_iq, isolated_rate));
+                }
+            } else {
+                for &offset_hz in &offsets {
+                    let isolated_iq = Self::ddc_and_decimate(
+                        iq_data,
                         sample_rate,
-                    )
-                };
-                let energy: f32 = isolated_iq
-                    .iter()
-                    .map(|s| s.re * s.re + s.im * s.im)
-                    .sum::<f32>()
-                    / isolated_iq.len() as f32;
-                probes.push((offset_hz, energy, isolated_iq, isolated_rate));
+                        offset_hz as f32,
+                        target_rate_prime,
+                    );
+                    let energy: f32 = isolated_iq
+                        .iter()
+                        .map(|s| s.re * s.re + s.im * s.im)
+                        .sum::<f32>()
+                        / isolated_iq.len() as f32;
+                    probes.push((offset_hz, energy, isolated_iq, isolated_rate));
+                }
             }
 
             // Noise floor: 25th percentile of probe energies (robust to FM
@@ -945,6 +1006,61 @@ mod tests {
             phase += b;
         }
         iq
+    }
+
+    /// Stage-parity check for GPU Phase 2: the batched GPU DDC
+    /// (`GpuAnalog::sweep`) must reproduce `ddc_and_decimate`'s decimated
+    /// IQ closely enough that downstream classification (unchanged, CPU,
+    /// operating on this output) sees the same signal. Compares directly
+    /// against the private `ddc_and_decimate`/`decimation_factor`
+    /// helpers rather than going through `detect_from_iq`, so a
+    /// divergence here points straight at the GPU kernels rather than
+    /// requiring a classification-level failure to notice it.
+    ///
+    /// Skips gracefully with no adapter. Only meaningfully validates
+    /// Metal-specific numerics when run on the dev Mac — see the crate's
+    /// GPU acceleration plan for why CI's lavapipe backend isn't a
+    /// substitute for that.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_ddc_matches_cpu_ddc_and_decimate() {
+        let Some(gpu) = crate::gpu::GpuAnalog::try_new() else {
+            eprintln!("No GPU adapter found; skipping gpu_ddc_matches_cpu_ddc_and_decimate");
+            return;
+        };
+
+        let sample_rate = 50_000_000u32;
+        let iq = make_pal_pulse_train(sample_rate, 2000);
+        let target_rate = WIDEBAND_TARGET_RATE_HZ;
+        let offset_hz = -10_000_000.0f64;
+        let decimation_factor = AnalogFpvDetector::decimation_factor(sample_rate, target_rate);
+        let cutoff_hz = target_rate as f32 / 3.0;
+
+        let cpu_out =
+            AnalogFpvDetector::ddc_and_decimate(&iq, sample_rate, offset_hz as f32, target_rate);
+        let gpu_out = gpu.sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz);
+        let gpu_probe = &gpu_out[0];
+
+        assert_eq!(
+            cpu_out.len(),
+            gpu_probe.len(),
+            "GPU/CPU decimated length mismatch"
+        );
+
+        let mut sq_err = 0.0f64;
+        let mut sq_ref = 0.0f64;
+        for (c, g) in cpu_out.iter().zip(gpu_probe.iter()) {
+            let d_re = (c.re - g.re) as f64;
+            let d_im = (c.im - g.im) as f64;
+            sq_err += d_re * d_re + d_im * d_im;
+            sq_ref += (c.re as f64).powi(2) + (c.im as f64).powi(2);
+        }
+        let rel_rms = (sq_err / sq_ref.max(1e-12)).sqrt();
+        assert!(
+            rel_rms < 0.01,
+            "GPU DDC output diverges from CPU by {:.4}% RMS (tolerance 1%)",
+            rel_rms * 100.0
+        );
     }
 
     #[test]

@@ -36,6 +36,54 @@ use std::f32::consts::PI;
 /// roughly 40 dB better than the boxcar of equivalent length.
 pub const DEFAULT_FIR_TAPS: usize = 63;
 
+/// Design a Blackman-windowed-sinc low-pass FIR, in natural (non-reversed)
+/// impulse-response order, normalised to unity DC gain. Factored out of
+/// [`StreamingDDC::with_taps`] so the `gpu` feature's batched DDC compute
+/// shader can upload the *exact* same filter design the CPU path uses —
+/// the sliding-DDC sweep's PAL/NTSC classification depends on the FIR's
+/// passband/stopband shape, so GPU and CPU probes must share one design
+/// function rather than risk two implementations drifting apart.
+///
+/// `num_taps` is clamped to a minimum of 3 (see [`StreamingDDC::with_taps`]
+/// for why) and `sample_rate` to a minimum of 1 Hz.
+pub(crate) fn design_fir_taps(cutoff_hz: f32, sample_rate: u32, num_taps: usize) -> Vec<f32> {
+    let num_taps = num_taps.max(3);
+    let sample_rate = sample_rate.max(1);
+    let cutoff_norm = cutoff_hz / sample_rate as f32;
+    let m = (num_taps - 1) as f32 / 2.0;
+    let mut taps = vec![0.0f32; num_taps];
+    for i in 0..num_taps {
+        let n = i as f32 - m;
+        // Windowed sinc — exact value at n=0 is `2·cutoff_norm`
+        // (the impulse-response peak), avoiding the 0/0 form.
+        let sinc = if n.abs() < 1e-6 {
+            2.0 * cutoff_norm
+        } else {
+            (2.0 * PI * cutoff_norm * n).sin() / (PI * n)
+        };
+        // Blackman window — > 50 dB stopband.
+        let window = 0.42 - 0.5 * (2.0 * PI * i as f32 / (num_taps - 1) as f32).cos()
+            + 0.08 * (4.0 * PI * i as f32 / (num_taps - 1) as f32).cos();
+        taps[i] = sinc * window;
+    }
+    // Normalise to unity gain at DC. A degenerate design (e.g.
+    // `cutoff_hz == 0`, which zeros every sinc term → `sum == 0`) would
+    // otherwise divide by zero and yield NaN taps; fall back to a centred
+    // unit impulse (unity-gain passthrough) so the filter stays finite.
+    let sum: f32 = taps.iter().sum();
+    if sum.is_finite() && sum.abs() > 1e-20 {
+        for t in &mut taps {
+            *t /= sum;
+        }
+    } else {
+        for t in taps.iter_mut() {
+            *t = 0.0;
+        }
+        taps[num_taps / 2] = 1.0;
+    }
+    taps
+}
+
 /// Streaming mixer + low-pass FIR for use in real-time and offline
 /// pipelines. Preserves filter delay-line state across `process()`
 /// calls, so a long capture can be processed in chunks without
@@ -121,38 +169,7 @@ impl StreamingDDC {
         let (step_im, step_re) = phase_adv.sin_cos();
         let step_phasor = Complex::new(step_re, step_im);
 
-        let cutoff_norm = cutoff_hz / sample_rate as f32;
-        let m = (num_taps - 1) as f32 / 2.0;
-        let mut taps = vec![0.0f32; num_taps];
-        for i in 0..num_taps {
-            let n = i as f32 - m;
-            // Windowed sinc — exact value at n=0 is `2·cutoff_norm`
-            // (the impulse-response peak), avoiding the 0/0 form.
-            let sinc = if n.abs() < 1e-6 {
-                2.0 * cutoff_norm
-            } else {
-                (2.0 * PI * cutoff_norm * n).sin() / (PI * n)
-            };
-            // Blackman window — > 50 dB stopband.
-            let window = 0.42 - 0.5 * (2.0 * PI * i as f32 / (num_taps - 1) as f32).cos()
-                + 0.08 * (4.0 * PI * i as f32 / (num_taps - 1) as f32).cos();
-            taps[i] = sinc * window;
-        }
-        // Normalise to unity gain at DC. A degenerate design (e.g.
-        // `cutoff_hz == 0`, which zeros every sinc term → `sum == 0`) would
-        // otherwise divide by zero and yield NaN taps; fall back to a centred
-        // unit impulse (unity-gain passthrough) so the filter stays finite.
-        let sum: f32 = taps.iter().sum();
-        if sum.is_finite() && sum.abs() > 1e-20 {
-            for t in &mut taps {
-                *t /= sum;
-            }
-        } else {
-            for t in taps.iter_mut() {
-                *t = 0.0;
-            }
-            taps[num_taps / 2] = 1.0;
-        }
+        let taps = design_fir_taps(cutoff_hz, sample_rate, num_taps);
 
         // Pre-reversed taps for the doubled-buffer convolution.
         // `taps_for_conv[k]` will multiply the k-th-oldest sample in
