@@ -60,7 +60,7 @@ pub struct DeviationEstimate {
 }
 
 #[inline]
-fn moving_average(data: &[f32], win: usize) -> Vec<f32> {
+pub(crate) fn moving_average(data: &[f32], win: usize) -> Vec<f32> {
     if win <= 1 || data.len() < win {
         return data.to_vec();
     }
@@ -80,7 +80,7 @@ fn moving_average(data: &[f32], win: usize) -> Vec<f32> {
 /// Median of a slice via `select_nth_unstable` (O(n), no full sort).
 /// Returns 0.0 for an empty slice — callers only call this on
 /// already-length-checked data.
-fn median(values: &mut [f32]) -> f32 {
+pub(crate) fn median(values: &mut [f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
     }

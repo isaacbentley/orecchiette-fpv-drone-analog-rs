@@ -16,7 +16,9 @@
 )]
 
 use crate::frame_history::{FieldMeta, FrameHistory};
+use crate::levels::{SyncLevels, estimate_sync_levels};
 use crate::types::SignalType;
+use crate::vbi::{FieldParity, find_vertical_sync};
 use rayon::prelude::*;
 use std::io::Write;
 
@@ -494,61 +496,109 @@ impl FrameReconstructor {
         let radians_per_volt = 2.0 * std::f32::consts::PI * self.fm_deviation / fs;
         let v_sync_threshold = -0.3 * radians_per_volt;
         let window_len = self.samples_per_line;
-
-        let mut v_sync_idx = None;
-        if demod_data.len() > window_len * 2 {
-            let mut below_count = 0usize;
-            for i in 0..window_len {
-                if demod_data[i] < v_sync_threshold {
-                    below_count += 1;
-                }
-            }
-            let density_threshold = window_len / 2;
-            if below_count > density_threshold {
-                v_sync_idx = Some(0);
-            } else {
-                for start in 1..demod_data.len() - window_len {
-                    if demod_data[start - 1] < v_sync_threshold {
-                        below_count -= 1;
-                    }
-                    if demod_data[start + window_len - 1] < v_sync_threshold {
-                        below_count += 1;
-                    }
-                    if below_count > density_threshold {
-                        v_sync_idx = Some(start);
-                        break;
-                    }
-                }
-            }
-        }
-        let v_idx = v_sync_idx?;
-        let required_samples = v_idx + self.samples_per_line * (20 + self.field_lines + 2);
-        if demod_data.len() < required_samples {
-            return None;
-        }
-
-        // Search for first H-sync tip after V-sync + blanking lines.
-        let skip_lines = v_idx + (self.samples_per_line * 20);
         let ma_win = ((fs * 0.5e-6) as usize).max(1);
         let sync_window = (fs * 2.0e-6) as usize;
         // Back-porch reference window: wider than the ~4.7 µs sync pulse
         // so the max reaches the blanking level on both sides.
         let porch_radius = (fs * 3.5e-6) as usize;
 
-        // Anchor = robust centre of the first H-sync tip in the ~2 lines
-        // after the blanking skip. Brightness-invariant (see
-        // `robust_sync_tip_center`); the two-pass extraction below
-        // validates every tip against the median period, so the anchor
-        // needs no extra smoothing.
-        let first_sync_center = robust_sync_tip_center(
-            demod_data,
-            (skip_lines + self.samples_per_line) as f32,
-            self.samples_per_line,
-            porch_radius,
-            ma_win,
-            v_sync_threshold * 0.8,
-        )
-        .unwrap_or((skip_lines + self.samples_per_line) as f32);
+        // Prefer the structural VBI parser (crate::vbi): it locates the
+        // actual serrated vertical-sync group, so the active-video
+        // anchor and (when conclusive) field parity come from real
+        // pulse structure instead of a density heuristic + a hardcoded
+        // 20-line blanking guess that's wrong for PAL (25 lines) and
+        // can never detect parity at all. `estimate_sync_levels` needs
+        // ~40 ms of data to be trustworthy — many single-call slices
+        // are shorter than that (one field alone is 16.7–20 ms), so it
+        // commonly falls back to the levels implied by `self.fm_deviation`,
+        // which for a correctly-locked deviation is exactly right.
+        let sync_levels =
+            estimate_sync_levels(demod_data, self.sample_rate).unwrap_or(SyncLevels {
+                sync_tip: -0.4 * radians_per_volt,
+                blanking: 0.0,
+            });
+        let vbi_info = find_vertical_sync(demod_data, self.sample_rate, &sync_levels, self.pal);
+
+        let first_sync_center;
+        let required_samples;
+        if let Some(info) = &vbi_info {
+            if let Some(parity) = info.parity {
+                self.field_parity = match parity {
+                    FieldParity::First => 0,
+                    FieldParity::Second => 1,
+                };
+            }
+            first_sync_center = info.field_active_start;
+            required_samples = (info.field_active_start.max(0.0) as usize)
+                + self.samples_per_line * (self.field_lines + 2);
+            if self.debug_dump {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "[VBI] broad={} eq={}/{} parity={:?} active@{:.0}",
+                    info.n_broad,
+                    info.n_eq_pre,
+                    info.n_eq_post,
+                    info.parity,
+                    info.field_active_start
+                );
+            }
+        } else {
+            // Fall back to the density heuristic + a fixed 20-line
+            // blanking skip — real VBI is dirtier than the spec on
+            // cheap FPV cameras and deep fades, and this path stays
+            // exactly as it was before the parser existed.
+            let mut v_sync_idx = None;
+            if demod_data.len() > window_len * 2 {
+                let mut below_count = 0usize;
+                for i in 0..window_len {
+                    if demod_data[i] < v_sync_threshold {
+                        below_count += 1;
+                    }
+                }
+                let density_threshold = window_len / 2;
+                if below_count > density_threshold {
+                    v_sync_idx = Some(0);
+                } else {
+                    for start in 1..demod_data.len() - window_len {
+                        if demod_data[start - 1] < v_sync_threshold {
+                            below_count -= 1;
+                        }
+                        if demod_data[start + window_len - 1] < v_sync_threshold {
+                            below_count += 1;
+                        }
+                        if below_count > density_threshold {
+                            v_sync_idx = Some(start);
+                            break;
+                        }
+                    }
+                }
+            }
+            let v_idx = v_sync_idx?;
+            required_samples = v_idx + self.samples_per_line * (20 + self.field_lines + 2);
+            if demod_data.len() >= required_samples {
+                // Search for first H-sync tip after V-sync + blanking lines.
+                let skip_lines = v_idx + (self.samples_per_line * 20);
+                // Anchor = robust centre of the first H-sync tip in the
+                // ~2 lines after the blanking skip. Brightness-invariant
+                // (see `robust_sync_tip_center`); the two-pass extraction
+                // below validates every tip against the median period, so
+                // the anchor needs no extra smoothing.
+                first_sync_center = robust_sync_tip_center(
+                    demod_data,
+                    (skip_lines + self.samples_per_line) as f32,
+                    self.samples_per_line,
+                    porch_radius,
+                    ma_win,
+                    v_sync_threshold * 0.8,
+                )
+                .unwrap_or((skip_lines + self.samples_per_line) as f32);
+            } else {
+                first_sync_center = 0.0; // unused: the length check below returns None first
+            }
+        }
+        if demod_data.len() < required_samples {
+            return None;
+        }
         self.sync_phase = first_sync_center;
 
         // ═══════════════════════════════════════════════════════════
@@ -1160,44 +1210,64 @@ impl FrameReconstructor {
         self.field_counter = self.field_counter.wrapping_add(1);
         self.has_prev = true;
 
-        // Advance to the next field. Anchor the search to the expected
-        // field boundary — row-0 sync (`sync_positions[0]`, the most
-        // reliable datum) plus one field of active line-periods — rather
-        // than walking forward from the last rendered row's sync and
-        // taking the *first* density spike. During the vertical-sync
-        // interval many one-line windows clear the density threshold;
-        // the first of them is the leading equalizing pulse, ~2-3 lines
-        // before the true next-field datum. Latching that leading edge
-        // makes the next call open mid-V-sync, which is the startup
-        // mis-lock that craters sync-quality on the first few fields.
-        // Instead, scan a short forward window past active video and
-        // pick the *strongest* sync plateau, falling back to a clean
-        // one-field advance if nothing clears the threshold (so we slip
-        // at most a fraction of a field rather than skipping whole
-        // fields).
-        let field_start = sync_positions[0];
-        let nominal_advance = field_start + self.line_period * self.field_lines as f32;
-        let mut consumed = nominal_advance.round() as usize;
-        let density_threshold = self.samples_per_line / 2;
-        let stride = (self.samples_per_line / 4).max(1);
-        let search_lo = consumed;
-        let search_hi = (search_lo + 8 * self.samples_per_line)
-            .min(demod_data.len().saturating_sub(self.samples_per_line));
-        let mut best_below = density_threshold; // require at least the threshold to override the fallback
-        let mut probe = search_lo;
-        while probe < search_hi {
-            let mut below = 0usize;
-            for i in probe..probe + self.samples_per_line {
-                if demod_data[i] < v_sync_threshold {
-                    below += 1;
+        // Advance to the next field. When the VBI parser locked, the
+        // next field's vertical-sync group starts exactly one field
+        // duration after this one's `broad_start` — a direct datum,
+        // not a search — so `consumed` lands a few lines *before* it
+        // (via `margin`), letting the next call's own parser find it
+        // fresh rather than us guessing where mid-field. This also
+        // structurally avoids the old heuristic's failure mode (the
+        // leading equalizing pulse look-alike, described below).
+        let consumed = if let Some(info) = &vbi_info {
+            let field_total_lines = if self.pal {
+                crate::vbi::consts::PAL_FIELD_TOTAL_LINES
+            } else {
+                crate::vbi::consts::NTSC_FIELD_TOTAL_LINES
+            } as f32;
+            let margin_lines = 6.0;
+            let advance = info.broad_start + (field_total_lines - margin_lines) * self.line_period;
+            advance.round() as usize
+        } else {
+            // Anchor the search to the expected field boundary — row-0
+            // sync (`sync_positions[0]`, the most reliable datum) plus
+            // one field of active line-periods — rather than walking
+            // forward from the last rendered row's sync and taking the
+            // *first* density spike. During the vertical-sync interval
+            // many one-line windows clear the density threshold; the
+            // first of them is the leading equalizing pulse, ~2-3 lines
+            // before the true next-field datum. Latching that leading
+            // edge makes the next call open mid-V-sync, which is the
+            // startup mis-lock that craters sync-quality on the first
+            // few fields. Instead, scan a short forward window past
+            // active video and pick the *strongest* sync plateau,
+            // falling back to a clean one-field advance if nothing
+            // clears the threshold (so we slip at most a fraction of a
+            // field rather than skipping whole fields).
+            let field_start = sync_positions[0];
+            let nominal_advance = field_start + self.line_period * self.field_lines as f32;
+            let mut consumed = nominal_advance.round() as usize;
+            let density_threshold = self.samples_per_line / 2;
+            let stride = (self.samples_per_line / 4).max(1);
+            let search_lo = consumed;
+            let search_hi = (search_lo + 8 * self.samples_per_line)
+                .min(demod_data.len().saturating_sub(self.samples_per_line));
+            let mut best_below = density_threshold; // require at least the threshold to override the fallback
+            let mut probe = search_lo;
+            while probe < search_hi {
+                let mut below = 0usize;
+                for i in probe..probe + self.samples_per_line {
+                    if demod_data[i] < v_sync_threshold {
+                        below += 1;
+                    }
                 }
+                if below > best_below {
+                    best_below = below;
+                    consumed = probe;
+                }
+                probe += stride;
             }
-            if below > best_below {
-                best_below = below;
-                consumed = probe;
-            }
-            probe += stride;
-        }
+            consumed
+        };
 
         // Never report consuming past the end of the input. `nominal_advance`
         // is built from the float `line_period`, while the up-front
@@ -1280,5 +1350,172 @@ mod tests {
         let mut fr = FrameReconstructor::new(0, false, 200_000.0, false);
         let demod_data = vec![0.0f32; 1000];
         assert!(fr.reconstruct_frame(&demod_data).is_none());
+    }
+
+    use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_fields};
+
+    fn base_synth_config(is_pal: bool, deviation_hz: f32) -> SyntheticVideoConfig {
+        SyntheticVideoConfig {
+            sample_rate: 15_360_000,
+            is_pal,
+            deviation_hz,
+            pattern: TestPattern::Flat(0.0),
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        }
+    }
+
+    /// Average luma of an output row (`0xFF000000 | c<<16 | c<<8 | c`,
+    /// so the blue byte alone is the luma value).
+    fn row_avg_luma(frame: &[u32], width: usize, row: usize) -> f32 {
+        let off = row * width;
+        let sum: u32 = frame[off..off + width].iter().map(|&px| px & 0xFF).sum();
+        sum as f32 / width as f32
+    }
+
+    /// A full-width bright band proves *row* placement without needing
+    /// to reason about the TBC's column resampling/crop — the concern
+    /// this test exists for is [`crate::vbi`]'s standards-correct
+    /// blanking (PAL 25 lines vs the old hardcoded 20), a purely
+    /// vertical effect.
+    #[test]
+    fn white_band_lands_on_the_correct_row_for_ntsc_and_pal() {
+        for is_pal in [false, true] {
+            let deviation_hz = 5e6;
+            let mut cfg = base_synth_config(is_pal, deviation_hz);
+            let row0 = 100;
+            let band_h = 20;
+            cfg.pattern = TestPattern::WhiteSquare {
+                row0,
+                col0: 0,
+                h: band_h,
+                w: crate::synthetic::OUTPUT_WIDTH,
+            };
+            let data = generate_fields(&cfg, 3);
+
+            let mut recon = FrameReconstructor::new(cfg.sample_rate, is_pal, deviation_hz, false);
+            let mut frame = vec![0u32; recon.width * recon.height];
+            recon
+                .reconstruct_frame_into(&data, &mut frame)
+                .unwrap_or_else(|| panic!("is_pal={is_pal}: expected a reconstructed field"));
+
+            let parity = recon.field_parity as usize ^ 1; // this call's parity, before the end-of-call toggle
+            let bright_row = row0 * 2 + parity;
+            let dark_row_above = (row0 - 10) * 2 + parity;
+            let dark_row_below = (row0 + band_h + 10) * 2 + parity;
+
+            let bright = row_avg_luma(&frame, recon.width, bright_row);
+            let dark_above = row_avg_luma(&frame, recon.width, dark_row_above);
+            let dark_below = row_avg_luma(&frame, recon.width, dark_row_below);
+            assert!(
+                bright > 180.0,
+                "is_pal={is_pal}: row {bright_row} luma {bright}, expected bright"
+            );
+            assert!(
+                dark_above < 60.0,
+                "is_pal={is_pal}: row {dark_row_above} luma {dark_above}, expected dark"
+            );
+            assert!(
+                dark_below < 60.0,
+                "is_pal={is_pal}: row {dark_row_below} luma {dark_below}, expected dark"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_fields_interlace_onto_correct_row_parities() {
+        let deviation_hz = 5e6;
+        let mut cfg = base_synth_config(false, deviation_hz);
+        // Field 1 (First) paints rows 50..70; field 2 (Second) paints a
+        // *different* band at rows 150..170. Both bands must land on
+        // their own field's row parity and survive into the merged
+        // output of the following call.
+        cfg.pattern = TestPattern::WhiteSquare {
+            row0: 50,
+            col0: 0,
+            h: 20,
+            w: crate::synthetic::OUTPUT_WIDTH,
+        };
+        let field1 = generate_fields(&cfg, 1);
+        cfg.start_field = FieldParity::Second;
+        cfg.pattern = TestPattern::WhiteSquare {
+            row0: 150,
+            col0: 0,
+            h: 20,
+            w: crate::synthetic::OUTPUT_WIDTH,
+        };
+        let field2_alone = generate_fields(&cfg, 1);
+
+        let mut data = field1.clone();
+        data.extend_from_slice(&field2_alone);
+        // Pad so the second call has enough trailing data to lock its
+        // own VBI group and advance (mirrors a live decode buffer that
+        // always has more than exactly one field queued).
+        data.extend_from_slice(&field2_alone);
+
+        let mut recon = FrameReconstructor::new(cfg.sample_rate, false, deviation_hz, false);
+        let mut frame = vec![0u32; recon.width * recon.height];
+        let consumed1 = recon
+            .reconstruct_frame_into(&data, &mut frame)
+            .expect("expected field 1 to reconstruct");
+        assert!(
+            row_avg_luma(&frame, recon.width, 100) > 180.0,
+            "field 1's band (row 50 -> output row 100)"
+        );
+
+        recon
+            .reconstruct_frame_into(&data[consumed1..], &mut frame)
+            .expect("expected field 2 to reconstruct");
+        assert!(
+            row_avg_luma(&frame, recon.width, 301) > 180.0,
+            "field 2's band (row 150 -> output row 301)"
+        );
+        assert!(
+            row_avg_luma(&frame, recon.width, 100) > 180.0,
+            "field 1's band must survive the merge into field 2's output frame"
+        );
+    }
+
+    #[test]
+    fn dropped_field_is_corrected_by_vbi_parity_override_not_left_inverted() {
+        // Simulate a decode pipeline that lost one field's batch
+        // entirely (a real occurrence: a dropped IQ batch, a channel-
+        // hop interruption). A naive parity toggle has no way to know
+        // a field went missing and stays permanently out of phase; the
+        // VBI parser reads the real parity out of each field's own
+        // vertical-sync structure and corrects it every call.
+        let deviation_hz = 5e6;
+        let cfg = base_synth_config(false, deviation_hz); // First, Second, First, Second, ...
+        let f1_len = generate_fields(&cfg, 1).len();
+        let f2_len = generate_fields(&cfg, 2).len() - f1_len;
+        let all_four = generate_fields(&cfg, 4);
+        let f3_start = f1_len + f2_len;
+        let f3_len = generate_fields(&cfg, 3).len() - f3_start;
+
+        let mut spliced = Vec::new();
+        spliced.extend_from_slice(&all_four[0..f1_len]); // field 1 (First)
+        spliced.extend_from_slice(&all_four[f3_start..f3_start + f3_len]); // field 3 (First) -- field 2 dropped
+        spliced.extend_from_slice(&all_four[f3_start..f3_start + f3_len]); // padding so call 2 has enough trailing data
+
+        let mut recon = FrameReconstructor::new(cfg.sample_rate, false, deviation_hz, false);
+        let mut frame = vec![0u32; recon.width * recon.height];
+        let consumed1 = recon
+            .reconstruct_frame_into(&spliced, &mut frame)
+            .expect("expected field 1 to reconstruct");
+        recon
+            .reconstruct_frame_into(&spliced[consumed1..], &mut frame)
+            .expect("expected field 3 to reconstruct despite the dropped field 2");
+
+        // See the derivation in this test's accompanying commit message:
+        // with the VBI override correcting the naive toggle, field_parity
+        // is 1 after this second call (both fields are genuinely First,
+        // so the override re-applies 0 before rendering, then the
+        // end-of-call toggle leaves 1); a naive toggle-only
+        // implementation would instead leave it at 0.
+        assert_eq!(
+            recon.field_parity, 1,
+            "VBI override should re-detect First parity for the post-drop field, not blindly toggle"
+        );
     }
 }
