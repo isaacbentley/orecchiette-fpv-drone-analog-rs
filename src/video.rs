@@ -2,7 +2,7 @@
 //!
 //! This module takes a demodulated FM signal and reconstructs it into 2D frames
 //! by identifying H-Sync and V-Sync pulses. The pipeline is monochrome (luma
-//! only — see DESIGN.md §6 for why colour is disabled) and features a sub-sample
+//! only — see DESIGN.md §9 for why colour is disabled) and features a sub-sample
 //! Time Base Corrector (TBC), two-pass sync extraction with MAD outlier
 //! rejection, a subcarrier notch for dot-crawl suppression, multi-field temporal
 //! denoise + dropout repair (see [`crate::frame_history`]), Dropout Compensation

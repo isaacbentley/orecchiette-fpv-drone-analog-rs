@@ -11,10 +11,13 @@ A high-performance Rust crate for detecting analog FPV drone video signals using
 - **FM Demodulation**: Implements baseband video recovery from FM-modulated signals using polar phase differentiation (`arg(z[n] × conj(z[n-1]))`).
 - **PAL/NTSC Classification**: Performs windowed FFT analysis to discriminate horizontal sync pulses at 15,625 Hz (PAL) and 15,734 Hz (NTSC).
 - **Cepstral Analysis Validation**: Applies post-harmonic cepstrum validation (`IFFT(ln|FFT|²)`) to distinguish periodic pulse trains from multi-CW interference.
-- **PAL Parity Tracking**: Utilizes a phase-delta discriminator to track and correct PAL V-switch line parity offsets.
+- **Vertical-Sync (VBI) Parsing**: Classifies equalizing / serrated-broad / horizontal pulses by width, locates the true vertical-sync group, and determines field parity by direct hypothesis test against the standard's calibrated active-video timing — not a phase fit, which this signal's own structure can't actually carry (see `DESIGN.md` §7).
+- **VBI-Confirmed Detection**: The detector cross-checks a harmonic-comb match against real, field-period-spaced vertical syncs, boosting confidence to 0.95 (or promoting a standard-ambiguous hit to 0.75) — essentially unfakeable by a non-video interferer.
+- **FM Deviation Auto-Estimation**: Recovers a transmitter's true peak FM deviation directly from the demodulated waveform (`levels::estimate_fm_deviation`), with no sync lock required, so playback and detection thresholds don't depend on a fixed assumption that's wrong for a given VTX.
+- **Optional Deemphasis**: A single-pole IIR deemphasis filter (`demod::Deemphasis`), off by default, approximates undoing a VTX's video pre-emphasis with unity DC gain (doesn't affect deviation estimation or sync detection either way).
 - **Sync Extraction & Time Base Correction**: Employs median and MAD outlier rejection on raw sync tips, combined with Catmull-Rom cubic interpolation for sub-sample Time Base Correction (TBC).
 - **Temporal Noise Reduction**: Features a configurable fixed-capacity ring buffer for multi-field temporal denoising, utilizing per-pixel median and motion-weighted blending to improve SNR on static regions.
-- **Monochrome Rendering**: Outputs luma-only frames to ensure stability under high phase-noise conditions typical of analog FPV chroma bursts (see `DESIGN.md` for empirical details).
+- **Monochrome Rendering**: Outputs luma-only frames — analog FPV's color subcarrier carries comparatively little of what an operator needs, and low-SNR RF links look better in clean grayscale than in noisy decoded color (see `DESIGN.md` §9).
 - **Signal Clustering**: Aggregates proximate DDC probe hits (within 25 MHz) to emit single, consolidated detection events.
 - **Standardized Scoring**: Employs a 0.0–1.0 confidence scoring model consistent across workspace detection heuristics.
 - **Hardware Agnostic**: Processes standard complex I/Q samples independent of the underlying SDR hardware.
@@ -74,8 +77,10 @@ for res in &results {
 | Confidence | `SignalType` | Meaning |
 | :--- | :--- | :--- |
 | **0.6** | `AnalogVideoUnknown` | H-sync detected but FFT bin resolution too coarse to discriminate PAL (15625 Hz) from NTSC (15734 Hz); harmonic check passed |
-| **0.6** | `AnalogVideoPal` / `AnalogVideoNtsc` | Classified via V-sync rate (50/60 Hz); only reachable with > 100 ms capture window |
+| **0.6** | `AnalogVideoPal` / `AnalogVideoNtsc` | Demoted from 0.8/0.95 by the opt-in `demote_unconfirmed_video` check (default off) — a harmonic-comb match with zero confirmed vertical-sync groups over ≥ 2.5 field periods |
+| **0.75** | `AnalogVideoUnknown` | The 0.6 (bin-collision) case above, but real periodic vertical-sync structure was confirmed underneath |
 | **0.8** | `AnalogVideoPal` / `AnalogVideoNtsc` | Distinct H-sync bin AND ≥ 2 harmonics above the −20 dB threshold (high-confidence pulse-train classification) |
+| **0.95** | `AnalogVideoPal` / `AnalogVideoNtsc` | The 0.8 case above, additionally confirmed by real vertical-sync structure — essentially unfakeable by a non-video interferer |
 
 The harmonic-consistency check is a *gate*: candidates with fewer than 2 harmonics above the −20 dB threshold are rejected as `Unknown` regardless of fundamental energy. This holds across both the bins-distinct and bin-collision paths.
 
@@ -87,9 +92,9 @@ Use `SignalType::is_analog_video()` to gate on "is this an analog FPV signal at 
 cargo test -p orecchiette-fpv-drone-analog-rs
 ```
 
-Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), and PAL parity self-correction under 1-line V-sync offset.
+Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. `synthetic::generate_fields`/`generate_iq` build standards-shaped NTSC/PAL fields with real vertical-sync structure (equalizing/serrated-broad pulses, correct blanking, interlace parity), shared by every module's tests so generator and parser can't independently drift. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), the VBI parser (broad-group location, field-parity hypothesis test for both standards and parities, noise robustness), the confidence-tier policy (boost/promote/demote, as a pure function independent of any specific IQ signal), the FM-deviation estimator's accuracy across a range of deviation/sample-rate pairs, and the deemphasis filter's DC gain / −3 dB point / streaming continuity.
 
-`video::FrameReconstructor` additionally has regression tests confirming `reconstruct_frame_into` degrades to `None` rather than panicking on a mismatched output-buffer size, empty input, and degenerate configuration (`sample_rate = 0`).
+`video::FrameReconstructor` additionally has regression tests confirming `reconstruct_frame_into` degrades to `None` rather than panicking on a mismatched output-buffer size, empty input, and degenerate configuration (`sample_rate = 0`), plus geometry tests proving a test pattern lands on the correct output row for both NTSC and PAL (the standards-correct-blanking fix) and a dropped-field test proving the VBI parser's parity override — not a naive per-call toggle — recovers correct interlacing after a lost field.
 
 ### End-to-end decode check
 
