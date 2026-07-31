@@ -125,11 +125,41 @@ pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType
         return SignalType::AnalogVideoNtsc;
     }
 
-    let avg_interval = intervals.iter().sum::<usize>() as f64 / intervals.len() as f64;
-    let line_period_us = avg_interval / sample_rate as f64 * 1_000_000.0;
-    let is_pal = line_period_us > 63.78;
+    // Median, not mean. Every field's vertical-sync group contributes
+    // ~18 *half*-line intervals (≈31.8 µs at NTSC) which clear the 30 µs
+    // `min_gap` and so land in `intervals` alongside the ~240 full-line
+    // ones. Averaging let that minority drag the estimate down by ~3.5%,
+    // which was not a rounding nuisance but an outright correctness
+    // failure: real PAL measured 62.1 µs against the 63.78 µs PAL/NTSC
+    // decision boundary below, so this function could **never** return
+    // `AnalogVideoPal` — every PAL capture came back NTSC. The median
+    // ignores the half-line minority and recovers 64.00 µs for PAL /
+    // 63.56 µs for NTSC.
+    intervals.sort_unstable();
+    let median_interval = intervals[intervals.len() / 2] as f64;
+    if median_interval <= 0.0 {
+        return SignalType::Unknown;
+    }
+    let line_hz = sample_rate as f64 / median_interval;
 
-    if is_pal {
+    // Reject a measured rate that is nowhere near either standard before
+    // committing to one. On FM-demodulated *noise* the dips below
+    // threshold occur essentially continuously, so the `min_gap` skip
+    // collapses the interval to just above `min_gap` (30 µs → a ~33 kHz
+    // "line rate"). Without this bound that absurd rate still classified
+    // as NTSC — it only had to be *closer* to 15734 than to 15625 — which
+    // is how empty-band noise got reported as video on live captures.
+    // Real VTX crystal error is a few Hz; ±~250 Hz is generous.
+    //
+    // Both this guard and the median above mirror
+    // `detector::classify_pal_ntsc_time_domain`, which had them first;
+    // the two implementations of this same measurement had diverged.
+    if !(15_400.0..=16_000.0).contains(&line_hz) {
+        return SignalType::Unknown;
+    }
+
+    let line_period_us = 1_000_000.0 / line_hz;
+    if line_period_us > 63.78 {
         SignalType::AnalogVideoPal
     } else {
         SignalType::AnalogVideoNtsc
@@ -989,7 +1019,16 @@ impl FrameReconstructor {
             let back_porch =
                 tbc_line[bp_start..bp_end].iter().sum::<f32>() / (bp_end - bp_start) as f32;
 
-            if (back_porch - sync_tip).abs() > 0.01 {
+            // Require a *positive* sync-to-porch swing, not merely a
+            // large-magnitude one. In this crate's FM-demod convention
+            // blanking always sits above the sync tip, so a negative swing
+            // means the discriminator output is inverted (swapped I/Q, or a
+            // spectrally-mirrored capture). `.abs()` accepted that and
+            // handed back a negative `scale_y`, which silently rendered a
+            // photographic negative — an inverted picture is much harder to
+            // recognise as a wiring fault than a flat one. Leaving the line
+            // unscaled keeps the fault visible instead of dressing it up.
+            if back_porch - sync_tip > 0.01 {
                 let scale_y = 0.4 * radians_per_volt / (back_porch - sync_tip);
                 for v in &mut tbc_line {
                     *v = (*v - back_porch) * scale_y;
@@ -1195,8 +1234,15 @@ impl FrameReconstructor {
 
         // Push the just-rendered Y field into the multi-field
         // history buffer for the next call's temporal denoise.
+        // Field period per standard: PAL is 50 fields/s (20 000 µs), NTSC
+        // ~59.94 (16 667 µs). This was hardcoded to the NTSC value, so a
+        // PAL stream's history timestamps ran ~20% fast. Only diagnostics
+        // read them today, but the field is documented as the temporal
+        // reference for future motion-compensated work, where a wrong
+        // inter-field interval would weight the wrong neighbours.
+        let field_period_us: u64 = if self.pal { 20_000 } else { 16_667 };
         let meta = FieldMeta {
-            timestamp_us: self.field_counter * 16_667, // ≈ 60 fields/sec
+            timestamp_us: self.field_counter * field_period_us,
             field_parity: self.field_parity,
             sync_quality,
             mean_amplitude: if !current_frame_y.is_empty() {
@@ -1310,6 +1356,52 @@ impl FrameReconstructor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_video_standard_rejects_noise_instead_of_claiming_ntsc() {
+        // On FM-demodulated noise the below-threshold dips are continuous,
+        // so the `min_gap` skip collapses the mean inter-dip interval to
+        // just above 30 us -- a ~33 kHz "line rate". Without a plausibility
+        // bound that still classified as NTSC (it only had to be closer to
+        // 15734 than to 15625), which is how empty-band noise got reported
+        // as video on live captures.
+        let sr = 15_360_000u32;
+        let mut seed = 0x2545F491_4F6CDD1Du64;
+        let noise: Vec<f32> = (0..sr as usize / 20)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed as f32 / u64::MAX as f32) * 2.0 - 1.0
+            })
+            .collect();
+        assert_eq!(
+            detect_video_standard(&noise, sr),
+            SignalType::Unknown,
+            "noise must not be classified as a video standard"
+        );
+    }
+
+    #[test]
+    fn detect_video_standard_still_identifies_real_pal_and_ntsc() {
+        // The plausibility bound must not cost real detections: run the
+        // synthetic generator for both standards and confirm each is still
+        // named correctly.
+        for is_pal in [false, true] {
+            let cfg = base_synth_config(is_pal, 5e6);
+            let data = generate_fields(&cfg, 2);
+            let want = if is_pal {
+                SignalType::AnalogVideoPal
+            } else {
+                SignalType::AnalogVideoNtsc
+            };
+            assert_eq!(
+                detect_video_standard(&data, cfg.sample_rate),
+                want,
+                "is_pal={is_pal}: real synthetic video must still classify"
+            );
+        }
+    }
 
     #[test]
     fn reconstruct_frame_into_rejects_mismatched_frame_buffer() {

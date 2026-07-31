@@ -687,6 +687,48 @@ impl AnalogFpvDetector {
     }
 }
 
+/// Frequency window within which two detections are treated as the same
+/// signal. Roughly one FM-video channel width.
+const DEDUP_BW_HZ: f64 = 25e6;
+
+/// Merge detections that fall within [`DEDUP_BW_HZ`] of each other,
+/// keeping the strongest (highest confidence, then highest RSSI) member
+/// of each group. `results` must already be sorted by frequency.
+///
+/// Each group is compared against an **immutable anchor** — the first
+/// result that opened it — not against the running strongest member.
+/// Replacing the kept entry also moves the frequency the *next* result
+/// is compared against, which makes evenly-spaced detections chain: the
+/// standard 5.8 GHz band plans space channels ~19–20 MHz apart (band F
+/// is 5740 / 5760 / 5780 / 5800 …), comfortably inside this 25 MHz
+/// window, so three simultaneous VTXs one channel apart collapsed into a
+/// single detection — each merge dragged the comparison point up to the
+/// next channel, and a whole band could fold into one hit. Same defect,
+/// same fix, as the sweep clustering in `detect_from_iq` (see its
+/// `anchor_freq` note).
+///
+/// Factored out of `detect_from_iq` so the grouping rule is directly
+/// unit-testable, matching [`apply_vbi_confidence_tier`]'s rationale.
+fn dedup_by_frequency(results: Vec<DetectionResult>) -> Vec<DetectionResult> {
+    let mut deduped: Vec<DetectionResult> = Vec::new();
+    let mut anchor_hz = 0.0f64;
+    for r in results {
+        if let Some(last) = deduped.last_mut()
+            && (r.frequency_hz as f64 - anchor_hz).abs() < DEDUP_BW_HZ
+        {
+            if r.confidence > last.confidence
+                || (r.confidence == last.confidence && r.rssi_dbm > last.rssi_dbm)
+            {
+                *last = r;
+            }
+            continue;
+        }
+        anchor_hz = r.frequency_hz as f64;
+        deduped.push(r);
+    }
+    deduped
+}
+
 /// The confidence-tier decision the VBI confirm stage applies, factored
 /// out as a pure function of `(sig_type, conf, evidence, demote_flag)`
 /// so it's directly unit-testable against synthetic
@@ -1011,20 +1053,7 @@ impl FpvDetector for AnalogFpvDetector {
                 .partial_cmp(&(b.frequency_hz as f64))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut deduped: Vec<DetectionResult> = Vec::new();
-        for r in final_results {
-            if let Some(last) = deduped.last_mut()
-                && (r.frequency_hz as f64 - last.frequency_hz as f64).abs() < 25e6
-            {
-                if r.confidence > last.confidence
-                    || (r.confidence == last.confidence && r.rssi_dbm > last.rssi_dbm)
-                {
-                    *last = r;
-                }
-                continue;
-            }
-            deduped.push(r);
-        }
+        let mut deduped = dedup_by_frequency(final_results);
 
         deduped.retain(|r| {
             r.bandwidth_hz >= self.min_bandwidth
@@ -1039,6 +1068,87 @@ impl FpvDetector for AnalogFpvDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn det(freq_hz: u64, confidence: f32, rssi_dbm: f32) -> DetectionResult {
+        DetectionResult {
+            channel: None,
+            frequency_hz: freq_hz,
+            confidence,
+            rssi_dbm,
+            bandwidth_hz: 10_000_000,
+            signal_type: SignalType::AnalogVideoPal,
+        }
+    }
+
+    #[test]
+    fn dedup_does_not_chain_a_whole_band_into_one_detection() {
+        // Band F, four simultaneous VTXs 20 MHz apart: 5740 / 5760 / 5780
+        // / 5800. Each is within the 25 MHz merge window of its immediate
+        // *neighbour*, so comparing against the running strongest member
+        // walked the comparison point up the band and folded all four into
+        // a single detection — an 8-channel band would collapse to one hit.
+        // Anchoring the comparison bounds each group to one 25 MHz window,
+        // so the span is covered by ceil(80/25) = 2 groups, not 1.
+        //
+        // This does NOT separate adjacent channels, and cannot: FM video is
+        // ~20 MHz wide, so two VTXs one channel apart genuinely overlap and
+        // the 25 MHz window is sized for that signal bandwidth. Telling
+        // those apart needs bandwidth-aware merging, not a narrower window.
+        let out = dedup_by_frequency(vec![
+            det(5_740_000_000, 0.8, -50.0),
+            det(5_760_000_000, 0.9, -40.0),
+            det(5_780_000_000, 0.95, -30.0),
+            det(5_800_000_000, 0.85, -35.0),
+        ]);
+        assert_eq!(
+            out.len(),
+            2,
+            "expected the 80 MHz span to need 2 anchored groups, got {:?}",
+            out.iter().map(|r| r.frequency_hz).collect::<Vec<_>>()
+        );
+        // Each surviving group reports its own strongest member.
+        assert_eq!(out[0].frequency_hz, 5_760_000_000);
+        // 5800 (0.85) loses to 5780 (0.95) inside the second group.
+        assert_eq!(out[1].frequency_hz, 5_780_000_000);
+    }
+
+    #[test]
+    fn dedup_group_width_is_bounded_by_the_window_not_the_input_span() {
+        // Eight detections spanning 140 MHz, each 20 MHz from the last.
+        // Unanchored, every one merges into its predecessor and the whole
+        // sweep returns a single detection. Anchored, the result count
+        // grows with the span.
+        let hits: Vec<DetectionResult> = (0..8)
+            .map(|i| det(5_700_000_000 + i * 20_000_000, 0.8, -50.0))
+            .collect();
+        let out = dedup_by_frequency(hits);
+        assert!(
+            out.len() >= 4,
+            "140 MHz of detections collapsed to {} group(s) — chaining regression",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn dedup_still_merges_genuine_duplicates_and_keeps_the_strongest() {
+        // Two probes landing on one real signal a few MHz apart: still one
+        // detection, and it must be the higher-confidence one.
+        let out = dedup_by_frequency(vec![
+            det(5_800_000_000, 0.8, -50.0),
+            det(5_805_000_000, 0.95, -30.0),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].frequency_hz, 5_805_000_000);
+        assert_eq!(out[0].confidence, 0.95);
+
+        // Equal confidence -> stronger RSSI wins.
+        let out = dedup_by_frequency(vec![
+            det(5_800_000_000, 0.8, -50.0),
+            det(5_802_000_000, 0.8, -20.0),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rssi_dbm, -20.0);
+    }
 
     /// Generate a synthetic FM-modulated PAL H-sync pulse train.
     ///
