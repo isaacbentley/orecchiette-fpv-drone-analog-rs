@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "orecchiette-fpv-drone-analog-rs"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bytemuck",
  "log",
