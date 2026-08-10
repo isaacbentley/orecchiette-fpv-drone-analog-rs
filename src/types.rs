@@ -6,6 +6,11 @@ pub struct DetectionResult {
     pub channel: Option<FpvChannel>,
     pub frequency_hz: u64,
     pub confidence: f32, // 0.0 to 1.0
+    /// Mean signal power as `10·log10(mean |IQ|²)` — dB relative to
+    /// digital full scale (dBFS), *not* calibrated dBm: no SDR gain or
+    /// antenna factor is applied. Comparable between detections from
+    /// the same capture chain, not across devices. (Field name kept
+    /// for serialization compatibility.)
     pub rssi_dbm: f32,
     pub bandwidth_hz: u32,
     pub signal_type: SignalType,

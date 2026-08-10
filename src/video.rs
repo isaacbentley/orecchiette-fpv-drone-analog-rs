@@ -69,10 +69,18 @@ const ACTIVE_VIDEO_LEFT_CROP_FRAC: f32 = 0.16;
 /// chroma-burst amplitude as a noise floor.
 const TEMPORAL_MOTION_THRESHOLD: f32 = 0.10;
 
+/// Classify a demodulated baseband slice as PAL or NTSC by measuring
+/// the median sync-tip interval. Returns [`SignalType::Unknown`] when
+/// the slice carries no measurable line structure — too short, too few
+/// sync tips, a non-negative (DC-offset/inverted) waveform, or a
+/// measured rate implausibly far from both standards. Earlier versions
+/// returned `AnalogVideoNtsc` for the degenerate cases, which asserted
+/// a standard from no evidence; callers must pick their own default
+/// when this returns `Unknown`.
 pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType {
     let min_samples = sample_rate as usize / 200;
     if demod_data.len() < min_samples {
-        return SignalType::AnalogVideoNtsc;
+        return SignalType::Unknown;
     }
 
     let search_len = (sample_rate as f32 * 640e-6) as usize;
@@ -81,6 +89,13 @@ pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType
         .iter()
         .cloned()
         .fold(f32::INFINITY, f32::min);
+    // Sync tips must sit below zero in this crate's demod convention; a
+    // non-negative minimum (DC-offset or inverted capture) makes the
+    // `global_min * 0.3` threshold meaningless — mirror the guard in
+    // `detector::classify_pal_ntsc_time_domain`.
+    if !global_min.is_finite() || global_min >= 0.0 {
+        return SignalType::Unknown;
+    }
 
     let threshold = global_min * 0.3;
     let min_gap = (sample_rate as f32 * 30e-6) as usize;
@@ -110,7 +125,7 @@ pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType
     }
 
     if sync_positions.len() < 5 {
-        return SignalType::AnalogVideoNtsc;
+        return SignalType::Unknown;
     }
 
     let mut intervals: Vec<usize> = Vec::new();
@@ -122,7 +137,7 @@ pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType
     }
 
     if intervals.is_empty() {
-        return SignalType::AnalogVideoNtsc;
+        return SignalType::Unknown;
     }
 
     // Median, not mean. Every field's vertical-sync group contributes
@@ -1228,6 +1243,13 @@ impl FrameReconstructor {
         // to *both* parities (current and complementary) when it
         // pulls the complementary parity in.
         self.field_buf.copy_from_slice(frame);
+        // Parity of the field just rendered, captured before the toggle:
+        // the FieldMeta below describes THIS field, and reading
+        // `self.field_parity` after `^= 1` stamped every history entry
+        // with the NEXT field's parity instead — an off-by-one-field
+        // error in the value documented as the key for future 3D-comb
+        // work.
+        let rendered_parity = self.field_parity;
         self.field_parity ^= 1;
 
         self.prev_frame_tbc = current_frame_tbc;
@@ -1243,7 +1265,7 @@ impl FrameReconstructor {
         let field_period_us: u64 = if self.pal { 20_000 } else { 16_667 };
         let meta = FieldMeta {
             timestamp_us: self.field_counter * field_period_us,
-            field_parity: self.field_parity,
+            field_parity: rendered_parity,
             sync_quality,
             mean_amplitude: if !current_frame_y.is_empty() {
                 let s: f32 = current_frame_y.iter().sum();
@@ -1380,6 +1402,17 @@ mod tests {
             SignalType::Unknown,
             "noise must not be classified as a video standard"
         );
+    }
+
+    #[test]
+    fn detect_video_standard_returns_unknown_on_degenerate_input() {
+        let sr = 15_360_000u32;
+        // Too short to contain a single line.
+        assert_eq!(detect_video_standard(&[0.0; 100], sr), SignalType::Unknown);
+        // All-positive (DC-offset / inverted) waveform: no sync tips
+        // below zero, so no standard can honestly be claimed.
+        let positive = vec![0.5f32; sr as usize / 10];
+        assert_eq!(detect_video_standard(&positive, sr), SignalType::Unknown);
     }
 
     #[test]
