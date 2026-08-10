@@ -2,6 +2,7 @@ use crate::types::{DetectionResult, SignalType};
 use num_complex::Complex;
 use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::PI;
 
 /// Target decimated rate for each sliding-DDC probe, and the boundary
@@ -55,6 +56,13 @@ pub struct AnalogFpvDetector {
     /// ~100% and saves a `cosf` per sample per call (65 k of them at the
     /// default block size).
     hann: RefCell<Option<(usize, Vec<f32>)>>,
+    /// Reused demodulation buffer for `detect_sync_pulses` — a fresh
+    /// ~256 KB `Vec` per probe per batch was pure allocator churn.
+    demod_scratch: RefCell<Vec<f32>>,
+    /// Cached sweep FIR design, keyed by `(sample_rate, cutoff_hz)`.
+    /// Every probe in a sweep shares one design; only the mixing
+    /// offset differs.
+    sweep_taps: RefCell<Option<(u32, u32, Vec<f32>)>>,
     /// Optional GPU handle for the wideband sweep's batched DDC (see
     /// [`crate::gpu::GpuAnalog`], behind the `gpu` feature). `None` — the
     /// default — runs the existing sequential-per-probe CPU sweep
@@ -76,6 +84,8 @@ impl Default for AnalogFpvDetector {
             demote_unconfirmed_video: false,
             planner: RefCell::new(FftPlanner::new()),
             hann: RefCell::new(None),
+            demod_scratch: RefCell::new(Vec::new()),
+            sweep_taps: RefCell::new(None),
             #[cfg(feature = "gpu")]
             gpu: None,
         }
@@ -101,9 +111,12 @@ impl AnalogFpvDetector {
 /// resolution is too coarse to separate the two line rates (109 Hz
 /// gap; typical first-packet FFTs give 380+ Hz/bin at 25 MSPS).
 ///
-/// Reads the FM-demodulated baseband, walks it looking for sync tips
-/// (local minima below 30 % of the global minimum), computes the
-/// median inter-tip interval, and converts to a line frequency. PAL
+/// Reads the FM-demodulated baseband (smoothed by a ~0.5 µs moving
+/// average), walks it looking for sync tips below a robust percentile
+/// threshold (see [`crate::levels`]'s `robust_sync_threshold` — DC- and
+/// click-outlier-invariant, unlike the global-minimum threshold it
+/// replaced), computes the median inter-tip interval, and converts to a
+/// line frequency. PAL
 /// = 15625 Hz, NTSC = 15734 Hz. Returns `None` when we can't find
 /// enough sync tips for a confident median (< 8 intervals) or when
 /// the median falls within ±30 Hz of the midpoint, which would make
@@ -123,25 +136,32 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     // (≈ 78 PAL lines / 80 NTSC lines) and keeps the function
     // cheap on long input buffers.
     let scan_len = ((sample_rate as f32 * 5_000e-6) as usize).min(demod.len());
-    let slice = &demod[..scan_len];
-    let global_min = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-    if !global_min.is_finite() || global_min >= 0.0 {
-        return None;
-    }
-    let threshold = global_min * 0.3;
+    // Smooth with the same ~0.5 µs moving average every other pulse
+    // scan in the crate uses (levels.rs / vbi.rs) — un-smoothed FM
+    // click noise otherwise dominates the extrema thresholded below.
+    let ma_win = ((sample_rate as f32 * 0.5e-6) as usize).max(1);
+    let smoothed = crate::levels::moving_average(&demod[..scan_len], ma_win);
+    // Percentile threshold (p2 + 0.25·(p50−p2)), not `global_min · 0.3`:
+    // the global minimum of a low-CNR record is a single FM click far
+    // below any real sync tip, which put the threshold beneath the tips
+    // and left only clicks detectable — exactly the regime this
+    // disambiguator exists for. Percentiles are also DC-invariant, so a
+    // demod offset from a tuning error no longer breaks classification.
+    let threshold = crate::levels::robust_sync_threshold(&smoothed)?;
     // Sync gap bounds: 30–100 µs covers both NTSC (63.5 µs) and PAL
     // (64.0 µs) with comfortable margin.
     let min_gap = (sample_rate as f32 * 30e-6) as usize;
     let max_gap = (sample_rate as f32 * 100e-6) as usize;
+    let scan_len = smoothed.len();
     let mut sync_positions: Vec<usize> = Vec::with_capacity(128);
     let mut i = 0;
     while i < scan_len {
-        if slice[i] < threshold {
+        if smoothed[i] < threshold {
             let mut local_min_idx = i;
-            let mut local_min_val = slice[i];
-            while i < scan_len && slice[i] < threshold {
-                if slice[i] < local_min_val {
-                    local_min_val = slice[i];
+            let mut local_min_val = smoothed[i];
+            while i < scan_len && smoothed[i] < threshold {
+                if smoothed[i] < local_min_val {
+                    local_min_val = smoothed[i];
                     local_min_idx = i;
                 }
                 i += 1;
@@ -205,21 +225,40 @@ impl AnalogFpvDetector {
         }
     }
 
-    /// Wrapper that calls `detect_sync_pulses_inner` and then applies
-    /// the cepstrum structural gate.  If the cepstrum check fails,
-    /// the classification is downgraded to `Unknown`.
+    /// Classify one capture block: harmonic-comb line-rate detection,
+    /// cepstrum structural gate, and the VBI confirm stage.
     pub fn detect_sync_pulses(
         &self,
         iq_data: &[Complex<f32>],
         sample_rate: u32,
     ) -> (SignalType, f32) {
-        self.detect_sync_pulses_with_cepstrum(iq_data, sample_rate)
+        self.detect_sync_pulses_inner(iq_data, sample_rate, None)
     }
 
-    fn detect_sync_pulses_with_cepstrum(
+    /// Like [`Self::detect_sync_pulses`], but classifies against a
+    /// noncoherently averaged magnitude spectrum accumulated in
+    /// `integrator` under `key_hz` (typically the absolute tuned/probe
+    /// frequency in Hz). Successive batches of the same signal add
+    /// coherently in the comb bins while noise averages down ~1/√N —
+    /// several dB of sensitivity that a single 68 ms batch cannot
+    /// provide. Time-domain PAL/NTSC disambiguation and the VBI confirm
+    /// stage still run on the *current* batch (they need the waveform,
+    /// not the spectrum).
+    pub fn detect_sync_pulses_integrated(
         &self,
         iq_data: &[Complex<f32>],
         sample_rate: u32,
+        key_hz: i64,
+        integrator: &mut SpectralIntegrator,
+    ) -> (SignalType, f32) {
+        self.detect_sync_pulses_inner(iq_data, sample_rate, Some((integrator, key_hz)))
+    }
+
+    fn detect_sync_pulses_inner(
+        &self,
+        iq_data: &[Complex<f32>],
+        sample_rate: u32,
+        integration: Option<(&mut SpectralIntegrator, i64)>,
     ) -> (SignalType, f32) {
         let n = iq_data.len();
         // `sample_rate == 0` would make `bin_hz` zero and the line-rate bin
@@ -231,13 +270,16 @@ impl AnalogFpvDetector {
         }
 
         // FM demodulation: instantaneous frequency via arg(z[n] * conj(z[n-1])).
-        // Use the single shared implementation in `demod::fm_demod` so the
-        // discriminator never diverges between the detection and decode paths.
-        let demod = crate::demod::fm_demod(iq_data);
+        // Use the single shared implementation in `demod::fm_demod_into` so
+        // the discriminator never diverges between the detection and decode
+        // paths, refilling the reused scratch buffer.
+        let mut demod_guard = self.demod_scratch.borrow_mut();
+        crate::demod::fm_demod_into(iq_data, &mut demod_guard);
+        let demod: &[f32] = &demod_guard;
         let demod_len = demod.len();
         let avg_demod = demod.iter().sum::<f32>() / demod_len as f32;
         let mut var = 0.0f32;
-        for &d in &demod {
+        for &d in demod {
             let diff = d - avg_demod;
             var += diff * diff;
         }
@@ -288,6 +330,17 @@ impl AnalogFpvDetector {
 
         fft.process(&mut buffer);
 
+        // Magnitude spectrum — everything below runs on amplitudes,
+        // which is also what makes cross-batch integration possible:
+        // magnitudes average noncoherently (noise drops ~1/√N while the
+        // sync comb stays put), whereas complex bins would need
+        // impossible phase coherence across batches.
+        let fresh_mags: Vec<f32> = buffer.iter().map(|c| c.norm()).collect();
+        let mags: &[f32] = match integration {
+            Some((integrator, key_hz)) => integrator.accumulate(key_hz, &fresh_mags),
+            None => &fresh_mags,
+        };
+
         let bin_hz = sample_rate as f32 / fft_len as f32;
         let bin_pal = (15625.0 / bin_hz).round() as usize;
         let bin_ntsc = (15734.0 / bin_hz).round() as usize;
@@ -302,26 +355,24 @@ impl AnalogFpvDetector {
         // the default block size actually hits.
         let search_range = ((fft_len as f32 / demod_len as f32).round() as usize).max(1);
 
-        let pal_energy = self.get_peak_energy(&buffer, bin_pal, search_range);
-        let ntsc_energy = self.get_peak_energy(&buffer, bin_ntsc, search_range);
+        let pal_energy = self.get_peak_energy(mags, bin_pal, search_range);
+        let ntsc_energy = self.get_peak_energy(mags, bin_ntsc, search_range);
 
         // Floor at bin 1 so the DC bin (nonzero even after mean-subtraction,
         // because the Hann window has nonzero mean) never enters the noise
         // estimate on coarse/short FFTs where round(500/bin_hz) would be 0.
         let noise_start_bin = ((500.0 / bin_hz).round() as usize).max(1);
         let noise_end_bin = fft_len / 2;
-        let mut noise_sum = 0.0;
-        let mut noise_count = 0;
-
-        if noise_end_bin > noise_start_bin {
-            for c in &buffer[noise_start_bin..noise_end_bin] {
-                noise_sum += c.norm();
-                noise_count += 1;
-            }
-        }
-
-        let noise_floor = if noise_count > 0 {
-            noise_sum / noise_count as f32
+        // Median, not mean: this bin range also contains the signal's own
+        // video spectrum and harmonic comb, and a mean lets a real signal
+        // raise its own detection floor — costing sensitivity exactly on
+        // the weak signals the floor exists to find. The comb occupies a
+        // small fraction of the bins, so the median tracks the true noise
+        // level (and for pure Rayleigh noise it sits within ~6% of the
+        // mean, so thresholds barely move on empty bands).
+        let noise_floor = if noise_end_bin > noise_start_bin {
+            let mut noise_mags: Vec<f32> = mags[noise_start_bin..noise_end_bin].to_vec();
+            crate::levels::median(&mut noise_mags)
         } else {
             1e-6
         };
@@ -345,13 +396,13 @@ impl AnalogFpvDetector {
                 let hb_pal = (kf * PAL_LINE_HZ / bin_hz).round() as usize;
                 let hb_ntsc = (kf * NTSC_LINE_HZ / bin_hz).round() as usize;
                 if hb_pal < max_bin {
-                    let e = self.get_peak_energy(&buffer, hb_pal, search_range);
+                    let e = self.get_peak_energy(mags, hb_pal, search_range);
                     if e > pal_thresh && e > thresh_weak {
                         pal_harmonics += 1;
                     }
                 }
                 if hb_ntsc < max_bin {
-                    let e = self.get_peak_energy(&buffer, hb_ntsc, search_range);
+                    let e = self.get_peak_energy(mags, hb_ntsc, search_range);
                     if e > ntsc_thresh && e > thresh_weak {
                         ntsc_harmonics += 1;
                     }
@@ -398,7 +449,7 @@ impl AnalogFpvDetector {
             // (which we don't have because the first packet is 2.6 ms).
             let hline_energy = pal_energy.max(ntsc_energy);
             if hline_energy > thresh_strong && collide_harmonics >= 2 {
-                let time_domain_class = classify_pal_ntsc_time_domain(&demod, sample_rate);
+                let time_domain_class = classify_pal_ntsc_time_domain(demod, sample_rate);
                 match time_domain_class {
                     Some(SignalType::AnalogVideoPal) => {
                         sig_type = SignalType::AnalogVideoPal;
@@ -433,7 +484,7 @@ impl AnalogFpvDetector {
                 SignalType::AnalogVideoNtsc => NTSC_LINE_HZ,
                 _ => PAL_LINE_HZ, // AnalogVideoUnknown — check PAL as proxy
             };
-            if !self.verify_cepstrum(&buffer, sample_rate, candidate_line_hz, demod_len) {
+            if !self.verify_cepstrum(mags, sample_rate, candidate_line_hz, demod_len) {
                 sig_type = SignalType::Unknown;
                 conf = 0.0;
             }
@@ -451,15 +502,14 @@ impl AnalogFpvDetector {
         // comb" into "confirmed periodic field structure", which is
         // essentially unfakeable by a non-video interferer.
         if sig_type.is_analog_video()
-            && let Some(levels) = crate::levels::estimate_sync_levels(&demod, sample_rate)
+            && let Some(levels) = crate::levels::estimate_sync_levels(demod, sample_rate)
         {
             let is_pal_hint = match sig_type {
                 SignalType::AnalogVideoPal => Some(true),
                 SignalType::AnalogVideoNtsc => Some(false),
                 _ => None,
             };
-            let evidence =
-                crate::vbi::confirm_field_sync(&demod, sample_rate, &levels, is_pal_hint);
+            let evidence = crate::vbi::confirm_field_sync(demod, sample_rate, &levels, is_pal_hint);
             conf =
                 apply_vbi_confidence_tier(sig_type, conf, &evidence, self.demote_unconfirmed_video);
         }
@@ -467,17 +517,14 @@ impl AnalogFpvDetector {
         (sig_type, conf)
     }
 
-    fn get_peak_energy(&self, buffer: &[FftComplex<f32>], bin: usize, range: usize) -> f32 {
-        let end = (bin + range).min(buffer.len() / 2);
+    fn get_peak_energy(&self, mags: &[f32], bin: usize, range: usize) -> f32 {
+        let end = (bin + range).min(mags.len() / 2);
         // Clamp start to end: for a `bin` past Nyquist (only reachable at
         // pathologically low sample rates where the line-rate bin exceeds
         // fft_len/2) `start` could otherwise exceed `end`, panicking the
         // inclusive slice below.
         let start = bin.saturating_sub(range).min(end);
-        buffer[start..=end]
-            .iter()
-            .map(|c| c.norm())
-            .fold(0.0f32, f32::max)
+        mags[start..=end].iter().copied().fold(0.0f32, f32::max)
     }
 
     /// Cepstrum-based structural verification for H-sync pulse trains.
@@ -506,12 +553,12 @@ impl AnalogFpvDetector {
     /// floor and inflate the peak-to-median ratio this gate turns on.
     fn verify_cepstrum(
         &self,
-        fft_buffer: &[FftComplex<f32>],
+        mags: &[f32],
         sample_rate: u32,
         candidate_line_hz: f32,
         record_len: usize,
     ) -> bool {
-        let fft_len = fft_buffer.len();
+        let fft_len = mags.len();
         if fft_len < 64 {
             return true; // too short for meaningful cepstrum
         }
@@ -525,16 +572,16 @@ impl AnalogFpvDetector {
         }
 
         // ---- Step 1: log-power spectrum ----
-        // Written as a single pass over the complex FFT buffer.
-        // The inner loop is branchless: `re*re + im*im + eps` then
-        // `ln()`.  LLVM SLP-vectorises the multiply-add to 4-wide
-        // NEON/SSE; the `ln` call is scalar but dominates only at
-        // very large FFT sizes where the IFFT cost already exceeds
-        // it.
+        // Written as a single pass over the magnitude spectrum (which
+        // may be a cross-batch average — see `SpectralIntegrator`).
+        // The inner loop is branchless: `m*m + eps` then `ln()`. LLVM
+        // SLP-vectorises the multiply; the `ln` call is scalar but
+        // dominates only at very large FFT sizes where the IFFT cost
+        // already exceeds it.
         const EPSILON: f32 = 1e-12;
         let mut log_power: Vec<FftComplex<f32>> = Vec::with_capacity(fft_len);
-        for c in fft_buffer {
-            let power = c.re * c.re + c.im * c.im + EPSILON;
+        for &m in mags {
+            let power = m * m + EPSILON;
             log_power.push(FftComplex {
                 re: power.ln(),
                 im: 0.0,
@@ -642,18 +689,17 @@ impl AnalogFpvDetector {
     ///    leaves 2.5 MHz-off signals at ~0 dB (well inside the
     ///    passband), so no detection blind spot.
     ///
-    /// ## Known follow-ups
+    /// ## Performance notes
     ///
-    /// The implementation below runs the FIR for *every* input
-    /// sample even though only every `decimation_factor`-th output is
-    /// kept; a polyphase decimating FIR would only compute the
-    /// retained outputs for a ~5× per-probe speed-up. The
-    /// `StreamingDDC` is also re-constructed per probe per packet
-    /// (which re-runs the tap-design `sin_cos` loop), so caching the
-    /// designed taps in `AnalogFpvDetector` is another easy win.
-    /// Neither matters yet at our current packet sizes; both are
-    /// tracked under the multi-mode wire-up item.
+    /// `StreamingDDC::process_decimated` already computes the FIR only
+    /// on decimation-aligned samples (the mixer and delay-line writes
+    /// are per-sample and irreducible in this structure), so there is
+    /// no pending "polyphase" win here — an earlier note claiming a
+    /// ~5× speed-up predated that gating. The FIR *design* is cached
+    /// across probes and batches (`sweep_taps`), so per-probe
+    /// construction costs one 63-`f32` copy, not a `sin_cos` loop.
     fn ddc_and_decimate(
+        &self,
         iq_data: &[Complex<f32>],
         sample_rate: u32,
         freq_offset: f32,
@@ -661,8 +707,26 @@ impl AnalogFpvDetector {
     ) -> Vec<Complex<f32>> {
         let decimation_factor = Self::decimation_factor(sample_rate, target_rate);
         let cutoff_hz = (target_rate as f32) / 3.0;
-        let mut ddc = crate::ddc::StreamingDDC::new(freq_offset, sample_rate, cutoff_hz);
+        let taps = self.cached_sweep_taps(sample_rate, cutoff_hz);
+        let mut ddc = crate::ddc::StreamingDDC::from_designed_taps(freq_offset, sample_rate, taps);
         ddc.process_decimated(iq_data, decimation_factor)
+    }
+
+    /// The sweep's shared FIR design, cached by `(sample_rate,
+    /// cutoff_hz)` — every probe in a sweep differs only in mixing
+    /// offset.
+    fn cached_sweep_taps(&self, sample_rate: u32, cutoff_hz: f32) -> Vec<f32> {
+        let key = (sample_rate, cutoff_hz.to_bits());
+        let mut cache = self.sweep_taps.borrow_mut();
+        if let Some((rate, cut, taps)) = cache.as_ref()
+            && (*rate, *cut) == key
+        {
+            return taps.clone();
+        }
+        let taps =
+            crate::ddc::design_fir_taps(cutoff_hz, sample_rate, crate::ddc::DEFAULT_FIR_TAPS);
+        *cache = Some((key.0, key.1, taps.clone()));
+        taps
     }
 
     /// Integer decimation factor `ddc_and_decimate` actually divides by.
@@ -684,6 +748,94 @@ impl AnalogFpvDetector {
     /// capture rate that wasn't a clean multiple of `target_rate`.
     fn decimated_rate(sample_rate: u32, target_rate: u32) -> u32 {
         sample_rate / Self::decimation_factor(sample_rate, target_rate) as u32
+    }
+}
+
+/// Noncoherent cross-batch spectrum accumulator for the `_integrated`
+/// detection entry points.
+///
+/// Keyed by absolute frequency (rounded to a 1 MHz bucket, so probe-grid
+/// jitter between sweeps lands in the same bucket), each bucket holds a
+/// running average of the FM-demod magnitude spectrum. A real signal's
+/// sync comb sits in the same bins batch after batch while noise
+/// magnitudes average toward their mean, so after N batches the
+/// comb-to-floor contrast improves ~√N — several dB of detection
+/// sensitivity that no single ~68 ms batch can provide. The averaging is
+/// a cumulative mean up to `window` batches, then an EWMA with
+/// `α = 1/window`, so stale signals fade rather than pinning the bucket
+/// forever.
+///
+/// One integrator per capture chain: buckets assume a consistent FFT
+/// length per frequency, and a changed capture configuration should
+/// start fresh (see [`Self::reset`]).
+pub struct SpectralIntegrator {
+    window: u32,
+    max_buckets: usize,
+    buckets: HashMap<i64, SpectralBucket>,
+    /// First-insertion order, for cheap oldest-bucket eviction at the
+    /// `max_buckets` cap (a runaway hop list shouldn't grow memory
+    /// unboundedly — each bucket holds a full magnitude spectrum).
+    insertion_order: VecDeque<i64>,
+}
+
+struct SpectralBucket {
+    mags: Vec<f32>,
+    count: u32,
+}
+
+impl SpectralIntegrator {
+    /// `window` is the effective averaging depth in batches (clamped to
+    /// ≥ 1). 4 is a good default: ~6 dB of noise-variance reduction at
+    /// ~4 batches of latency for a signal to reach full sensitivity.
+    pub fn new(window: u32) -> Self {
+        Self {
+            window: window.max(1),
+            max_buckets: 256,
+            buckets: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    /// Drop all accumulated state (retune, capture-config change).
+    pub fn reset(&mut self) {
+        self.buckets.clear();
+        self.insertion_order.clear();
+    }
+
+    /// Fold `fresh` into the bucket for `key_hz` and return the
+    /// averaged spectrum. A length mismatch (changed capture length for
+    /// this frequency) restarts the bucket from `fresh`.
+    fn accumulate(&mut self, key_hz: i64, fresh: &[f32]) -> &[f32] {
+        let key = key_hz.div_euclid(1_000_000);
+        if !self.buckets.contains_key(&key) {
+            if self.insertion_order.len() >= self.max_buckets
+                && let Some(evict) = self.insertion_order.pop_front()
+            {
+                self.buckets.remove(&evict);
+            }
+            self.insertion_order.push_back(key);
+            self.buckets.insert(
+                key,
+                SpectralBucket {
+                    mags: fresh.to_vec(),
+                    count: 1,
+                },
+            );
+            return &self.buckets[&key].mags;
+        }
+        let bucket = self.buckets.get_mut(&key).expect("checked above");
+        if bucket.mags.len() != fresh.len() {
+            bucket.mags.clear();
+            bucket.mags.extend_from_slice(fresh);
+            bucket.count = 1;
+        } else {
+            bucket.count = (bucket.count + 1).min(self.window);
+            let alpha = 1.0 / bucket.count as f32;
+            for (avg, &x) in bucket.mags.iter_mut().zip(fresh) {
+                *avg += alpha * (x - *avg);
+            }
+        }
+        &bucket.mags
     }
 }
 
@@ -775,12 +927,35 @@ fn apply_vbi_confidence_tier(
     }
 }
 
-impl FpvDetector for AnalogFpvDetector {
-    fn detect_from_iq(
+impl AnalogFpvDetector {
+    /// [`FpvDetector::detect_from_iq`] with cross-batch spectral
+    /// integration (see [`SpectralIntegrator`]). Differences from the
+    /// single-shot path:
+    ///
+    /// - every wideband probe is demodulated, transformed, and
+    ///   accumulated — the per-probe energy gate no longer skips
+    ///   classification, because a signal below this batch's energy
+    ///   floor is exactly the one integration exists to find (cost:
+    ///   ~one FFT per probe per batch instead of only gate-passers);
+    /// - classification thresholds run against the accumulated average
+    ///   spectrum for each probe's frequency bucket, so sensitivity
+    ///   grows over successive batches at the same tuning.
+    pub fn detect_from_iq_integrated(
         &self,
         iq_data: &[Complex<f32>],
         center_freq: u64,
         sample_rate: u32,
+        integrator: &mut SpectralIntegrator,
+    ) -> Vec<DetectionResult> {
+        self.detect_from_iq_impl(iq_data, center_freq, sample_rate, Some(integrator))
+    }
+
+    fn detect_from_iq_impl(
+        &self,
+        iq_data: &[Complex<f32>],
+        center_freq: u64,
+        sample_rate: u32,
+        mut integration: Option<&mut SpectralIntegrator>,
     ) -> Vec<DetectionResult> {
         let n = iq_data.len();
         if n < 2048 {
@@ -824,7 +999,15 @@ impl FpvDetector for AnalogFpvDetector {
         // coverage at all), so anything ≤ 10 MHz is treated as a single
         // baseband slice and classified directly.
         if sample_rate <= WIDEBAND_TARGET_RATE_HZ {
-            let (sig_type, conf) = self.detect_sync_pulses(iq_data, sample_rate);
+            let (sig_type, conf) = match integration.as_deref_mut() {
+                Some(integ) => self.detect_sync_pulses_integrated(
+                    iq_data,
+                    sample_rate,
+                    center_freq as i64,
+                    integ,
+                ),
+                None => self.detect_sync_pulses(iq_data, sample_rate),
+            };
             if sig_type != SignalType::Unknown {
                 // Measured mean power like every other path — this used
                 // to be a hardcoded -50.0, which fed a constant into the
@@ -885,7 +1068,15 @@ impl FpvDetector for AnalogFpvDetector {
             // stable frequency (the centre) rather than 2-3 fake probe
             // offsets that deduped into separate detections downstream.
             if n_steps < 4 {
-                let (sig_type, conf) = self.detect_sync_pulses(iq_data, sample_rate);
+                let (sig_type, conf) = match integration.as_deref_mut() {
+                    Some(integ) => self.detect_sync_pulses_integrated(
+                        iq_data,
+                        sample_rate,
+                        center_freq as i64,
+                        integ,
+                    ),
+                    None => self.detect_sync_pulses(iq_data, sample_rate),
+                };
                 if sig_type != SignalType::Unknown {
                     let energy: f32 = iq_data
                         .iter()
@@ -957,7 +1148,7 @@ impl FpvDetector for AnalogFpvDetector {
                 }
             } else {
                 for &offset_hz in &offsets {
-                    let isolated_iq = Self::ddc_and_decimate(
+                    let isolated_iq = self.ddc_and_decimate(
                         iq_data,
                         sample_rate,
                         offset_hz as f32,
@@ -1001,10 +1192,23 @@ impl FpvDetector for AnalogFpvDetector {
             // Collect all positive detections from the sweep
             let mut sweep_hits: Vec<(f64, f32, SignalType, f32)> = Vec::new(); // (freq_hz, energy, type, conf)
             for (offset_hz, energy, isolated_iq, isolated_rate) in &probes {
-                if *energy <= energy_thresh {
+                // Single-shot mode: the energy gate limits classification
+                // cost to probes that plausibly hold a signal. Integrated
+                // mode classifies (and accumulates) EVERY probe — a
+                // signal below this batch's energy floor is exactly the
+                // one integration exists to find, and the harmonic +
+                // cepstrum + VBI gates still protect against false
+                // positives on the averaged spectrum.
+                if integration.is_none() && *energy <= energy_thresh {
                     continue;
                 }
-                let (sig_type, conf) = self.detect_sync_pulses(isolated_iq, *isolated_rate);
+                let (sig_type, conf) = match integration.as_deref_mut() {
+                    Some(integ) => {
+                        let key = center_freq as i64 + *offset_hz as i64;
+                        self.detect_sync_pulses_integrated(isolated_iq, *isolated_rate, key, integ)
+                    }
+                    None => self.detect_sync_pulses(isolated_iq, *isolated_rate),
+                };
                 if sig_type != SignalType::Unknown {
                     let freq_hz = center_freq as f64 + offset_hz;
                     sweep_hits.push((freq_hz, *energy, sig_type, conf));
@@ -1073,6 +1277,17 @@ impl FpvDetector for AnalogFpvDetector {
         });
 
         deduped
+    }
+}
+
+impl FpvDetector for AnalogFpvDetector {
+    fn detect_from_iq(
+        &self,
+        iq_data: &[Complex<f32>],
+        center_freq: u64,
+        sample_rate: u32,
+    ) -> Vec<DetectionResult> {
+        self.detect_from_iq_impl(iq_data, center_freq, sample_rate, None)
     }
 }
 
@@ -1221,31 +1436,96 @@ mod tests {
         let decimation_factor = AnalogFpvDetector::decimation_factor(sample_rate, target_rate);
         let cutoff_hz = target_rate as f32 / 3.0;
 
-        let cpu_out =
-            AnalogFpvDetector::ddc_and_decimate(&iq, sample_rate, offset_hz as f32, target_rate);
+        let cpu_det = AnalogFpvDetector::default();
+        let cpu_out = cpu_det.ddc_and_decimate(&iq, sample_rate, offset_hz as f32, target_rate);
+
+        // Two consecutive sweeps: the second reuses the persistent
+        // buffer pool, so this also guards the pooled-upload path.
+        for label in ["fresh-buffers", "pooled-rerun"] {
+            let gpu_out = gpu.sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz);
+            let gpu_probe = &gpu_out[0];
+
+            assert_eq!(
+                cpu_out.len(),
+                gpu_probe.len(),
+                "{label}: GPU/CPU decimated length mismatch"
+            );
+
+            let mut sq_err = 0.0f64;
+            let mut sq_ref = 0.0f64;
+            for (c, g) in cpu_out.iter().zip(gpu_probe.iter()) {
+                let d_re = (c.re - g.re) as f64;
+                let d_im = (c.im - g.im) as f64;
+                sq_err += d_re * d_re + d_im * d_im;
+                sq_ref += (c.re as f64).powi(2) + (c.im as f64).powi(2);
+            }
+            let rel_rms = (sq_err / sq_ref.max(1e-12)).sqrt();
+            assert!(
+                rel_rms < 0.01,
+                "{label}: GPU DDC output diverges from CPU by {:.4}% RMS (tolerance 1%)",
+                rel_rms * 100.0
+            );
+        }
+    }
+
+    /// A large decimation factor (smaller pooled output than the
+    /// earlier tests') must still match the CPU reference — also
+    /// exercises pool rebinding at a different output geometry.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_sweep_matches_cpu_at_large_decimation() {
+        let Some(gpu) = crate::gpu::GpuAnalog::try_new() else {
+            eprintln!("No GPU adapter found; skipping");
+            return;
+        };
+        let sample_rate = 50_000_000u32;
+        let iq = make_pal_pulse_train(sample_rate, 500);
+        let decimation_factor = 40usize;
+        let cutoff_hz = 400_000.0f32;
+        let offset_hz = -3_000_000.0f64;
+
+        let mut ddc = crate::ddc::StreamingDDC::new(offset_hz as f32, sample_rate, cutoff_hz);
+        let cpu_out = ddc.process_decimated(&iq, decimation_factor);
         let gpu_out = gpu.sweep(&iq, sample_rate, &[offset_hz], decimation_factor, cutoff_hz);
         let gpu_probe = &gpu_out[0];
-
-        assert_eq!(
-            cpu_out.len(),
-            gpu_probe.len(),
-            "GPU/CPU decimated length mismatch"
-        );
-
+        assert_eq!(cpu_out.len(), gpu_probe.len());
         let mut sq_err = 0.0f64;
         let mut sq_ref = 0.0f64;
         for (c, g) in cpu_out.iter().zip(gpu_probe.iter()) {
-            let d_re = (c.re - g.re) as f64;
-            let d_im = (c.im - g.im) as f64;
-            sq_err += d_re * d_re + d_im * d_im;
+            sq_err += ((c.re - g.re) as f64).powi(2) + ((c.im - g.im) as f64).powi(2);
             sq_ref += (c.re as f64).powi(2) + (c.im as f64).powi(2);
         }
         let rel_rms = (sq_err / sq_ref.max(1e-12)).sqrt();
-        assert!(
-            rel_rms < 0.01,
-            "GPU DDC output diverges from CPU by {:.4}% RMS (tolerance 1%)",
-            rel_rms * 100.0
-        );
+        assert!(rel_rms < 0.01, "fallback diverges: {:.4}%", rel_rms * 100.0);
+    }
+
+    /// Timing harness for the GPU sweep (not asserted — run with
+    /// `cargo test --features gpu gpu_sweep_timing -- --ignored --nocapture`).
+    /// Historical baseline on an Apple-silicon GPU: ~15 ms/sweep for
+    /// 1 M samples × 11 probes at D = 5 — the number that condemned the
+    /// workgroup-tiling experiment (see the shader's note).
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore]
+    fn gpu_sweep_timing() {
+        let Some(gpu) = crate::gpu::GpuAnalog::try_new() else {
+            eprintln!("No GPU adapter found; skipping");
+            return;
+        };
+        let sample_rate = 50_000_000u32;
+        let iq = make_pal_pulse_train(sample_rate, 300); // ~1 M samples, a realistic large batch
+        let offsets: Vec<f64> = (0..11).map(|i| -20e6 + i as f64 * 5e6).collect();
+        let decimation_factor =
+            AnalogFpvDetector::decimation_factor(sample_rate, WIDEBAND_TARGET_RATE_HZ);
+        let cutoff_hz = WIDEBAND_TARGET_RATE_HZ as f32 / 3.0;
+        // Warm-up (pipeline + pool growth), then timed runs.
+        let _ = gpu.sweep(&iq, sample_rate, &offsets, decimation_factor, cutoff_hz);
+        let t0 = std::time::Instant::now();
+        let reps = 5;
+        for _ in 0..reps {
+            let _ = gpu.sweep(&iq, sample_rate, &offsets, decimation_factor, cutoff_hz);
+        }
+        eprintln!("sweep: {:?}/sweep", t0.elapsed() / reps);
     }
 
     #[test]
@@ -1302,36 +1582,35 @@ mod tests {
     /// a flat spectrum fails.
     #[test]
     fn verify_cepstrum_unit_test() {
-        use rustfft::num_complex::Complex as FftC;
-
         let sr = 10_000_000u32;
         let line_hz = 15625.0f32;
         let fft_len = 8192;
         let det = AnalogFpvDetector::new(-20.0);
 
-        // Build a synthetic FFT buffer with a harmonic comb at the
-        // line rate — simulates what a real pulse train would produce.
+        // Build a synthetic magnitude spectrum with a harmonic comb at
+        // the line rate — simulates what a real pulse train would
+        // produce.
         let bin_hz = sr as f32 / fft_len as f32;
-        let mut fft_buf = vec![FftC { re: 0.001, im: 0.0 }; fft_len];
+        let mut mags = vec![0.001f32; fft_len];
         for k in 1..=10 {
             let bin = (k as f32 * line_hz / bin_hz).round() as usize;
             if bin < fft_len / 2 {
                 // Strong peak at this harmonic.
-                fft_buf[bin] = FftC { re: 100.0, im: 0.0 };
+                mags[bin] = 100.0;
                 // Mirror.
-                fft_buf[fft_len - bin] = FftC { re: 100.0, im: 0.0 };
+                mags[fft_len - bin] = 100.0;
             }
         }
 
         assert!(
-            det.verify_cepstrum(&fft_buf, sr, line_hz, fft_len),
+            det.verify_cepstrum(&mags, sr, line_hz, fft_len),
             "harmonic comb should pass cepstrum check"
         );
 
         // Flat spectrum — no periodic structure.
-        let flat_buf = vec![FftC { re: 1.0, im: 0.0 }; fft_len];
+        let flat = vec![1.0f32; fft_len];
         assert!(
-            !det.verify_cepstrum(&flat_buf, sr, line_hz, fft_len),
+            !det.verify_cepstrum(&flat, sr, line_hz, fft_len),
             "flat spectrum should fail cepstrum check"
         );
     }
@@ -1369,6 +1648,88 @@ mod tests {
         let demod = make_synthetic_demod(sr, 15734.0, 80);
         let class = classify_pal_ntsc_time_domain(&demod, sr);
         assert_eq!(class, Some(SignalType::AnalogVideoNtsc));
+    }
+
+    /// Regression: the classifier's threshold must survive FM-click
+    /// outliers. Physically, `fm_demod` output is bounded to ±π, and a
+    /// weak signal's sync tips sit well inside that (−0.4·rpv ≈ −0.5
+    /// at 5 MHz deviation / 25 MSPS) — so the old `global_min · 0.3`
+    /// threshold latched onto a −π click, landed at ≈ −0.94, below
+    /// every real tip, and the disambiguator saw only clicks. The
+    /// smoothed percentile threshold ignores single-sample clicks
+    /// entirely.
+    #[test]
+    fn time_domain_disambig_survives_click_outliers() {
+        let sr = 25_000_000u32;
+        // Scale the ±1 synthetic to the real convention: tips at −0.5,
+        // blanking at 0.
+        let mut demod: Vec<f32> = make_synthetic_demod(sr, 15625.0, 80)
+            .into_iter()
+            .map(|v| (v - 1.0) * 0.25)
+            .collect();
+        // Single-sample ±π FM clicks at an aperiodic stride so they
+        // can't masquerade as a line rate.
+        let mut k = 917usize;
+        while k < demod.len() {
+            demod[k] = -std::f32::consts::PI;
+            k += 917 + (k % 131);
+        }
+        assert_eq!(
+            classify_pal_ntsc_time_domain(&demod, sr),
+            Some(SignalType::AnalogVideoPal)
+        );
+    }
+
+    /// The percentile threshold is DC-invariant: a demod offset from a
+    /// tuning error must not break classification (the old
+    /// zero-referenced threshold required sync tips below zero).
+    #[test]
+    fn time_domain_disambig_is_dc_invariant() {
+        let sr = 25_000_000u32;
+        let mut demod = make_synthetic_demod(sr, 15734.0, 80);
+        for v in &mut demod {
+            *v += 1.5; // tips now at +0.5, blanking at +2.5 — all positive
+        }
+        assert_eq!(
+            classify_pal_ntsc_time_domain(&demod, sr),
+            Some(SignalType::AnalogVideoNtsc)
+        );
+    }
+
+    /// Weak-signal sanity: a full standards-shaped NTSC signal buried
+    /// in complex AWGN must still be detected as analog video. The
+    /// noise level here (σ = 0.35 per I/Q component against a
+    /// unit-amplitude carrier, ≈ 6 dB CNR in the capture bandwidth)
+    /// sits well below clean-signal conditions; it exercises the
+    /// median-based FFT noise floor and the percentile sync
+    /// thresholds together.
+    #[test]
+    fn detects_video_under_awgn() {
+        let sample_rate = 15_360_000u32;
+        let cfg = synth_config(false, sample_rate);
+        let mut iq = generate_iq(&cfg, 2, 0.0);
+        let mut seed = 0xC0FFEE42u64;
+        let gauss = |s: &mut u64| -> f32 {
+            // Irwin-Hall (sum of 12 uniforms) approximate N(0,1).
+            let mut acc = 0.0f32;
+            for _ in 0..12 {
+                *s ^= *s << 13;
+                *s ^= *s >> 7;
+                *s ^= *s << 17;
+                acc += (*s >> 11) as f32 / (1u64 << 53) as f32;
+            }
+            acc - 6.0
+        };
+        for z in iq.iter_mut() {
+            z.re += 0.35 * gauss(&mut seed);
+            z.im += 0.35 * gauss(&mut seed);
+        }
+        let det = AnalogFpvDetector::default();
+        let (sig_type, conf) = det.detect_sync_pulses(&iq, sample_rate);
+        assert!(
+            sig_type.is_analog_video(),
+            "expected analog video under AWGN, got {sig_type:?} (conf {conf})"
+        );
     }
 
     #[test]
@@ -1597,5 +1958,114 @@ mod tests {
             det.min_confidence > conf,
             "demoted confidence should fail the default floor"
         );
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+    use crate::vbi::FieldParity;
+
+    fn awgn(iq: &mut [Complex<f32>], sigma: f32, seed: &mut u64) {
+        let gauss = |s: &mut u64| -> f32 {
+            // Irwin-Hall approximate N(0,1): sum of 12 uniforms − 6.
+            let mut acc = 0.0f32;
+            for _ in 0..12 {
+                *s ^= *s << 13;
+                *s ^= *s >> 7;
+                *s ^= *s << 17;
+                acc += (*s >> 11) as f32 / (1u64 << 53) as f32;
+            }
+            acc - 6.0
+        };
+        for z in iq.iter_mut() {
+            z.re += sigma * gauss(seed);
+            z.im += sigma * gauss(seed);
+        }
+    }
+
+    /// The headline property of [`SpectralIntegrator`]: at σ = 1.2 per
+    /// I/Q component against a unit carrier, no single batch detects
+    /// the signal (0/4 across four independent noise realizations —
+    /// calibrated empirically with margin: single-shot is already 0/4
+    /// at σ = 1.2 and integration still detects cleanly at σ = 1.5),
+    /// but four noncoherently averaged batches classify it at full 0.8
+    /// confidence. That is the several-dB sensitivity gain the
+    /// integrator exists for.
+    #[test]
+    fn integration_detects_where_single_batches_cannot() {
+        let sample_rate = 15_360_000u32;
+        let cfg = SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let clean = generate_iq(&cfg, 2, 0.0);
+        let sigma = 1.2f32;
+        let det = AnalogFpvDetector::default();
+
+        // Single-shot: every one of the four noisy batches must fail —
+        // this pins the "too weak for one batch" premise.
+        for b in 0..4u64 {
+            let mut iq = clean.clone();
+            let mut seed = 0x1111u64.wrapping_add(b.wrapping_mul(0x9E3779B97F4A7C15));
+            awgn(&mut iq, sigma, &mut seed);
+            let (st, conf) = det.detect_sync_pulses(&iq, sample_rate);
+            assert!(
+                !st.is_analog_video(),
+                "batch {b}: single-shot unexpectedly detected {st:?} (conf {conf}) — \
+                 recalibrate sigma upward"
+            );
+        }
+
+        // Integrated: the same four batches through one accumulator.
+        let mut integ = SpectralIntegrator::new(4);
+        let mut last = (SignalType::Unknown, 0.0f32);
+        for b in 0..4u64 {
+            let mut iq = clean.clone();
+            let mut seed = 0x1111u64.wrapping_add(b.wrapping_mul(0x9E3779B97F4A7C15));
+            awgn(&mut iq, sigma, &mut seed);
+            last = det.detect_sync_pulses_integrated(&iq, sample_rate, 5_800_000_000, &mut integ);
+        }
+        assert!(
+            last.0.is_analog_video() && last.1 >= 0.7,
+            "integrated detection should succeed, got {:?} conf {:.2}",
+            last.0,
+            last.1
+        );
+    }
+
+    #[test]
+    fn integrator_resets_bucket_on_length_change_and_caps_bucket_count() {
+        let mut integ = SpectralIntegrator::new(4);
+        // Average of two batches at the same key.
+        let a = vec![1.0f32; 64];
+        let b = vec![3.0f32; 64];
+        integ.accumulate(5_800_000_000, &a);
+        let avg = integ.accumulate(5_800_000_000, &b).to_vec();
+        assert!(
+            (avg[0] - 2.0).abs() < 1e-6,
+            "cumulative mean, got {}",
+            avg[0]
+        );
+
+        // Length change restarts the bucket rather than mixing shapes.
+        let c = vec![7.0f32; 32];
+        let after = integ.accumulate(5_800_000_000, &c).to_vec();
+        assert_eq!(after.len(), 32);
+        assert!((after[0] - 7.0).abs() < 1e-6);
+
+        // Bucket cap: hammering more distinct frequencies than
+        // max_buckets must evict, not grow unboundedly.
+        let tiny = vec![0.0f32; 8];
+        for k in 0..300i64 {
+            integ.accumulate(k * 1_000_000, &tiny);
+        }
+        assert!(integ.buckets.len() <= integ.max_buckets);
     }
 }

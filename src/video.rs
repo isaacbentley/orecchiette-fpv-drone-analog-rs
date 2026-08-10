@@ -69,50 +69,87 @@ const ACTIVE_VIDEO_LEFT_CROP_FRAC: f32 = 0.16;
 /// chroma-burst amplitude as a noise floor.
 const TEMPORAL_MOTION_THRESHOLD: f32 = 0.10;
 
+/// Per-line EMA coefficient for the AGC gain/porch state — a ~5-line
+/// time constant, fast enough to track real vertical shading but slow
+/// enough that one noisy porch window can't flicker a line.
+const AGC_EMA_ALPHA: f32 = 0.2;
+
+/// Sanity clamp on the per-line AGC gain target, as a factor of the
+/// deviation-implied nominal gain of 1.0. Anything outside this is a
+/// broken measurement (dropout, click burst), not real level drift.
+const AGC_GAIN_CLAMP: (f32, f32) = (0.25, 4.0);
+
+/// Consecutive fields whose burst measurement must disagree with the
+/// current notch state before it flips — keeps a marginal source from
+/// toggling the subcarrier notch (a visible sharpness change) field to
+/// field.
+const NOTCH_HYSTERESIS_FIELDS: u8 = 3;
+
+/// Fraction of measured rows that must report a burst for the field to
+/// count as "burst present".
+const NOTCH_BURST_ROW_MAJORITY: f32 = 0.5;
+
+/// Goertzel tone power for `w0` rad/sample over `x`, normalised to an
+/// amplitude-squared estimate (`4·P/N²` recovers `A²` for a full-window
+/// tone of amplitude `A`).
+fn goertzel_amp_sq(x: &[f32], w0: f32) -> f32 {
+    if x.len() < 8 {
+        return 0.0;
+    }
+    let coeff = 2.0 * w0.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for &v in x {
+        let s0 = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+    4.0 * power.max(0.0) / (x.len() * x.len()) as f32
+}
+
 /// Classify a demodulated baseband slice as PAL or NTSC by measuring
 /// the median sync-tip interval. Returns [`SignalType::Unknown`] when
 /// the slice carries no measurable line structure — too short, too few
-/// sync tips, a non-negative (DC-offset/inverted) waveform, or a
-/// measured rate implausibly far from both standards. Earlier versions
-/// returned `AnalogVideoNtsc` for the degenerate cases, which asserted
-/// a standard from no evidence; callers must pick their own default
-/// when this returns `Unknown`.
+/// sync tips, no downward spread to threshold against (flat or
+/// inverted waveforms), or a measured rate implausibly far from both
+/// standards. Earlier versions returned `AnalogVideoNtsc` for the
+/// degenerate cases, which asserted a standard from no evidence;
+/// callers must pick their own default when this returns `Unknown`.
+///
+/// The sync threshold is the same robust percentile construction the
+/// rest of the crate uses (`p2 + 0.25·(p50−p2)` on a ~0.5 µs-smoothed
+/// copy): DC-invariant and immune to single FM-click outliers, unlike
+/// the `global_min · 0.3` threshold it replaced, which one deep click
+/// could drag beneath every real sync tip at exactly the low CNR this
+/// function matters for.
 pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType {
     let min_samples = sample_rate as usize / 200;
     if demod_data.len() < min_samples {
         return SignalType::Unknown;
     }
 
-    let search_len = (sample_rate as f32 * 640e-6) as usize;
-    let search_len = search_len.min(demod_data.len());
-    let global_min = demod_data[..search_len]
-        .iter()
-        .cloned()
-        .fold(f32::INFINITY, f32::min);
-    // Sync tips must sit below zero in this crate's demod convention; a
-    // non-negative minimum (DC-offset or inverted capture) makes the
-    // `global_min * 0.3` threshold meaningless — mirror the guard in
-    // `detector::classify_pal_ntsc_time_domain`.
-    if !global_min.is_finite() || global_min >= 0.0 {
-        return SignalType::Unknown;
-    }
-
-    let threshold = global_min * 0.3;
+    let scan_len = (sample_rate as f32 * 5000e-6) as usize;
+    let scan_len = scan_len.min(demod_data.len());
+    let ma_win = ((sample_rate as f32 * 0.5e-6) as usize).max(1);
+    let smoothed = crate::levels::moving_average(&demod_data[..scan_len], ma_win);
+    let threshold = match crate::levels::robust_sync_threshold(&smoothed) {
+        Some(t) => t,
+        None => return SignalType::Unknown,
+    };
     let min_gap = (sample_rate as f32 * 30e-6) as usize;
     let max_gap = (sample_rate as f32 * 100e-6) as usize;
 
     let mut sync_positions: Vec<usize> = Vec::new();
     let mut i = 0;
-    let scan_len = (sample_rate as f32 * 5000e-6) as usize;
-    let scan_len = scan_len.min(demod_data.len());
+    let scan_len = smoothed.len();
 
     while i < scan_len {
-        if demod_data[i] < threshold {
+        if smoothed[i] < threshold {
             let mut local_min_idx = i;
-            let mut local_min_val = demod_data[i];
-            while i < scan_len && demod_data[i] < threshold {
-                if demod_data[i] < local_min_val {
-                    local_min_val = demod_data[i];
+            let mut local_min_val = smoothed[i];
+            while i < scan_len && smoothed[i] < threshold {
+                if smoothed[i] < local_min_val {
+                    local_min_val = smoothed[i];
                     local_min_idx = i;
                 }
                 i += 1;
@@ -241,6 +278,33 @@ pub struct FrameReconstructor {
     notch_b2: f32,
     notch_a1: f32,
     notch_a2: f32,
+    /// Subcarrier angular frequency at the TBC output rate — kept for
+    /// the burst-presence Goertzel that gates the notch (see
+    /// [`Self::chroma_notch_active`]).
+    notch_w0: f32,
+    /// Whether the subcarrier notch is currently applied. Starts
+    /// `true` (safe default: dot-crawl suppression until proven
+    /// burst-free) and flips only after [`NOTCH_HYSTERESIS_FIELDS`]
+    /// consecutive fields agree — burst-free monochrome cameras get
+    /// their full luma detail back, burst-carrying sources keep the
+    /// notch.
+    notch_enabled: bool,
+    /// Consecutive fields whose burst measurement disagreed with
+    /// `notch_enabled`; drives the hysteresis flip.
+    notch_flip_streak: u8,
+
+    /// Smoothed per-line AGC state: gain applied to (sample − porch)
+    /// and the porch (blanking) level it references. EMA'd across
+    /// lines (α = [`AGC_EMA_ALPHA`]) because the raw per-line
+    /// measurements come from two ~25-sample window means — at low CNR
+    /// a single click in the porch window used to swing an entire
+    /// line's brightness, visible as line-to-line flicker exactly when
+    /// the picture was already struggling.
+    agc_gain: f32,
+    agc_porch: f32,
+    /// `false` until the first valid swing measurement seeds the AGC
+    /// state directly (instead of easing in from the 1.0/0.0 init).
+    agc_primed: bool,
 
     /// Multi-field temporal history. Holds the last N rendered Y
     /// fields plus per-field metadata. Consumed by the temporal-
@@ -430,6 +494,12 @@ impl FrameReconstructor {
             notch_b2,
             notch_a1,
             notch_a2,
+            notch_w0: w0,
+            notch_enabled: true,
+            notch_flip_streak: 0,
+            agc_gain: 1.0,
+            agc_porch: 0.0,
+            agc_primed: false,
             history: FrameHistory::new(DEFAULT_TEMPORAL_WINDOW, field_pixels),
             field_counter: 0,
             in_dropout: false,
@@ -504,6 +574,16 @@ impl FrameReconstructor {
     /// without full denoise benefit).
     pub fn history_depth(&self) -> usize {
         self.history.len()
+    }
+
+    /// Whether the colour-subcarrier notch is currently applied. Gated
+    /// per field by a Goertzel burst-presence measurement on the back
+    /// porch (with [`NOTCH_HYSTERESIS_FIELDS`] of hysteresis): many FPV
+    /// cameras are effectively monochrome sources with no burst, and
+    /// for those the notch deleted real luma detail around 3.58 /
+    /// 4.43 MHz for nothing.
+    pub fn chroma_notch_active(&self) -> bool {
+        self.notch_enabled
     }
 
     pub fn video_standard(&self) -> crate::types::SignalType {
@@ -916,6 +996,16 @@ impl FrameReconstructor {
         let mut current_frame_tbc = vec![0.0f32; self.field_lines * self.line_width];
         let mut current_frame_doc = vec![false; self.field_lines * self.line_width];
 
+        // Per-row scratch, hoisted out of the loop: at 288 rows × 50
+        // fields/s the per-row `vec![...]`s added up to real allocator
+        // churn for buffers whose sizes never change within a call.
+        let mut tbc_line = vec![0.0f32; self.line_width];
+        let mut doc_mask = vec![false; self.line_width];
+        let mut dilated_doc = vec![false; self.line_width];
+        let mut aa_line: Vec<f32> = Vec::new();
+
+        let nominal_swing = 0.4 * radians_per_volt;
+
         for row in 0..self.field_lines {
             if row >= n_rows {
                 break;
@@ -962,26 +1052,48 @@ impl FrameReconstructor {
             // exact regardless of which sample `start_int` rounds to.
             let raw_len_f = end_pos - start_pos;
 
-            // TBC: Resample to exact self.line_width
-            let mut tbc_line = vec![0.0f32; self.line_width];
-            let mut doc_mask = vec![false; self.line_width];
+            // Anti-alias ahead of the TBC's point-sampling. When the
+            // resample is decimating (high capture rates: 61.44 MSPS →
+            // ~3,900 samples/line swept onto 864 outputs), evaluating
+            // the cubic at a >1-sample stride folds demod content and
+            // noise above the output Nyquist (~6.75 MHz) back into the
+            // picture. A boxcar the width of the decimation ratio ahead
+            // of the sampling (CIC-1) suppresses the fold; its
+            // (win−1)/2 group delay is compensated in `idx_float` so
+            // the image doesn't shift. At ≤1.5× ratios (low capture
+            // rates) the pass is skipped — nothing folds.
+            let ratio = raw_len_f / self.line_width as f32;
+            let aa_win = if ratio >= 1.5 {
+                ratio.round() as usize
+            } else {
+                1
+            };
+            let (line_src, aa_shift): (&[f32], f32) = if aa_win >= 2 {
+                crate::levels::moving_average_into(raw_line, aa_win, &mut aa_line);
+                (&aa_line, (aa_win - 1) as f32 / 2.0)
+            } else {
+                (raw_line, 0.0)
+            };
 
             let doc_thresh_high = 1.5 * radians_per_volt;
             let doc_thresh_low = -0.8 * radians_per_volt;
 
             for col in 0..self.line_width {
                 // start_frac shifts the entire sweep by the fractional
-                // sync_phase; the col-driven term spreads the fractional
-                // raw_len_f across the requested line_width samples.
-                let idx_float = start_frac + (col as f32 * raw_len_f) / (self.line_width as f32);
+                // sync_phase; aa_shift compensates the anti-alias
+                // boxcar's group delay; the col-driven term spreads the
+                // fractional raw_len_f across the requested line_width
+                // samples.
+                let idx_float =
+                    start_frac + aa_shift + (col as f32 * raw_len_f) / (self.line_width as f32);
                 let idx = idx_float as usize;
                 let frac = idx_float - idx as f32;
 
-                let val = if idx >= 1 && idx + 2 < raw_line.len() {
-                    let v0 = raw_line[idx - 1];
-                    let v1 = raw_line[idx];
-                    let v2 = raw_line[idx + 1];
-                    let v3 = raw_line[idx + 2];
+                let val = if idx >= 1 && idx + 2 < line_src.len() {
+                    let v0 = line_src[idx - 1];
+                    let v1 = line_src[idx];
+                    let v2 = line_src[idx + 1];
+                    let v3 = line_src[idx + 2];
 
                     let a = -0.5 * v0 + 1.5 * v1 - 1.5 * v2 + 0.5 * v3;
                     let b = v0 - 2.5 * v1 + 2.0 * v2 - 0.5 * v3;
@@ -989,11 +1101,11 @@ impl FrameReconstructor {
                     let d = v1;
 
                     a * frac * frac * frac + b * frac * frac + c * frac + d
-                } else if idx + 1 < raw_line.len() {
+                } else if idx + 1 < line_src.len() {
                     // Fallback to linear at the very edges
-                    raw_line[idx] * (1.0 - frac) + raw_line[idx + 1] * frac
-                } else if idx < raw_line.len() {
-                    raw_line[idx]
+                    line_src[idx] * (1.0 - frac) + line_src[idx + 1] * frac
+                } else if idx < line_src.len() {
+                    line_src[idx]
                 } else {
                     // Past the end of the extracted line — clamp to the
                     // last real sample rather than injecting a 0, which
@@ -1002,7 +1114,7 @@ impl FrameReconstructor {
                     // tail is displayed). `.last()` rather than
                     // `[len - 1]` so a (guarded-impossible) empty line
                     // can't underflow.
-                    raw_line.last().copied().unwrap_or(0.0)
+                    line_src.last().copied().unwrap_or(0.0)
                 };
 
                 let is_doc = val > doc_thresh_high || val < doc_thresh_low;
@@ -1011,7 +1123,7 @@ impl FrameReconstructor {
             }
 
             // Blur doc mask slightly (morphological dilate)
-            let mut dilated_doc = doc_mask.clone();
+            dilated_doc.copy_from_slice(&doc_mask);
             for col in 2..self.line_width - 2 {
                 if doc_mask[col - 2]
                     || doc_mask[col - 1]
@@ -1023,7 +1135,13 @@ impl FrameReconstructor {
                 }
             }
 
-            // AGC Luma
+            // AGC Luma — measured per line, applied through smoothed
+            // EMA state (`agc_gain`/`agc_porch`). The raw measurements
+            // are two ~25-sample window means; instantaneous per-line
+            // application let a single click in either window swing an
+            // entire line's brightness and offset — visible as
+            // line-to-line flicker exactly at the low CNR where the
+            // picture is already struggling.
             let sync_tip_start = (self.line_width as f32 * 0.01) as usize;
             let sync_tip_end = (self.line_width as f32 * 0.04) as usize;
             let bp_start = (self.line_width as f32 * 0.12) as usize;
@@ -1038,15 +1156,29 @@ impl FrameReconstructor {
             // large-magnitude one. In this crate's FM-demod convention
             // blanking always sits above the sync tip, so a negative swing
             // means the discriminator output is inverted (swapped I/Q, or a
-            // spectrally-mirrored capture). `.abs()` accepted that and
-            // handed back a negative `scale_y`, which silently rendered a
-            // photographic negative — an inverted picture is much harder to
-            // recognise as a wiring fault than a flat one. Leaving the line
-            // unscaled keeps the fault visible instead of dressing it up.
-            if back_porch - sync_tip > 0.01 {
-                let scale_y = 0.4 * radians_per_volt / (back_porch - sync_tip);
-                for v in &mut tbc_line {
-                    *v = (*v - back_porch) * scale_y;
+            // spectrally-mirrored capture) — such lines never update the
+            // AGC state, so the wiring fault stays visible as an inverted
+            // picture rather than being silently "corrected".
+            let swing = back_porch - sync_tip;
+            if swing > 0.01 {
+                let target_gain = (nominal_swing / swing).clamp(AGC_GAIN_CLAMP.0, AGC_GAIN_CLAMP.1);
+                if self.agc_primed {
+                    self.agc_gain += AGC_EMA_ALPHA * (target_gain - self.agc_gain);
+                    self.agc_porch += AGC_EMA_ALPHA * (back_porch - self.agc_porch);
+                } else {
+                    // First valid measurement seeds the state directly
+                    // instead of easing in from the 1.0/0.0 init.
+                    self.agc_gain = target_gain;
+                    self.agc_porch = back_porch;
+                    self.agc_primed = true;
+                }
+            }
+            // Apply the smoothed state even when this line's own
+            // measurement was invalid (a dropout or click burst): the
+            // last good gain beats leaving the line unscaled.
+            if self.agc_primed {
+                for v in tbc_line.iter_mut() {
+                    *v = (*v - self.agc_porch) * self.agc_gain;
                 }
             }
 
@@ -1062,6 +1194,53 @@ impl FrameReconstructor {
 
         let mut current_frame_y = vec![0.0f32; self.field_lines * self.line_width];
         let rows_to_process = field_rows_written;
+
+        // ── Chroma-burst presence → subcarrier-notch gating ─────────
+        //
+        // Many FPV cameras are effectively monochrome sources with no
+        // colour burst; for those the notch deletes real luma detail
+        // around f_sc for nothing. Measure burst presence with a
+        // Goertzel at f_sc over the back-porch window (7–14 % of the
+        // line — where the burst lives for both standards) on up to 32
+        // rows, and gate the notch with NOTCH_HYSTERESIS_FIELDS of
+        // hysteresis so a marginal source can't toggle sharpness field
+        // to field.
+        if rows_to_process > 8 {
+            let b_lo = (self.line_width as f32 * 0.07) as usize;
+            let b_hi = (self.line_width as f32 * 0.14) as usize;
+            let step = (rows_to_process / 32).max(1);
+            let mut hits = 0u32;
+            let mut total = 0u32;
+            let mut row = 0;
+            while row < rows_to_process {
+                let off = row * self.line_width;
+                let w = &current_frame_tbc[off + b_lo..off + b_hi];
+                let mean = w.iter().sum::<f32>() / w.len() as f32;
+                let var = w.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / w.len() as f32;
+                aa_line.clear();
+                aa_line.extend(w.iter().map(|v| v - mean));
+                // A window dominated by a real burst has tone-amplitude²
+                // ≈ 2·variance; noise-only windows put ~1/N of their
+                // variance in any one bin. `> var` splits the two with
+                // margin on both sides.
+                if var > 1e-12 && goertzel_amp_sq(&aa_line, self.notch_w0) > var {
+                    hits += 1;
+                }
+                total += 1;
+                row += step;
+            }
+            let burst_present =
+                total > 0 && (hits as f32) >= NOTCH_BURST_ROW_MAJORITY * total as f32;
+            if burst_present != self.notch_enabled {
+                self.notch_flip_streak += 1;
+                if self.notch_flip_streak >= NOTCH_HYSTERESIS_FIELDS {
+                    self.notch_enabled = burst_present;
+                    self.notch_flip_streak = 0;
+                }
+            } else {
+                self.notch_flip_streak = 0;
+            }
+        }
 
         // ── Per-row clean + temporal denoise (PARALLEL) ────────────
         //
@@ -1096,6 +1275,7 @@ impl FrameReconstructor {
             self.notch_a1,
             self.notch_a2,
         );
+        let notch_enabled = self.notch_enabled;
         let motion_threshold = TEMPORAL_MOTION_THRESHOLD * radians_per_volt;
         current_frame_y
             .par_chunks_mut(line_width)
@@ -1103,7 +1283,11 @@ impl FrameReconstructor {
             .take(rows_to_process)
             .for_each(|(row, y_out)| {
                 let offset = row * line_width;
-                let mut y_line = current_frame_tbc[offset..offset + line_width].to_vec();
+                // Work in place on this row's output chunk — the row
+                // used to copy into a per-row `Vec` and back, an
+                // allocation and two copies per row for nothing.
+                y_out.copy_from_slice(&current_frame_tbc[offset..offset + line_width]);
+                let y_line = y_out;
                 let doc_mask = &current_frame_doc[offset..offset + line_width];
 
                 // 1. DOC replacement from the previous field.
@@ -1115,8 +1299,12 @@ impl FrameReconstructor {
                     }
                 }
 
-                // 2. Subcarrier notch (zero-phase forward/backward biquad).
-                filtfilt(&mut y_line, nb0, nb1, nb2, na1, na2);
+                // 2. Subcarrier notch (zero-phase forward/backward
+                //    biquad) — only while the burst gate says a colour
+                //    subcarrier is actually present.
+                if notch_enabled {
+                    filtfilt(y_line, nb0, nb1, nb2, na1, na2);
+                }
 
                 // 3. Temporal denoise. Stack scratch, allocation-free.
                 let mut history_rows: [Option<&[f32]>; MAX_HISTORY] = [None; MAX_HISTORY];
@@ -1165,8 +1353,6 @@ impl FrameReconstructor {
                     let median = sorted[len / 2];
                     y_line[col] = motion_weight * cur + (1.0 - motion_weight) * median;
                 }
-
-                y_out.copy_from_slice(&y_line);
             });
 
         // ── CTI + Y→RGB pack (SEQUENTIAL) ──────────────────────────
@@ -1176,12 +1362,14 @@ impl FrameReconstructor {
         // dst_row max is `(field_lines - 1) * 2 + 1` (479 NTSC / 575
         // PAL), within `height - 1`, so the row math needs no guard.
         let h_blank_end = (self.line_width as f32 * ACTIVE_VIDEO_LEFT_CROP_FRAC) as usize;
+        // Hoisted CTI scratch (see the TBC scratch note above).
+        let mut y_cti = vec![0.0f32; self.line_width];
         for row in 0..rows_to_process {
             let offset = row * self.line_width;
             let y_clean = &current_frame_y[offset..offset + self.line_width];
 
             // 4. CTI (unsharp mask on luma).
-            let mut y_cti = y_clean.to_vec();
+            y_cti.copy_from_slice(y_clean);
             for col in 1..self.line_width - 1 {
                 let diff2 = y_clean[col - 1] - 2.0 * y_clean[col] + y_clean[col + 1];
                 y_cti[col] -= 0.2 * diff2;
@@ -1197,8 +1385,9 @@ impl FrameReconstructor {
                     break;
                 }
                 let y_norm = y_cti[src_col] / radians_per_volt;
-                let luma = y_norm.clamp(0.0, 1.0) * 255.0;
-                let c = luma as u32;
+                // `+ 0.5`: round to nearest instead of truncating, which
+                // biased every pixel ~half an LSB dark.
+                let c = (y_norm.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
                 frame[dst_off + col] = 0xFF000000 | (c << 16) | (c << 8) | c;
             }
         }
@@ -1546,6 +1735,61 @@ mod tests {
                 "is_pal={is_pal}: row {dark_row_below} luma {dark_below}, expected dark"
             );
         }
+    }
+
+    #[test]
+    fn goertzel_detects_tone_and_ignores_noise() {
+        let w0 = 0.9f32; // arbitrary in-band angular frequency
+        let n = 64;
+        let tone: Vec<f32> = (0..n).map(|i| (w0 * i as f32).cos()).collect();
+        let amp_sq = goertzel_amp_sq(&tone, w0);
+        assert!(
+            (amp_sq - 1.0).abs() < 0.3,
+            "unit tone should measure amp²≈1, got {amp_sq}"
+        );
+
+        let mut seed = 7u64;
+        let noise: Vec<f32> = (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed as f32 / u64::MAX as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let mean = noise.iter().sum::<f32>() / n as f32;
+        let var = noise.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+        let centered: Vec<f32> = noise.iter().map(|v| v - mean).collect();
+        let amp_sq = goertzel_amp_sq(&centered, w0);
+        assert!(
+            amp_sq < var,
+            "noise-only window must stay under the burst threshold (amp²={amp_sq}, var={var})"
+        );
+    }
+
+    /// Burst-free video (like the synthetic generator's, and like most
+    /// monochrome FPV cameras) must disable the subcarrier notch after
+    /// the hysteresis window, recovering luma detail around f_sc — and
+    /// the notch must start enabled (safe default).
+    #[test]
+    fn notch_disables_after_hysteresis_on_burst_free_video() {
+        let deviation_hz = 5e6;
+        let cfg = base_synth_config(false, deviation_hz);
+        let data = generate_fields(&cfg, 6);
+        let mut recon = FrameReconstructor::new(cfg.sample_rate, false, deviation_hz, false);
+        assert!(recon.chroma_notch_active(), "notch must start enabled");
+        let mut frame = vec![0u32; recon.width * recon.height];
+        let mut cursor = 0usize;
+        for _ in 0..4 {
+            let consumed = recon
+                .reconstruct_frame_into(&data[cursor..], &mut frame)
+                .expect("field should reconstruct");
+            cursor += consumed;
+        }
+        assert!(
+            !recon.chroma_notch_active(),
+            "burst-free fields should disable the notch after hysteresis"
+        );
     }
 
     #[test]

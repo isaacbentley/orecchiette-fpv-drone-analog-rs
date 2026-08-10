@@ -30,3 +30,10 @@ pollster = { version = "1.0", optional = true }
 [features]
 gpu = ["dep:wgpu", "dep:pollster"]
 
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "dsp"
+harness = false

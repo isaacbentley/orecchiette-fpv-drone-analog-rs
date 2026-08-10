@@ -14,7 +14,9 @@ A high-performance Rust crate for detecting analog FPV drone video signals using
 - **Vertical-Sync (VBI) Parsing**: Classifies equalizing / serrated-broad / horizontal pulses by width, locates the true vertical-sync group, and determines field parity by direct hypothesis test against the standard's calibrated active-video timing — not a phase fit, which this signal's own structure can't actually carry (see `DESIGN.md` §7).
 - **VBI-Confirmed Detection**: The detector cross-checks a harmonic-comb match against real, field-period-spaced vertical syncs, boosting confidence to 0.95 (or promoting a standard-ambiguous hit to 0.75) — essentially unfakeable by a non-video interferer.
 - **FM Deviation Auto-Estimation**: Recovers a transmitter's true peak FM deviation directly from the demodulated waveform (`levels::estimate_fm_deviation`), with no sync lock required, so playback and detection thresholds don't depend on a fixed assumption that's wrong for a given VTX.
-- **Optional Deemphasis**: A single-pole IIR deemphasis filter (`demod::Deemphasis`), off by default, approximates undoing a VTX's video pre-emphasis with unity DC gain (doesn't affect deviation estimation or sync detection either way).
+- **Cross-Batch Spectral Integration**: `SpectralIntegrator` + the `_integrated` detection entry points noncoherently average magnitude spectra per frequency across batches — several dB of extra sensitivity on weak signals (a calibrated test pins detection at a noise level where four independent single batches all fail). See `DESIGN.md` §11.
+- **Optional Deemphasis**: A single-pole IIR deemphasis filter (`demod::Deemphasis`) with unity DC gain, approximating the inverse of a VTX's video pre-emphasis (doesn't affect deviation estimation or sync detection either way); `fpv-viewer-rs` applies it by default.
+- **Burst-Gated Subcarrier Notch**: the dot-crawl notch runs only while a Goertzel burst detector finds a real colour burst — burst-free (effectively monochrome) FPV cameras keep their full luma detail.
 - **Sync Extraction & Time Base Correction**: Employs median and MAD outlier rejection on raw sync tips, combined with Catmull-Rom cubic interpolation for sub-sample Time Base Correction (TBC).
 - **Temporal Noise Reduction**: Features a configurable fixed-capacity ring buffer for multi-field temporal denoising, utilizing per-pixel median and motion-weighted blending to improve SNR on static regions.
 - **Monochrome Rendering**: Outputs luma-only frames — analog FPV's color subcarrier carries comparatively little of what an operator needs, and low-SNR RF links look better in clean grayscale than in noisy decoded color (see `DESIGN.md` §9).
@@ -112,6 +114,11 @@ Use `SignalType::is_analog_video()` to gate on "is this an analog FPV signal at 
 ```bash
 cargo test -p orecchiette-fpv-drone-analog-rs
 ```
+
+DSP hot paths are benchmarked with criterion (`cargo bench`):
+`detect_from_iq` on a live-shaped 65 k chunk (single-shot and
+integrated, 25 / 61.44 MSPS) and field reconstruction at 15.36 MSPS —
+so "real-time" is an enforced number, not an assumption.
 
 Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. `synthetic::generate_fields`/`generate_iq` build standards-shaped NTSC/PAL fields with real vertical-sync structure (equalizing/serrated-broad pulses, correct blanking, interlace parity), shared by every module's tests so generator and parser can't independently drift. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), the VBI parser (broad-group location, field-parity hypothesis test for both standards and parities, noise robustness), the confidence-tier policy (boost/promote/demote, as a pure function independent of any specific IQ signal), the FM-deviation estimator's accuracy across a range of deviation/sample-rate pairs, and the deemphasis filter's DC gain / −3 dB point / streaming continuity.
 

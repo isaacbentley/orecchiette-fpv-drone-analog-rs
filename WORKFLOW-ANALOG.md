@@ -42,7 +42,7 @@ The detector sweeps the entire capture bandwidth to find analog video signals at
 5.  **Energy Gating**:
     - Mean power (|I²+Q²|) is computed at each probe position.
     - The **25th percentile** of all probe energies serves as a robust noise floor estimate.
-    - Only probes exceeding the noise floor by ≥ 3 dB proceed to sync validation.
+    - Only probes exceeding the noise floor by ≥ 3 dB proceed to sync validation — except in *integrated* mode (`detect_from_iq_integrated`), where every probe is classified and accumulated: a signal below one batch's energy floor is exactly what cross-batch integration (DESIGN.md §11) exists to find.
 
 ---
 
@@ -59,7 +59,8 @@ The detector sweeps the entire capture bandwidth to find analog video signals at
       - **PAL**: 15,625 Hz
       - **NTSC**: 15,734 Hz
     - When FFT resolution is sufficient (bin_hz < 109 Hz, requiring > 9.2 ms of data), the detector classifies PAL vs NTSC straight from the spectrum.
-    - At coarse resolution (e.g., 2.6 ms at 100 MSPS, or a 65 k chunk at 25 MSPS ≈ 381 Hz/bin), PAL and NTSC bins collide. The detector then falls back to a **time-domain median sync-tip interval** (`classify_pal_ntsc_time_domain`): it counts sync tips on the demodulated record, takes the median line period, and maps it to a line rate compared against 15625/15734 Hz with a ±30 Hz midpoint dead-band — classifying PAL/NTSC at confidence 0.8. Only if that's inconclusive (too few tips, or median in the dead-band) does it tag `AnalogVideoUnknown` at 0.6 (rather than silently picking one standard). `SignalType::is_analog_video()` returns `true` in all three cases, so downstream consumers gating on "analog FPV present" still see the hit.
+    - At coarse resolution (e.g., 2.6 ms at 100 MSPS, or a 65 k chunk at 25 MSPS ≈ 381 Hz/bin), PAL and NTSC bins collide. The detector then falls back to a **time-domain median sync-tip interval** (`classify_pal_ntsc_time_domain`): it counts sync tips on the (smoothed) demodulated record against a robust percentile threshold (`p2 + 0.25·(p50−p2)` — DC-invariant and immune to single FM-click outliers, unlike the global-minimum threshold it replaced), takes the median line period, and maps it to a line rate compared against 15625/15734 Hz with a ±30 Hz midpoint dead-band — classifying PAL/NTSC at confidence 0.8. Only if that's inconclusive (too few tips, or median in the dead-band) does it tag `AnalogVideoUnknown` at 0.6 (rather than silently picking one standard). `SignalType::is_analog_video()` returns `true` in all three cases, so downstream consumers gating on "analog FPV present" still see the hit.
+    - The spectral noise floor these checks reference is the **median** of the in-band magnitude bins (a mean let a real signal raise its own detection floor), and in integrated mode all of the spectral checks run against the cross-batch averaged spectrum (DESIGN.md §11) — several dB of sensitivity after ~4 batches at the same tuning.
 
 8.  **Harmonic-Consistency Check**:
     - H-sync is a ~7% duty-cycle rectangular pulse train, so its FM-demodulated spectrum has the fundamental at the line rate plus a rich harmonic series — for a 7% duty train the first ~14 harmonics are within roughly −3 dB of the fundamental.
@@ -131,8 +132,10 @@ the colour path would return.
       from flickering the denoise mode frame to frame.
 
 14. **2D Mapping & Rescaling**:
-    - Samples between H-Sync pulses form a single line of pixels.
-    - **Normalization**: Raw FM deviations are mapped to 8-bit grayscale (0–255).
+    - Samples between H-Sync pulses form a single line of pixels, low-passed ahead of the sub-sample resampler whenever the resample is decimating (high capture rates), so content above the output Nyquist can't fold into the picture.
+    - **Normalization**: Raw FM deviations are mapped to 8-bit grayscale (0–255, rounded) through a line-to-line **smoothed AGC** (EMA'd gain/porch state with clamping — one noisy porch window can no longer flicker a whole line).
+    - **Subcarrier notch**: applied only while a Goertzel burst detector actually finds a colour burst on the back porch (3 fields of hysteresis) — burst-free monochrome cameras keep their full luma detail.
+    - **Deemphasis**: the viewer applies `demod::Deemphasis` stream-side by default (`--deemphasis-tau`, 0 disables), undoing VTX pre-emphasis so HF noise isn't emphasized in the picture.
     - **Geometry**: Lines are stacked into frames (720×576 for PAL, 720×480 for NTSC).
 
 14a. **Multi-Field Temporal Denoise** (`frame_history.rs`):

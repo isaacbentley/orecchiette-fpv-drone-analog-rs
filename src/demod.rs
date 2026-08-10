@@ -26,17 +26,27 @@ use num_complex::Complex;
 /// output clean. The downstream temporal-denoise median in `video.rs`
 /// is for channel noise, not for papering over demodulator error.
 pub fn fm_demod(iq_data: &[Complex<f32>]) -> Vec<f32> {
+    let mut output = Vec::new();
+    fm_demod_into(iq_data, &mut output);
+    output
+}
+
+/// Same as [`fm_demod`], but clears and refills a caller-supplied `Vec`
+/// so hot loops (the live decode worker demodulates a ~65 k-sample
+/// chunk hundreds of times per second; the detector demodulates every
+/// probe) can reuse one allocation instead of paying a fresh ~256 KB
+/// `Vec` per call.
+pub fn fm_demod_into(iq_data: &[Complex<f32>], output: &mut Vec<f32>) {
+    output.clear();
     let n = iq_data.len();
     if n < 2 {
-        return vec![];
+        return;
     }
-
-    let mut output = vec![0.0f32; n - 1];
+    output.reserve(n - 1);
     for i in 1..n {
         let prod = iq_data[i] * iq_data[i - 1].conj();
-        output[i - 1] = prod.arg();
+        output.push(prod.arg());
     }
-    output
 }
 
 /// Deprecated alias for [`fm_demod`]. The `_simd` suffix was

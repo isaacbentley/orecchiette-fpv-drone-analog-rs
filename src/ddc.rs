@@ -171,15 +171,31 @@ impl StreamingDDC {
         num_taps: usize,
     ) -> Self {
         let num_taps = num_taps.max(3);
-        // `sample_rate` is a divisor for both the LO phase advance and the
-        // normalised cutoff; a 0 rate would make `phase_adv` / `cutoff_norm`
-        // ±Inf → NaN taps and a NaN LO. Clamp to 1 Hz (degenerate but finite).
+        // `sample_rate` is a divisor for the normalised cutoff (and the
+        // LO phase advance below); clamp to 1 Hz (degenerate but finite).
+        let sample_rate = sample_rate.max(1);
+        let taps = design_fir_taps(cutoff_hz, sample_rate, num_taps);
+        Self::from_designed_taps(freq_offset_hz, sample_rate, taps)
+    }
+
+    /// Construct from an already-designed impulse response (e.g. one
+    /// cached by the detector's sweep, which builds a `StreamingDDC`
+    /// per probe with identical `cutoff/sample_rate` — re-running the
+    /// tap-design `sin_cos` loop per probe was pure waste). `taps` must
+    /// come from [`design_fir_taps`] (or be an equivalent finite,
+    /// unity-DC-gain design of length ≥ 3).
+    pub(crate) fn from_designed_taps(
+        freq_offset_hz: f32,
+        sample_rate: u32,
+        taps: Vec<f32>,
+    ) -> Self {
+        debug_assert!(taps.len() >= 3, "FIR needs at least 3 taps");
+        let num_taps = taps.len();
+        // A 0 rate would make `phase_adv` ±Inf → a NaN LO. Clamp to 1 Hz.
         let sample_rate = sample_rate.max(1);
         let phase_adv = -2.0 * PI * freq_offset_hz / sample_rate as f32;
         let (step_im, step_re) = phase_adv.sin_cos();
         let step_phasor = Complex::new(step_re, step_im);
-
-        let taps = design_fir_taps(cutoff_hz, sample_rate, num_taps);
 
         // Pre-reversed taps for the doubled-buffer convolution.
         // `taps_for_conv[k]` will multiply the k-th-oldest sample in

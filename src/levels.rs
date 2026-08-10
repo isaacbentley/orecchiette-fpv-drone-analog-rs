@@ -71,10 +71,21 @@ pub struct DeviationEstimate {
 
 #[inline]
 pub(crate) fn moving_average(data: &[f32], win: usize) -> Vec<f32> {
+    let mut out = Vec::new();
+    moving_average_into(data, win, &mut out);
+    out
+}
+
+/// [`moving_average`] into a caller-owned buffer, for per-row hot loops
+/// (the reconstructor's anti-alias pass runs once per rendered line).
+#[inline]
+pub(crate) fn moving_average_into(data: &[f32], win: usize, out: &mut Vec<f32>) {
+    out.clear();
     if win <= 1 || data.len() < win {
-        return data.to_vec();
+        out.extend_from_slice(data);
+        return;
     }
-    let mut out = Vec::with_capacity(data.len());
+    out.reserve(data.len());
     let mut acc = 0.0f32;
     for (i, &v) in data.iter().enumerate() {
         acc += v;
@@ -84,7 +95,6 @@ pub(crate) fn moving_average(data: &[f32], win: usize) -> Vec<f32> {
         let n = (i + 1).min(win) as f32;
         out.push(acc / n);
     }
-    out
 }
 
 /// Median of a slice via `select_nth_unstable` (O(n), no full sort).
@@ -99,6 +109,34 @@ pub(crate) fn median(values: &mut [f32]) -> f32 {
         a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
     });
     values[mid]
+}
+
+/// Robust sync-detection threshold for a smoothed demod slice:
+/// `p2 + 0.25·(p50 − p2)`, with the percentiles taken on a
+/// 16×-decimated copy for speed — the same construction
+/// [`estimate_fm_deviation`] uses (see its algorithm notes). The 2nd
+/// percentile is a brightness/DC-invariant stand-in for "pure sync
+/// tip" that a handful of FM-click outliers cannot drag around, unlike
+/// a global minimum. Returns `None` when the slice is too short or has
+/// no downward spread (`p50 <= p2`) — i.e. nothing sync-like to find.
+pub(crate) fn robust_sync_threshold(smoothed: &[f32]) -> Option<f32> {
+    let mut decimated: Vec<f32> = smoothed.iter().step_by(16).copied().collect();
+    if decimated.len() < 16 {
+        return None;
+    }
+    // Both order statistics come from the same buffer: select_nth
+    // doesn't need sorted input, so the p2 partition can't corrupt the
+    // later median selection — no defensive clone needed.
+    let p2_idx = (((decimated.len() as f32) * 0.02) as usize).min(decimated.len() - 1);
+    decimated.select_nth_unstable_by(p2_idx, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let p2 = decimated[p2_idx];
+    let p50 = median(&mut decimated);
+    if !(p2.is_finite() && p50.is_finite()) || p50 <= p2 {
+        return None;
+    }
+    Some(p2 + 0.25 * (p50 - p2))
 }
 
 /// Median absolute deviation around `center`.
@@ -154,28 +192,11 @@ pub fn estimate_fm_deviation(demod: &[f32], sample_rate: u32) -> Option<Deviatio
     let ma_win = ((fs * 0.5e-6) as usize).max(1);
     let smoothed = moving_average(demod, ma_win);
 
-    // Percentiles from a decimated copy — plenty of samples survive
-    // decimation at any capture length this function accepts, and it
-    // keeps the O(n) select_nth_unstable pass cheap.
-    let mut decimated: Vec<f32> = smoothed.iter().step_by(16).copied().collect();
-    if decimated.len() < 16 {
-        return None;
-    }
-    let p2_idx = ((decimated.len() as f32) * 0.02) as usize;
-    let p2 = {
-        let mut d = decimated.clone();
-        let idx = p2_idx.min(d.len() - 1);
-        d.select_nth_unstable_by(idx, |a, b| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        d[idx]
-    };
-    let p50 = median(&mut decimated);
-
-    if !(p2.is_finite() && p50.is_finite()) || p50 <= p2 {
-        return None;
-    }
-    let threshold = p2 + 0.25 * (p50 - p2);
+    // Percentile threshold from a decimated copy — see
+    // `robust_sync_threshold` (shared with the PAL/NTSC time-domain
+    // classifiers, which used to threshold on a fragile global
+    // minimum instead).
+    let threshold = robust_sync_threshold(&smoothed)?;
 
     let min_width = ((fs * 1.5e-6) as usize).max(1);
     let max_width = (fs * 32e-6) as usize;

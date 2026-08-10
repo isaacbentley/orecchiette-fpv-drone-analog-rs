@@ -48,6 +48,19 @@ const TWO_PI: f32 = 6.283185307179586;
 // the loop even if the two ever disagree.
 const MAX_TAPS: u32 = 96u;
 
+// ── A note on workgroup-memory tiling ───────────────────────────────
+//
+// A tiled variant (each workgroup cooperatively mixing its shared input
+// span into workgroup memory once, instead of every thread re-reading
+// and re-mixing ~num_taps/D overlapping samples from global memory) was
+// implemented and measured at 213 ms/sweep vs 14.7 ms/sweep for THIS
+// kernel on an Apple-silicon GPU (1 M samples x 11 probes, D = 5) — a
+// 14x REGRESSION, despite passing the CPU-equivalence tests. On a UMA
+// TBDR GPU the "redundant" overlapping reads are served from cache
+// nearly free, while the tile path pays a workgroupBarrier plus long
+// sequential per-thread phasor walks before any useful work. Don't
+// re-attempt tiling here without profiling on the actual target GPU.
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let global_idx = global_id.x;

@@ -55,17 +55,72 @@
 
 use crate::ddc::{DEFAULT_FIR_TAPS, design_fir_taps};
 use num_complex::Complex;
-use wgpu::util::DeviceExt;
 
 /// GPU compute handle for the wideband sweep's batched DDC. Build once
 /// with [`Self::try_new`] and share via `Arc` across detector instances.
+///
+/// Concurrent [`Self::sweep`] calls serialise on the internal buffer
+/// pool's mutex — deliberate: per-batch buffer creation was the
+/// dominant host-side cost, and one in-flight sweep at a time matches
+/// how the detector fleet actually uses a shared GPU.
 pub struct GpuAnalog {
     device: wgpu::Device,
     queue: wgpu::Queue,
     decimate_pipeline: wgpu::ComputePipeline,
     decimate_bgl: wgpu::BindGroupLayout,
+    /// Grow-only persistent buffers reused across sweeps (uploads go
+    /// through `queue.write_buffer`); recreating six buffers per batch
+    /// cost more host time than the dispatch itself.
+    pool: std::sync::Mutex<BufferPool>,
     poll_thread: Option<std::thread::JoinHandle<()>>,
     poll_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct BufferPool {
+    taps: Option<(wgpu::Buffer, u64)>,
+    offsets: Option<(wgpu::Buffer, u64)>,
+    phase_table: Option<(wgpu::Buffer, u64)>,
+    input: Option<(wgpu::Buffer, u64)>,
+    output: Option<(wgpu::Buffer, u64)>,
+    staging: Option<(wgpu::Buffer, u64)>,
+    config: Option<wgpu::Buffer>,
+}
+
+/// A `BindingResource` covering exactly `size` bytes of `buf` from
+/// offset 0 — pooled buffers are bound by live region, never capacity.
+fn sized_binding(buf: &wgpu::Buffer, size: u64) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: buf,
+        offset: 0,
+        size: std::num::NonZeroU64::new(size),
+    })
+}
+
+/// Fetch `slot`'s buffer, recreating it when `size` outgrows the stored
+/// capacity. Grow-only, with 2× headroom on growth so a slowly growing
+/// workload doesn't recreate every batch.
+fn ensure_buffer(
+    device: &wgpu::Device,
+    slot: &mut Option<(wgpu::Buffer, u64)>,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    label: &str,
+) -> wgpu::Buffer {
+    match slot {
+        Some((buf, cap)) if *cap >= size => buf.clone(),
+        _ => {
+            let cap = size.next_power_of_two().max(256);
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: cap,
+                usage,
+                mapped_at_creation: false,
+            });
+            *slot = Some((buf.clone(), cap));
+            buf
+        }
+    }
 }
 
 /// Mirrors `MAX_TAPS` in `ddc_decimate.wgsl` — headroom above
@@ -130,6 +185,7 @@ impl GpuAnalog {
         device: &wgpu::Device,
         label: &str,
         source: &str,
+        entry_point: &str,
         bgl: &wgpu::BindGroupLayout,
     ) -> wgpu::ComputePipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -145,7 +201,7 @@ impl GpuAnalog {
             label: Some(label),
             layout: Some(&layout),
             module: &shader,
-            entry_point: Some("main"),
+            entry_point: Some(entry_point),
             compilation_options: Default::default(),
             cache: None,
         })
@@ -158,8 +214,9 @@ impl GpuAnalog {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
+            // wgpu 30 additions (e.g. `apply_limit_buckets`) keep their
+            // defaults — this handle only ever runs one compute pipeline.
+            ..Default::default()
         }))
         .ok()?;
 
@@ -198,6 +255,7 @@ impl GpuAnalog {
             &device,
             "decimate",
             include_str!("shaders/ddc_decimate.wgsl"),
+            "main",
             &decimate_bgl,
         );
 
@@ -206,6 +264,7 @@ impl GpuAnalog {
             queue,
             decimate_pipeline,
             decimate_bgl,
+            pool: std::sync::Mutex::new(BufferPool::default()),
             poll_thread: Some(poll_thread),
             poll_shutdown,
         })
@@ -269,60 +328,87 @@ impl GpuAnalog {
             n_probes: n_probes as u32,
         };
 
-        let offsets_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("offsets_hz"),
-                contents: bytemuck::cast_slice(&offsets_f32),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let taps_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("taps"),
-                contents: bytemuck::cast_slice(&taps),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let phase_table_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("phase_table"),
-                contents: bytemuck::cast_slice(&phase_table),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        // ── Pooled buffers: grow-only, reused across sweeps ─────────
+        // The lock is held through readback, deliberately serialising
+        // concurrent sweeps — see the struct doc.
+        let storage_up = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let mut pool = self.pool.lock().expect("GPU buffer pool poisoned");
+
+        let offsets_buf = ensure_buffer(
+            &self.device,
+            &mut pool.offsets,
+            (offsets_f32.len() * 4) as u64,
+            storage_up,
+            "offsets_hz",
+        );
+        self.queue
+            .write_buffer(&offsets_buf, 0, bytemuck::cast_slice(&offsets_f32));
+
+        let taps_buf = ensure_buffer(
+            &self.device,
+            &mut pool.taps,
+            (taps.len() * 4) as u64,
+            storage_up,
+            "taps",
+        );
+        self.queue
+            .write_buffer(&taps_buf, 0, bytemuck::cast_slice(&taps));
+
+        let phase_table_buf = ensure_buffer(
+            &self.device,
+            &mut pool.phase_table,
+            (phase_table.len() * 8) as u64,
+            storage_up,
+            "phase_table",
+        );
+        self.queue
+            .write_buffer(&phase_table_buf, 0, bytemuck::cast_slice(&phase_table));
+
         // `Complex<f32>` is Pod under num-complex's `bytemuck` feature
         // (two consecutive `f32`s, matching WGSL's `vec2<f32>` layout),
         // so this reinterpret needs no `unsafe`.
         let input_bytes: &[u8] = bytemuck::cast_slice(iq_data);
-        let input_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("input_iq"),
-                contents: input_bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        let input_buf = ensure_buffer(
+            &self.device,
+            &mut pool.input,
+            input_bytes.len() as u64,
+            storage_up,
+            "input_iq",
+        );
+        self.queue.write_buffer(&input_buf, 0, input_bytes);
 
-        let decimate_config_buf =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let decimate_config_buf = pool
+            .config
+            .get_or_insert_with(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("decimate_config"),
-                    contents: bytemuck::cast_slice(&[decimate_config]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+                    size: std::mem::size_of::<DecimateConfig>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .clone();
+        self.queue.write_buffer(
+            &decimate_config_buf,
+            0,
+            bytemuck::cast_slice(&[decimate_config]),
+        );
 
         let output_size = (n_probes as u64) * (out_len as u64) * 8;
-        let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output_iq"),
-            size: output_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output_staging"),
-            size: output_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let output_buf = ensure_buffer(
+            &self.device,
+            &mut pool.output,
+            output_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "output_iq",
+        );
+        let staging_buf = ensure_buffer(
+            &self.device,
+            &mut pool.staging,
+            output_size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "output_staging",
+        );
 
         let create_bg = |layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindingResource]| {
             let wgpu_entries: Vec<_> = entries
@@ -340,15 +426,20 @@ impl GpuAnalog {
             })
         };
 
+        // Bind exactly the live region of each pooled buffer, not the
+        // grown capacity: `as_entire_binding` on a capacity-rounded
+        // pool buffer both inflates what counts against
+        // `max_storage_buffer_binding_size` and hands the shader's
+        // runtime-sized arrays stale tail elements.
         let decimate_bg = create_bg(
             &self.decimate_bgl,
             &[
                 decimate_config_buf.as_entire_binding(),
-                taps_buf.as_entire_binding(),
-                offsets_buf.as_entire_binding(),
-                phase_table_buf.as_entire_binding(),
-                input_buf.as_entire_binding(),
-                output_buf.as_entire_binding(),
+                sized_binding(&taps_buf, (taps.len() * 4) as u64),
+                sized_binding(&offsets_buf, (offsets_f32.len() * 4) as u64),
+                sized_binding(&phase_table_buf, (phase_table.len() * 8) as u64),
+                sized_binding(&input_buf, input_bytes.len() as u64),
+                sized_binding(&output_buf, output_size),
             ],
         );
 
@@ -370,12 +461,19 @@ impl GpuAnalog {
 
         let _ = self.queue.submit(Some(encoder.finish()));
 
-        let slice = staging_buf.slice(..);
+        // Pooled staging buffer may be larger than this sweep's output —
+        // map exactly the live region.
+        let slice = staging_buf.slice(..output_size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
         rx.recv().unwrap().unwrap();
 
-        let data = slice.get_mapped_range();
+        // wgpu 30: get_mapped_range is fallible; a failed map is the
+        // same "drop this batch via panic + caller catch_unwind" case
+        // as a map_async error (see the fn doc).
+        let data = slice
+            .get_mapped_range()
+            .expect("GPU staging buffer map failed");
         let floats: &[f32] = bytemuck::cast_slice(&data);
         let mut results = Vec::with_capacity(n_probes);
         for p in 0..n_probes {

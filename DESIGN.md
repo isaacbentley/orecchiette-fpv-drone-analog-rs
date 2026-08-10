@@ -52,7 +52,7 @@ For wideband captures (e.g., 100 MSPS), the detector sweeps the entire capture b
 
 2. **DDC + Decimation**: At each probe position, a Digital Down-Converter (NCO mixer) shifts the probe frequency to DC, then a 63-tap Blackman-windowed-sinc FIR (> 50 dB stopband, cutoff `target_rate / 3`; see §6 item 1 for the boxcar it replaced) band-limits before integer-stride decimation to 10 MSPS. This isolates a slice around each probe center.
 
-3. **Energy Gating**: Mean power is computed at each probe position. The **25th percentile** of all probe energies is used as a robust noise floor estimate (resistant to FM signals covering large fractions of the bandwidth). Probes with energy exceeding the noise floor by `energy_threshold_db` (default 3.0 dB, linear multiplier: $10^{\text{energy\_threshold\_db} / 10.0}$) proceed to sync validation.
+3. **Energy Gating**: Mean power is computed at each probe position. The **25th percentile** of all probe energies is used as a robust noise floor estimate (resistant to FM signals covering large fractions of the bandwidth). Probes with energy exceeding the noise floor by `energy_threshold_db` (default 3.0 dB, linear multiplier: $10^{\text{energy\_threshold\_db} / 10.0}$) proceed to sync validation. In *integrated* mode (`detect_from_iq_integrated`, §11) the gate no longer skips classification — every probe is demodulated and accumulated, because a signal below one batch's energy floor is exactly the one integration exists to find.
 
 Additionally, all finalized detection events are filtered to only return results whose bandwidth falls within the `min_bandwidth` and `max_bandwidth` thresholds (defaults: 1 MHz and 30 MHz) and whose confidence clears `min_confidence` (default 0.7).
 
@@ -68,7 +68,9 @@ Additionally, all finalized detection events are filtered to only return results
 
    When resolution is sufficient to resolve both rates into distinct bins (bin_hz < 109 Hz, requiring > 9.2 ms of data), the detector classifies PAL vs NTSC directly from the spectrum. When the bins collide (e.g. a 2.6 ms chunk at 25 MSPS gives ≈ 381 Hz/bin), the detector falls back to a **time-domain median sync-tip interval** measured on the FM-demodulated record (`classify_pal_ntsc_time_domain`): the median line period maps to a line rate that's compared against PAL (15625 Hz) and NTSC (15734 Hz), with a ±30 Hz dead-band around the midpoint. Only if that fallback is also inconclusive (too few sync tips, or the median lands in the dead-band) does the burst get tagged `AnalogVideoUnknown` rather than committing to a standard. Callers gate on `SignalType::is_analog_video()` when they want the "is this an analog FPV signal at all?" answer without committing to a PAL/NTSC label.
 
-6. **Harmonic-Consistency Check**: H-sync is a ~7 % duty-cycle rectangular pulse train; its FM-demodulated spectrum has the fundamental at the line rate plus a rich harmonic series (sinc-envelope coefficients keep the first ~14 harmonics within roughly −3 dB of the fundamental). A CW interferer or narrowband-FM tone that happens to land in the line-rate bin produces a fundamental ONLY. The detector counts how many of the first 5 harmonics exceed 10 % of the fundamental amplitude — at least 2 are required for a positive classification. Threshold is fundamental-relative (not noise-floor-relative) because spectral leakage from the strong fundamental otherwise drags the noise floor estimate down enough that any FFT-window sidelobe at 2× the fundamental crosses a noise-floor-relative threshold.
+6. **Harmonic-Consistency Check**: H-sync is a ~7 % duty-cycle rectangular pulse train; its FM-demodulated spectrum has the fundamental at the line rate plus a rich harmonic series (sinc-envelope coefficients keep the first ~14 harmonics within roughly −3 dB of the fundamental). A CW interferer or narrowband-FM tone that happens to land in the line-rate bin produces a fundamental ONLY. The detector counts how many of the first 5 harmonics exceed 10 % of the fundamental amplitude — at least 2 are required for a positive classification. Threshold is fundamental-relative (not noise-floor-relative) because spectral leakage from the strong fundamental otherwise drags the noise floor estimate down enough that any FFT-window sidelobe at 2× the fundamental crosses a noise-floor-relative threshold. The absolute floor these checks reference is the **median** of the in-band magnitude bins, not the mean — the range includes the signal's own spectrum, and a mean let a real signal raise its own detection floor, costing sensitivity exactly on weak signals.
+
+6a. **Time-domain thresholds**: `classify_pal_ntsc_time_domain` (and `video::detect_video_standard`) threshold sync tips at `p2 + 0.25·(p50 − p2)` of a ~0.5 µs-smoothed record — the same robust construction `levels::estimate_fm_deviation` uses. The `global_min · 0.3` threshold they previously used latched onto single FM-click outliers (which are bounded at ±π but far deeper than a weak signal's sync tips), putting the threshold beneath every real tip at exactly the low CNR these classifiers exist for; percentiles are also DC-invariant, so a tuning-offset demod no longer breaks classification.
 
 7. **Cepstrum Structural Verification (`verify_cepstrum`)**: After the harmonic gate passes, the detector runs a cepstral analysis on the FFT buffer to confirm the harmonics arise from a true periodic pulse train rather than a coincidental arrangement of narrowband interferers. The cepstrum — computed as `IFFT(ln|FFT[k]|²)` — collapses a harmonic comb into a single sharp peak at the quefrency corresponding to the pulse period (`sample_rate / line_rate_hz`). The detector:
    - Computes the power spectrum `|FFT[k]|²` (branchless multiply loop, SIMD-friendly).
@@ -290,7 +292,28 @@ consumed. A stateful filter living inside the reconstructor would
 re-filter already-filtered samples on every call. `demod::Deemphasis`
 is instead applied exactly once, stream-side, immediately after
 `demod::fm_demod` and before samples ever enter that persistent
-buffer.
+buffer — which is exactly where fpv-viewer-rs now applies it (on by
+default via `--deemphasis-tau`, 0 to disable).
+
+**Line-level conditioning added with the weak-signal work:**
+
+- **Smoothed AGC**: the per-line sync-tip/porch measurements drive an
+  EMA'd gain/offset state (α = 0.2, ~5-line time constant, gain
+  clamped to 0.25–4×) instead of being applied instantaneously — one
+  click in a 25-sample porch window used to swing an entire line's
+  brightness. Lines with no valid swing reuse the last good state;
+  inverted signals still never update it, so a wiring fault stays
+  visible.
+- **Pre-TBC anti-alias**: when the TBC resample is decimating (high
+  capture rates), a boxcar the width of the decimation ratio runs
+  ahead of the Catmull-Rom point-sampling (group delay compensated),
+  stopping demod content above the output Nyquist (~6.75 MHz) from
+  folding into the picture.
+- **Burst-gated subcarrier notch**: a Goertzel at f_sc over the
+  back-porch window (majority vote across up to 32 rows, 3 fields of
+  hysteresis) disables the dot-crawl notch on burst-free sources —
+  many FPV cameras are effectively monochrome, and for those the
+  notch deleted real luma detail around 3.58/4.43 MHz for nothing.
 
 ## 10. Optional GPU Acceleration (`gpu` feature)
 
@@ -332,11 +355,59 @@ total_iq_len * num_taps`). The GPU kernel then only ever walks that
 anchor backward by up to `num_taps` (63) small, bounded steps to reach
 any tap in its window.
 
+**Buffer management.** The six per-sweep GPU buffers live in a
+grow-only pool inside `GpuAnalog` (uploads via `queue.write_buffer`,
+bind groups sized to the live region rather than pooled capacity);
+recreating them per batch cost more host time than the dispatch. The
+pool mutex serialises concurrent sweeps deliberately. Full-output
+readback is retained on purpose: on unified-memory GPUs a gated
+readback (energy reduction on-GPU, then copying only passing probes)
+costs an extra submit/poll round-trip to save ~3 MB of UMA copy — a
+wash or worse; revisit only for discrete-GPU/PCIe targets.
+
+**A measured dead end.** A workgroup-memory tiled kernel (mixing each
+input span once per workgroup instead of ~num_taps/D redundant
+per-thread reads) was implemented, passed all equivalence tests, and
+measured **14× slower** than the naive kernel on an Apple-silicon GPU
+(213 ms vs 14.7 ms per 1 M-sample × 11-probe sweep) — cache serves the
+overlapping reads nearly free, while the tile path pays a barrier plus
+long sequential phasor walks. It was removed; see the shader's note
+before re-attempting.
+
 **Testing.** `detector::tests::gpu_ddc_matches_cpu_ddc_and_decimate`
 checks the GPU kernel directly against `ddc_and_decimate` (RMS tolerance
-1%, well above the < 0.1% actually observed). `tests/gpu_equivalence.rs`
+1%, well above the < 0.1% actually observed), running two consecutive
+sweeps so the pooled-buffer path is covered;
+`gpu_sweep_matches_cpu_at_large_decimation` re-checks at a different
+output geometry. `tests/gpu_equivalence.rs`
 checks `AnalogFpvDetector::with_gpu` against `::default()` end-to-end on
 single- and two-signal wideband captures. All skip gracefully with no
 adapter — and CI's lavapipe backend is a different code path from
 Metal, so these are only fully conclusive when run locally on real
 hardware.
+
+## 11. Cross-Batch Spectral Integration
+
+A single ~68 ms batch bounds single-shot sensitivity. `SpectralIntegrator`
+holds, per absolute-frequency bucket (1 MHz rounding, 256-bucket LRU cap),
+a running average of the FM-demod **magnitude** spectrum: a real signal's
+sync comb lands in the same bins batch after batch while noise magnitudes
+average toward their mean, so comb-to-floor contrast improves ~√N.
+Magnitudes — not complex bins — because batches share no phase reference;
+this is classic noncoherent (post-detection) integration.
+
+- `detect_sync_pulses_integrated` / `detect_from_iq_integrated` accept an
+  integrator; classification thresholds, harmonic checks, and the
+  cepstrum gate all run against the averaged spectrum, while time-domain
+  PAL/NTSC disambiguation and the VBI confirm stage still use the current
+  batch's waveform.
+- Averaging is a cumulative mean up to the configured window (default 4
+  batches ≈ +5 dB measured), then an EWMA with α = 1/window so stale
+  signals fade.
+- The calibrated regression test
+  (`integration_detects_where_single_batches_cannot`) pins the win: at a
+  noise level where four independent single batches all fail, four
+  integrated batches classify at full 0.8 confidence.
+- fpv-viewer-rs feeds one integrator per scan session (persisting across
+  sweeps and rescans) and gives single-channel standard detection up to 4
+  chunks of patience before settling for an ambiguous answer.
