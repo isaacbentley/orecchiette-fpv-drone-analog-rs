@@ -28,14 +28,14 @@ A high-performance Rust crate for detecting analog FPV drone video signals using
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = "0.1.0"
+orecchiette-fpv-drone-analog-rs = "0.2.0"
 num-complex = "0.4"
 ```
 
 To enable the optional GPU-accelerated wideband sweep:
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = { version = "0.1.0", features = ["gpu"] }
+orecchiette-fpv-drone-analog-rs = { version = "0.2.0", features = ["gpu"] }
 ```
 ```rust
 use orecchiette_fpv_drone_analog_rs::detector::AnalogFpvDetector;
@@ -54,8 +54,8 @@ if let Some(gpu) = GpuAnalog::try_new() {
 
 ## Usage
 
-### Narrowband Detection (< 3 MSPS)
-For isolated baseband signals where the FM carrier is already centered:
+### Single-Slice Baseband Detection (≤ 10 MSPS)
+For isolated baseband signals where the FM carrier is already centered (the sliding-DDC sweep needs > 10 MHz of capture to form a probe grid; below that the whole capture is classified as one slice):
 
 ```rust
 use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
@@ -72,8 +72,8 @@ for res in &results {
 }
 ```
 
-### Wideband Detection (≥ 3 MSPS)
-For wideband captures containing multiple signals at arbitrary frequencies:
+### Wideband Detection (> 10 MSPS)
+For wideband captures containing multiple signals at arbitrary frequencies (captures between ~10 and ~25 MSPS — fewer than 4 probe positions — are still classified as a single slice at the tuned centre):
 
 ```rust
 use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
@@ -121,7 +121,7 @@ With `--features gpu`, `cargo test --features gpu` additionally runs `detector::
 
 ### End-to-end decode check
 
-For a visual sanity check, use the [fpv-viewer-rs](https://github.com/isaacbentley/fpv-viewer-rs) binary with `--debug`, which renders the full DDC → FM-demod → reconstruction pipeline live and dumps the first three frames to `/tmp/fpv_frame_*.png` before auto-exiting. See the `fpv-viewer-rs` README for the full flag set.
+For a visual sanity check, use the [fpv-viewer-rs](https://github.com/isaacbentley/fpv-viewer-rs) binary with `--debug`, which renders the full DDC → FM-demod → reconstruction pipeline live, dumps startup frames 1–3 and steady-state frames 30–32 as `fpv_frame_<freq>MHz_<n>.png` in the working directory, and keeps running until quit. See the `fpv-viewer-rs` README for the full flag set.
 
 See [DESIGN.md](./DESIGN.md) for the full architecture and math.
 

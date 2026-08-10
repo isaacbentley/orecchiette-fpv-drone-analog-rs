@@ -8,12 +8,12 @@
 //!
 //! This module provides [`StreamingDDC`], a mixer + Blackman-windowed-
 //! sinc FIR low-pass (default 63 taps, > 50 dB stopband). It is used
-//! both by the live `fpv_viewer` binary on its channel-decode hot path
-//! and — since v0.4.29 — by the detector's sliding-DDC sweep via the
-//! private `ddc_and_decimate` helper in `detector.rs` (which
-//! constructs a `StreamingDDC` per probe and calls
-//! `process_decimated`). The earlier length-N boxcar (`sum/N`) it
-//! replaced had a sinc magnitude response with poor stopband
+//! both by the live fpv-viewer binary on its channel-decode hot path
+//! and by the detector's sliding-DDC sweep via the private
+//! `ddc_and_decimate` helper in `detector.rs` (which constructs a
+//! `StreamingDDC` per probe and calls `process_decimated`). The
+//! earlier length-N boxcar (`sum/N`) the sweep used had a sinc
+//! magnitude response with poor stopband
 //! attenuation — adjacent-band energy leaked back into the
 //! discriminator passband, costing CNR margin in the FM
 //! threshold-effect region and synthesising spurious harmonic content

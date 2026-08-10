@@ -14,17 +14,17 @@ graph TD
     A[RF Source] --> B[Scanner]
     B --> C[AnalogFpvDetector]
     
-    subgraph "Narrowband Fast Path (< 3 MHz)"
-        C -->|"SR < min_bw"| D1[FM Demod]
+    subgraph "Single-Slice Baseband Path (≤ 10 MHz)"
+        C -->|"SR ≤ 10 MHz"| D1[FM Demod]
         D1 --> D2[Windowed FFT]
         D2 --> D3[H-Sync Rate Detection]
         D3 --> D4{Harmonic Gate}
         D4 -->|"≥2 harmonics"| D5[Cepstrum Verification]
-        D5 -->|"peak/median > 5×"| D6[Classify PAL/NTSC]
+        D5 -->|"peak/median ≥ 7×"| D6[Classify PAL/NTSC]
     end
     
     subgraph "Wideband Sliding DDC Probe"
-        C -->|"SR >= min_bw"| E1[Sweep BW in 5 MHz Steps]
+        C -->|"SR > 10 MHz"| E1[Sweep BW in 5 MHz Steps]
         E1 --> E2[DDC + Decimate to 10 MSPS]
         E2 --> E3[Energy Measurement]
         E3 -->|"> noise floor"| E4[FM Demod]
@@ -32,7 +32,7 @@ graph TD
         E5 --> E6[H-Sync Rate Detection]
         E6 --> E7{Harmonic Gate}
         E7 -->|"≥2 harmonics"| E8[Cepstrum Verification]
-        E8 -->|"peak/median > 5×"| E9[Classify PAL/NTSC]
+        E8 -->|"peak/median ≥ 7×"| E9[Classify PAL/NTSC]
     end
     
     E9 --> F[Cluster within 25 MHz]
@@ -42,19 +42,19 @@ graph TD
 
 ## 3. Detection Logic
 
-### Narrowband Fast Path
-When `sample_rate < min_bandwidth` (default 3 MHz), the signal is assumed to already be isolated at baseband. The detector runs FM demodulation and sync pulse detection directly.
+### Single-Slice Baseband Path
+When `sample_rate <= WIDEBAND_TARGET_RATE_HZ` (10 MHz), the signal is assumed to already be isolated at baseband and the detector runs FM demodulation and sync pulse detection directly — the sweep's 5 MHz step + 5 MHz edge margin can't form a meaningful probe grid below that rate. Captures between ~10 and ~25 MSPS (fewer than 4 probe positions, too few for the percentile noise floor) are likewise classified as one baseband slice at the tuned centre; a video signal is ~20 MHz wide and spans the whole capture at those rates anyway.
 
 ### Wideband Sliding DDC Probe
 For wideband captures (e.g., 100 MSPS), the detector sweeps the entire capture bandwidth:
 
 1. **Probe Grid**: The bandwidth is divided into 5 MHz steps with a 5 MHz margin at each edge. For 100 MSPS, this yields ~18 probe positions.
 
-2. **DDC + Decimation**: At each probe position, a Digital Down-Converter (NCO mixer) shifts the probe frequency to DC, then a boxcar low-pass filter decimates to 10 MSPS. This isolates a ~10 MHz slice around each probe center.
+2. **DDC + Decimation**: At each probe position, a Digital Down-Converter (NCO mixer) shifts the probe frequency to DC, then a 63-tap Blackman-windowed-sinc FIR (> 50 dB stopband, cutoff `target_rate / 3`; see §6 item 1 for the boxcar it replaced) band-limits before integer-stride decimation to 10 MSPS. This isolates a slice around each probe center.
 
 3. **Energy Gating**: Mean power is computed at each probe position. The **25th percentile** of all probe energies is used as a robust noise floor estimate (resistant to FM signals covering large fractions of the bandwidth). Probes with energy exceeding the noise floor by `energy_threshold_db` (default 3.0 dB, linear multiplier: $10^{\text{energy\_threshold\_db} / 10.0}$) proceed to sync validation.
 
-Additionally, all finalized detection events are filtered to only return results whose bandwidth falls within the `min_bandwidth` and `max_bandwidth` thresholds.
+Additionally, all finalized detection events are filtered to only return results whose bandwidth falls within the `min_bandwidth` and `max_bandwidth` thresholds (defaults: 1 MHz and 30 MHz) and whose confidence clears `min_confidence` (default 0.7).
 
 4. **FM Demodulation**: The isolated I/Q is FM-demodulated via the differentiate-and-multiply discriminator: `arg(z[n] × conj(z[n-1]))`. This recovers the baseband video signal where sync pulses are encoded as instantaneous frequency excursions.
 
@@ -75,9 +75,9 @@ Additionally, all finalized detection events are filtered to only return results
    - Takes the log: `ln(power + ε)` where `ε = 1e-12` prevents log(0).
    - Applies IFFT via `rustfft` (platform SIMD).
    - Searches ±2% around the expected quefrency for the peak.
-   - Computes peak/median ratio — a threshold of ≥ 5× is required.
+   - Computes peak/median ratio — a threshold of ≥ 7× (`CEPSTRAL_RATIO_THRESHOLD`) is required.
    
-   A real pulse train produces a peak/median ratio of 20–100×; multi-CW tones with non-harmonic spacing or broadband noise produce ratios < 3×. This gate closes the false-positive gap the harmonic check alone cannot cover: interferers whose tones happen to land in harmonic bins of the line rate.
+   A real pulse train produces a peak/median ratio of roughly 5–20×; multi-CW tones with non-harmonic spacing or broadband noise produce ratios < 3×. The threshold sits *inside* the real-signal range rather than at its bottom: the ~5× region is also where a strong, spectrally broad, genuinely periodic non-video interferer (cellular OFDM symbol/frame timing is the classic case) can land, so a little sensitivity on very weak signals is traded for rejecting that class of false positive. This gate closes the gap the harmonic check alone cannot cover: interferers whose tones happen to land in harmonic bins of the line rate.
 
 8. **Clustering**: All positive detections are sorted by frequency and clustered within a 25 MHz radius. This radius matches the spectral footprint of an analog FPV transmission — while the baseband composite video is ~5 MHz wide, the wideband FM modulation (typically ±15–17 MHz deviation) produces a total occupied RF bandwidth of ~20–30 MHz. The probe with the strongest energy in each cluster is kept as the representative, collapsing adjacent-channel bleed-over into a single detection.
 
@@ -105,9 +105,9 @@ The harmonic-comb + cepstrum checks (items 6–7 above) only ever see one FFT's 
 
 - **Sample Rate**: Minimum 1 MSPS for sync pulse detection at baseband. ≥ 20 MSPS recommended for wideband scanning. The B210 over USB 3.0 runs clean at 25 MSPS; at 50 MSPS the USB transport saturates (~400 MB/s), producing intermittent hardware FIFO overflows. 25 MSPS is the recommended maximum for the B210.
 - **Packet Size**: 262,144 samples per packet (at 100 MSPS = 2.6 ms). Larger packets improve PAL/NTSC discrimination.
-- **Bands**: 1.2 GHz, 3.3 GHz, 5.3–5.9 GHz, and 6–7 GHz support is built-in via `bands.rs` channel tables (used for display/labeling, not detection).
+- **Bands**: `bands.rs` carries channel tables (used for display/labeling and `--channel` resolution, not detection) for 1.2 GHz, 3.3 GHz, and the 5.3–5.9 GHz bands — A/B/E/F/R plus Lowband L (5333 + 40 MHz grid) and Boscam D (5362 + 37 MHz grid). The 6–7 GHz evasion band is scanned by the viewer's UA sweep but has no channel table (detections there report raw frequency).
 - **Scan Dwell**: 10 ms per hop in the auto-scanner — sized for USRP PLL settle (~2 ms) + one full 65536-sample chunk (~2.6 ms at 25 MSPS). The detector only needs a single chunk per hop. All remaining duplicate-frequency packets are skipped to prevent queue buildup.
-- **Scan Modes** (via `fpv_viewer --scan-mode`):
+- **Scan Modes** (via `fpv-viewer --scan-mode`):
   - `58` (default): 5.8 GHz FPV band only (5.645–5.945 GHz). ~16 hops at 25 MSPS, ~160 ms per sweep.
   - `ua` (Ukraine): covers 1.2 GHz (1080–1360 MHz), 3.3 GHz (2870–4080 MHz), 5.3–5.9 GHz (5300–5945 MHz), and 6–7 GHz (6100–7300 MHz). ~100+ hops, ~1–2 s per sweep. Modelled after the Chuyka 3.0 detector and PEAK THOR T67 VTX evasion band used in the Ukraine theatre (2024–2025).
 
@@ -337,6 +337,6 @@ checks the GPU kernel directly against `ddc_and_decimate` (RMS tolerance
 1%, well above the < 0.1% actually observed). `tests/gpu_equivalence.rs`
 checks `AnalogFpvDetector::with_gpu` against `::default()` end-to-end on
 single- and two-signal wideband captures. All skip gracefully with no
-adapter — and, as with the DJI crate's own GPU front-end, CI's lavapipe
-backend is a different code path from Metal, so these are only fully
-conclusive when run locally on real hardware.
+adapter — and CI's lavapipe backend is a different code path from
+Metal, so these are only fully conclusive when run locally on real
+hardware.

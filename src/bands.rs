@@ -1,15 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+/// `#[non_exhaustive]` for the same reason as [`crate::types::SignalType`]:
+/// band plans keep growing (BandD was added after 0.1.8), and downstream
+/// exhaustive matches shouldn't break every time one lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum FpvBand {
     BandA,
     BandB,
     BandE,
     Fatshark, // Often Band F
     Raceband, // Band R
-    Lowband,  // Band L (5.3 - 5.6 GHz)
+    Lowband,  // Band L (5333-5613 MHz, 40 MHz grid)
+    BandD,    // Boscam D / "5.3G" (5362-5621 MHz, 37 MHz grid)
     Band1200, // 1.2GHz - 1.3GHz
-    Band3300, // 3.3GHz - 4.8GHz
+    Band3300, // 3.3GHz - 4.875GHz
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,14 +79,33 @@ pub const BAND_E_FREQS: [u64; 8] = [
     5_945_000_000,
 ];
 
-// Standard 48-channel VTX "Lowband" / "L" (Boscam/Aomway L band),
-// 37 MHz spacing from 5362 MHz. This matches the table the
-// `fpv_viewer` uses for channel naming and coarse-search snapping
-// (`FPV_CHANNELS_MHZ` + `get_fpv_channel_name`), so resolving
-// `--channel L1` here and labelling a detection there agree. An
-// earlier 40 MHz-spaced 5333 MHz grid lived here and silently
-// disagreed with the viewer (a tuned `L1` rendered as "Unknown").
+// Standard 48/56-channel VTX "Lowband" / "L" grid: 40 MHz spacing
+// from 5333 MHz — the table real L-band hardware (Boscam/Aomway,
+// Eachine, TBS 56CH units) transmits on.
+//
+// History: this array briefly held the 37 MHz-spaced 5362 grid to
+// match the viewer's channel table, but that grid is the *Boscam D
+// band* ([`BAND_D_FREQS`] below), not L — the reconciliation went in
+// the wrong direction and made `--channel L1` tune 5362 MHz while a
+// VTX set to L1 transmits at 5333 MHz, 29 MHz off. Both grids are now
+// modelled, under their correct names, here and in fpv-viewer-rs's
+// `FPV_CHANNELS_MHZ` / `get_fpv_channel_name` — keep the two repos'
+// tables in lockstep when editing either.
 pub const LOWBAND_FREQS: [u64; 8] = [
+    5_333_000_000,
+    5_373_000_000,
+    5_413_000_000,
+    5_453_000_000,
+    5_493_000_000,
+    5_533_000_000,
+    5_573_000_000,
+    5_613_000_000,
+];
+
+/// Boscam D band ("5.3G"): 37 MHz spacing from 5362 MHz, as found on
+/// Eachine Pro58-class receivers and many multi-band VTXs' "D/5.3"
+/// setting. Distinct from [`LOWBAND_FREQS`] — see the note there.
+pub const BAND_D_FREQS: [u64; 8] = [
     5_362_000_000,
     5_399_000_000,
     5_436_000_000,
@@ -103,7 +127,7 @@ pub const BAND_1200_FREQS: [u64; 8] = [
     1_300_000_000,
 ];
 
-/// 3.3 GHz to 4.8 GHz Band (64 Channels)
+/// 3.3 GHz band: 64 channels at 25 MHz spacing, 3300–4875 MHz.
 pub fn get_3300_freqs() -> Vec<u64> {
     let mut freqs = Vec::new();
     for i in 0..64 {
@@ -157,6 +181,13 @@ pub fn get_all_channels() -> Vec<FpvChannel> {
             frequency_hz: f,
         });
     }
+    for (i, &f) in BAND_D_FREQS.iter().enumerate() {
+        channels.push(FpvChannel {
+            band: FpvBand::BandD,
+            channel: (i + 1) as u8,
+            frequency_hz: f,
+        });
+    }
     for (i, &f) in BAND_1200_FREQS.iter().enumerate() {
         channels.push(FpvChannel {
             band: FpvBand::Band1200,
@@ -180,11 +211,12 @@ pub fn get_all_channels() -> Vec<FpvChannel> {
 /// Resolve a channel name (case-insensitive) to its centre frequency in Hz.
 ///
 /// Accepted formats: `A1`–`A8`, `B1`–`B8`, `E1`–`E8`, `F1`–`F8`,
-/// `R1`–`R8`, `L1`–`L8`. Returns `None` for unrecognised names.
+/// `R1`–`R8`, `L1`–`L8`, `D1`–`D8`. Returns `None` for unrecognised
+/// names.
 ///
 /// This is the inverse of the `get_fpv_channel_name` lookup in
-/// `fpv_viewer.rs` — but lives in the library crate so both the
-/// viewer and the main orchestrator can use it.
+/// fpv-viewer-rs's `src/main.rs` — but lives in the library crate so
+/// both the viewer and the main orchestrator can use it.
 pub fn lookup_channel_by_name(name: &str) -> Option<u64> {
     let name = name.trim().to_uppercase();
     let mut chars = name.chars();
@@ -206,6 +238,7 @@ pub fn lookup_channel_by_name(name: &str) -> Option<u64> {
         b'F' => FATSHARK_FREQS.get(idx).copied(),
         b'R' => RACEBAND_FREQS.get(idx).copied(),
         b'L' => LOWBAND_FREQS.get(idx).copied(),
+        b'D' => BAND_D_FREQS.get(idx).copied(),
         _ => None,
     }
 }
@@ -225,7 +258,10 @@ mod tests {
         assert_eq!(lookup_channel_by_name("F8"), Some(5_880_000_000));
         assert_eq!(lookup_channel_by_name("B4"), Some(5_790_000_000));
         assert_eq!(lookup_channel_by_name("E1"), Some(5_705_000_000));
-        assert_eq!(lookup_channel_by_name("L1"), Some(5_362_000_000));
+        assert_eq!(lookup_channel_by_name("L1"), Some(5_333_000_000));
+        assert_eq!(lookup_channel_by_name("L8"), Some(5_613_000_000));
+        assert_eq!(lookup_channel_by_name("D1"), Some(5_362_000_000));
+        assert_eq!(lookup_channel_by_name("D8"), Some(5_621_000_000));
     }
 
     #[test]

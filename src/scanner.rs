@@ -3,7 +3,16 @@ use crate::detector::FpvDetector;
 use crate::types::DetectionResult;
 use num_complex::Complex;
 
-#[allow(dead_code)]
+/// Channel-table-driven scanner: tune to each channel in turn and run
+/// the detector on one capture per channel.
+///
+/// Note that the 5.8 GHz band plans overlap heavily (A/B/E/F/R share
+/// the 5645–5945 MHz range, and L/D interleave below it), so one
+/// physical transmitter typically produces detections on several
+/// adjacent channel entries; results are tagged per-channel and NOT
+/// deduplicated across channels — callers wanting one hit per emitter
+/// should merge results within ~one video bandwidth (25 MHz) of each
+/// other, keeping the strongest.
 pub struct FpvScanner<D: FpvDetector> {
     detector: D,
     channels: Vec<FpvChannel>,
