@@ -41,10 +41,11 @@ struct Config {
 @group(0) @binding(5) var<storage, read_write> output_iq: array<vec2<f32>>;
 
 const TWO_PI: f32 = 6.283185307179586;
-// Upper bound on `num_taps` for the fixed-size unroll below. The crate's
-// wideband sweep always uses `StreamingDDC::new` (DEFAULT_FIR_TAPS = 63);
-// this headroom is a guard, not a tuned value — the host asserts
-// `num_taps <= MAX_TAPS` before dispatch.
+// Upper bound on the tap loop's trip count. The crate's wideband sweep
+// always uses `StreamingDDC::new`'s DEFAULT_FIR_TAPS (63); this headroom
+// is a guard, not a tuned value — the host clamps its `num_taps` to the
+// mirrored `SHADER_MAX_TAPS` before dispatch, and the `min` below bounds
+// the loop even if the two ever disagree.
 const MAX_TAPS: u32 = 96u;
 
 @compute @workgroup_size(64)
