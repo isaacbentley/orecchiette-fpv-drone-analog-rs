@@ -222,11 +222,11 @@ impl GpuAnalog {
     /// keeps this accurate across the whole buffer, not just near the
     /// start).
     ///
-    /// Panics on a GPU buffer-map failure, matching
-    /// `fpv_drone_dji::gpu_front_end::GpuFrontEnd`'s convention: the
-    /// caller (orecchiette's per-batch worker loop) already runs under
-    /// `catch_unwind`, so a GPU hiccup drops one batch rather than
-    /// crashing the process.
+    /// Panics on a GPU buffer-map failure. Callers that must survive a
+    /// GPU hiccup (e.g. a long-running batch worker) should wrap the
+    /// call in `catch_unwind` so a failed map drops one batch rather
+    /// than crashing the process — this crate's `detect_from_iq` does
+    /// not do that itself.
     pub fn sweep(
         &self,
         iq_data: &[Complex<f32>],
@@ -290,13 +290,10 @@ impl GpuAnalog {
                 contents: bytemuck::cast_slice(&phase_table),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        // SAFETY: `num_complex::Complex<f32>` is `#[repr(C)]` with two
-        // consecutive `f32` fields, so reinterpreting a `&[Complex<f32>]`
-        // as raw bytes matching WGSL's `vec2<f32>` layout is sound — the
-        // same pattern `fpv_drone_dji::gpu_front_end` already uses for
-        // its own `Complex32` IQ uploads.
-        let input_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(iq_data.as_ptr() as *const u8, n * 8) };
+        // `Complex<f32>` is Pod under num-complex's `bytemuck` feature
+        // (two consecutive `f32`s, matching WGSL's `vec2<f32>` layout),
+        // so this reinterpret needs no `unsafe`.
+        let input_bytes: &[u8] = bytemuck::cast_slice(iq_data);
         let input_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
