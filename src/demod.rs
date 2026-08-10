@@ -44,7 +44,7 @@ pub fn fm_demod(iq_data: &[Complex<f32>]) -> Vec<f32> {
 /// SIMD intrinsics. Kept around so external callers don't break;
 /// new code should call [`fm_demod`] directly.
 #[deprecated(
-    since = "0.4.28",
+    since = "0.1.0",
     note = "renamed to `fm_demod` — the `_simd` suffix was misleading; see fn docs"
 )]
 pub fn fm_demod_simd(iq_data: &[Complex<f32>]) -> Vec<f32> {

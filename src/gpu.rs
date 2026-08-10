@@ -153,8 +153,7 @@ impl GpuAnalog {
 
     /// Attempt to acquire a GPU adapter and build the sweep pipeline.
     /// Returns `None` on any failure (no adapter, driver rejects the
-    /// device request, ...) — callers should fall back to the CPU sweep,
-    /// exactly like `fpv_drone_dji::gpu_front_end::GpuFrontEnd::try_new`.
+    /// device request, ...) — callers should fall back to the CPU sweep.
     pub fn try_new() -> Option<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

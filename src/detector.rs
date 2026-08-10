@@ -826,11 +826,22 @@ impl FpvDetector for AnalogFpvDetector {
         if sample_rate <= WIDEBAND_TARGET_RATE_HZ {
             let (sig_type, conf) = self.detect_sync_pulses(iq_data, sample_rate);
             if sig_type != SignalType::Unknown {
+                // Measured mean power like every other path — this used
+                // to be a hardcoded -50.0, which fed a constant into the
+                // dedup RSSI tiebreak and the scanner's reported levels.
+                // The epsilon guards log10(0); unreachable in practice
+                // (the classifier's variance gate rejects silence before
+                // this) but harmless insurance against a -inf.
+                let energy: f32 = iq_data
+                    .iter()
+                    .map(|s| s.re * s.re + s.im * s.im)
+                    .sum::<f32>()
+                    / iq_data.len() as f32;
                 final_results.push(DetectionResult {
                     channel: None,
                     frequency_hz: center_freq,
                     confidence: conf,
-                    rssi_dbm: -50.0,
+                    rssi_dbm: 10.0 * (energy + 1e-12).log10(),
                     bandwidth_hz: sample_rate,
                     signal_type: sig_type,
                 });

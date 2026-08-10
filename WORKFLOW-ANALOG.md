@@ -4,15 +4,15 @@ This document provides a step-by-step technical walkthrough of how Orecchiette d
 
 ---
 
-## Phase 1: Hardware Capture & Scanning (`../../deps/sdr-*-rs` + `../../src/main.rs`)
+## Phase 1: Hardware Capture & Scanning (`orecchiette-sdr-*-rs` crates + fpv-viewer-rs)
 
-Phase 1 handles the wideband IQ capture. The hardware-specific code lives in dedicated `SdrSource` implementation crates (`sdr-usrp-rs`, `sdr-aaronia-rs`, `sdr-file-rs`); the orchestrator (`src/main.rs`) selects a backend at runtime and consumes the same `IqPacket` stream regardless of which one is feeding it.
+Phase 1 handles the wideband IQ capture. The hardware-specific code lives in dedicated `SdrSource` implementation crates (`orecchiette-sdr-usrp-rs`, `orecchiette-sdr-hackrf-rs`, `sdr-aaronia-rs`, `orecchiette-sdr-file-rs`); the consumer — fpv-viewer-rs's `src/main.rs` — selects a backend at runtime and consumes the same `IqPacket` stream regardless of which one is feeding it.
 
 1.  **Multi-Band Orchestration & Auto-Scanning**:
-    - **Frequency Pool**: The system can scan a consolidated list of 100+ channels, including Band A, B, E (Boscam), F (FatShark), R (RaceBand), L (LowBand), and the 1.2GHz/3.3GHz ranges.
-    - **Tuning**: USRP (`sdr-usrp-rs`) or Aaronia (`sdr-aaronia-rs`) hardware is tuned to each center frequency. For wideband 5.8 GHz captures, **100 MSPS** is used to cover the entire band in a single capture.
+    - **Frequency Pool**: The system can scan a consolidated list of 100+ channels, including Band A, B, E (Boscam), F (FatShark), R (RaceBand), L (LowBand), D (Boscam D / "5.3G"), and the 1.2GHz/3.3GHz ranges.
+    - **Tuning**: USRP (`orecchiette-sdr-usrp-rs`), HackRF (`orecchiette-sdr-hackrf-rs`), or Aaronia (`sdr-aaronia-rs`) hardware is tuned to each center frequency. Typical capture rates are 25 MSPS (USRP B2xx), 20 MSPS (HackRF, USB 2.0 ceiling), and a 61.44 MHz span (Aaronia); the 300 MHz-wide 5.8 GHz band is covered by frequency hopping, not one capture. The detector itself is rate-agnostic and handles captures up to 100 MSPS+.
     - **Auto-Scanner & Fine-Tuning**: For SDRs with smaller bandwidths (e.g. 25 MSPS), a state machine continuously sweeps the bands. Once a signal is found, it automatically stops scanning and transitions to a fine-tuning mode to snap precisely to the center channel. If the signal is lost for more than 2 seconds, the scanner automatically resumes sweeping.
-    - **Scan Modes**: The `fpv_viewer` supports two scan modes:
+    - **Scan Modes**: The fpv-viewer supports two scan modes:
       - `--scan-mode 58` (default): standard 5.8 GHz FPV band (5.645–5.945 GHz).
       - `--scan-mode ua`: Ukraine theatre — scans all confirmed analog video TX bands (1.2 GHz, 3.3 GHz, 5.3–5.9 GHz, 6–7 GHz) modelled after the Chuyka 3.0 detector and the PEAK THOR T67 VTX evasion band.
     - **Optimized Dwell**: The scan dwell is **10 ms per hop** — just enough for the USRP PLL to settle (~2 ms) and deliver one full 65536-sample chunk (~2.6 ms at 25 MSPS). The detector only needs a single chunk per hop to run the wideband DDC probe sweep. All remaining duplicate-frequency packets are skipped to prevent queue backlog.
@@ -20,9 +20,9 @@ Phase 1 handles the wideband IQ capture. The hardware-specific code lives in ded
 
 2.  **Zero-Allocation Pipeline**:
     - Raw IQ samples are streamed into pre-allocated buffers managed by the backend.
-    - Hand-off occurs via lock-free `crossbeam::channel`s from the backend's capture thread to orecchiette's worker pool.
-    - **Overrun Protection**: If the downstream pipeline cannot keep up with the SDR stream, frames are dynamically dropped at the dispatcher. In cases of persistent hardware overruns (e.g. `ReceiveErrorKind::Overflow` from UHD), the backend tracks this and automatically steps down the sample rate by 5 MHz (up to 2 times a minute) to restore stability.
-    - **Scan-loop backpressure**: The `fpv_viewer` scan loop processes only one packet per frequency hop and skips all remaining packets at the same center frequency. This prevents queue buildup when the detector's ~50 ms DDC sweep can't keep up with the 2.6 ms packet rate.
+    - Hand-off occurs via lock-free `crossbeam::channel`s from the backend's capture thread to the consumer's worker pool.
+    - **Overrun Protection**: If the downstream pipeline cannot keep up with the SDR stream, frames are dynamically dropped at the dispatcher. Hardware overruns are surfaced per-packet via `IqPacket.overrun` (set by the USRP backend when UHD reports an overflow); when they persist, the viewer steps its requested sample rate down by 5 MHz to restore stability.
+    - **Scan-loop backpressure**: The fpv-viewer scan loop processes only one packet per frequency hop and skips all remaining packets at the same center frequency. This prevents queue buildup when the detector's ~50 ms DDC sweep can't keep up with the 2.6 ms packet rate.
     - **B210 sample rate limit**: The B210 over USB 3.0 runs clean at 25 MSPS. At 50 MSPS the USB transport saturates (~400 MB/s sustained), producing intermittent hardware FIFO overflows — the scanner still sweeps but some samples are dropped. 25 MSPS is recommended for clean operation.
 
 ---
@@ -67,11 +67,16 @@ The detector sweeps the entire capture bandwidth to find analog video signals at
     - Threshold is fundamental-relative (not noise-floor-relative) because spectral leakage from a strong fundamental otherwise pulls the noise floor estimate down enough that any FFT-window sidelobe at 2× the fundamental crosses a noise-floor-relative threshold.
     - This rejects narrowband-FM tones and CW interferers that happen to land in the H-sync bin — they have no harmonic structure and fail the count.
 
-9.  **V-Sync Cross-Check**:
-    - For borderline cases, the detector checks for the vertical sync rate:
-      - **PAL**: 50 Hz
-      - **NTSC**: ~59.94 Hz
-    - V-sync confirmation raises confidence to 0.6 (only reachable at `bin_hz < 10`, i.e. > 100 ms capture window).
+9.  **Cepstrum Structural Gate**:
+    - Any candidate that clears the harmonic check is verified structurally via the cepstrum (IFFT of the log-power spectrum): a true H-sync pulse train's harmonic comb collapses to a single sharp quefrency peak at the line period, which multi-tone interferers (Wi-Fi beacons, BT hopping) cannot mimic.
+    - The peak-to-median ratio at the expected quefrency must reach **7×** (`CEPSTRAL_RATIO_THRESHOLD`) or the classification is downgraded to `Unknown`. Real pulse trains measure ~5–20×; the threshold sits inside that range (rather than at its bottom) to reject strong periodic non-video interferers like cellular OFDM frame timing.
+
+9a. **Vertical-Sync (VBI) Confirm Stage** (`vbi.rs`):
+    - The line-rate comb and cepstrum only confirm that the *line rate* is present. `confirm_field_sync` additionally parses the demod slice for serrated broad-pulse groups (the vertical-sync structure itself) and checks that consecutive groups land a real field period apart — essentially unfakeable by a non-video interferer.
+    - Confidence tiers (`apply_vbi_confidence_tier`):
+      - **Boost**: a strong (0.8) hit with confirmed field-sync structure → **0.95**.
+      - **Promote**: a standard-ambiguous `AnalogVideoUnknown` hit (0.6) with confirmed structure → **0.75**, clearing the default 0.7 confidence floor.
+      - **Demote** (opt-in via `demote_unconfirmed_video`): a 0.8 hit spanning ≥ 2.5 field periods with *zero* confirmed groups → 0.6.
 
 ---
 
@@ -102,11 +107,9 @@ Once a signal is detected, full FM demodulation recovers the video content:
 ## Phase 6: Video Frame Reconstruction (`video.rs` + `frame_history.rs`)
 
 This phase turns the 1D frequency stream into a 2D image. Output is
-monochrome (luma-only) — colour recovery is currently disabled because
-analog FPV chroma bursts on real-world links arrive with σ ≈ 165° of
-per-line phase noise, which is below the lock floor of the chroma PLL
-that previously drove the colour path. See DESIGN.md §5 for the
-empirical justification.
+monochrome (luma-only) — colour recovery is currently disabled; see
+DESIGN.md §9 for the rationale and §10 for the conditions under which
+the colour path would return.
 
 13. **Two-Pass Sync-Tip Alignment**:
     - Pass 1 detects every sync tip — points where the demodulated
@@ -120,9 +123,12 @@ empirical justification.
     - **Sync-quality score**: `valid_slots / total_slots` is exposed
       via `FrameReconstructor::latest_sync_quality()` and saved into
       the per-field [`FieldMeta`] in the history buffer. A score
-      below `DROPOUT_THRESHOLD` (0.5) forces the temporal denoise
-      into "static" mode for that field (full blend toward recent
-      history), preferring a recently-good frame to current FM static.
+      below `DROPOUT_ENTER_THRESHOLD` (0.5) forces the temporal
+      denoise into "static" mode (full blend toward recent history),
+      preferring a recently-good frame to current FM static; the mode
+      is held until the score recovers past `DROPOUT_EXIT_THRESHOLD`
+      (0.6) — hysteresis that stops a field hovering at the boundary
+      from flickering the denoise mode frame to frame.
 
 14. **2D Mapping & Rescaling**:
     - Samples between H-Sync pulses form a single line of pixels.
@@ -133,7 +139,7 @@ empirical justification.
     - Each rendered field is pushed into a fixed-capacity ring buffer
       of recent Y fields (default 5, configurable via
       `FrameReconstructor::with_temporal_window(N)` or the CLI flag
-      `--temporal-window N` on `fpv_viewer`).
+      `--temporal-window N` on fpv-viewer).
     - Per-pixel: collect the value from the current field and every
       retained history field; compute the median (kills FM "click"
       sparkles) and the max-absolute motion across history; blend
@@ -149,23 +155,15 @@ empirical justification.
 
 ---
 
-## Phase 7: Reporting (`main.rs`)
+## Phase 7: Consuming Detections
 
-15. **Multi-Signal Reporting**:
-    - The orchestrator iterates over **all** detected signals (not just the first).
-    - Each signal gets its own frequency-keyed dedup slot (1-second cooldown).
-    - A JSON detection record is emitted to `stdout` for each unique signal per second.
+15. **Library boundary**: this crate ends at
+    `Vec<DetectionResult>` (frequency, confidence, relative power,
+    bandwidth, `SignalType`) plus the reconstructed frames. It is a
+    library — it emits no records itself.
 
-16. **JSON Telemetry**:
-    ```json
-    {
-      "frequency_hz": 5775000000.0,
-      "protocol": "Analog FPV (NTSC)",
-      "source": "drone",
-      "rssi_relative_db": -4.3,
-      "confidence": 0.8,
-      "bandwidth_mhz": "10.0",
-      "video_standard": "NTSC",
-      "timestamp": 1779763967
-    }
-    ```
+16. **Consumers**: fpv-viewer-rs iterates over **all** detected
+    signals (not just the first), opens one decode window per signal,
+    and prints per-detection lines to the console. `DetectionResult`
+    derives `Serialize`, so a headless consumer can emit JSON
+    telemetry directly from it if needed.
