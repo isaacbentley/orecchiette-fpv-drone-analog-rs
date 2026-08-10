@@ -19,7 +19,7 @@ log = "0.4"
 # Portable SIMD for the DDC's FIR kernel (see `ddc::StreamingDDC`): a
 # float dot-product reduction can't be auto-vectorised (LLVM may not
 # reassociate FP adds), so the lanes are written explicitly.
-wide = "0.7"
+wide = "1.5"
 bytemuck = { version = "1.0", features = ["derive"] }
 # Optional GPU compute back-end (`gpu` feature) for the wideband sweep's
 # per-probe DDC. Kept optional so the default published crate stays pure
