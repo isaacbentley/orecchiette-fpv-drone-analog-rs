@@ -237,6 +237,12 @@ pub struct FrameReconstructor {
     pub neural_restorer: Option<crate::neural::NeuralRestorer>,
     #[cfg(feature = "neural-vsr")]
     pub hidden_state: Option<Vec<f32>>,
+    /// Persistent luma in/out scratch for the neural pass, so the hot
+    /// path doesn't allocate two full-frame `Vec`s per rendered frame.
+    #[cfg(feature = "neural-vsr")]
+    neural_in: Vec<f32>,
+    #[cfg(feature = "neural-vsr")]
+    neural_out: Vec<f32>,
 
     /// Holds the complete RGB frame between calls so consecutive
     /// `reconstruct_frame_into` calls (each one capturing a single
@@ -572,6 +578,10 @@ impl FrameReconstructor {
             neural_restorer: None,
             #[cfg(feature = "neural-vsr")]
             hidden_state: None,
+            #[cfg(feature = "neural-vsr")]
+            neural_in: vec![0.0; width * height],
+            #[cfg(feature = "neural-vsr")]
+            neural_out: vec![0.0; width * height],
 
             field_buf: vec![0u32; width * height],
             field_parity: 0,
@@ -702,18 +712,15 @@ impl FrameReconstructor {
         self
     }
 
+    /// Enable the optional temporal neural denoiser, loading the ONNX
+    /// model from `model_path`. The caller supplies the path — a library
+    /// must not assume a CWD-relative location. A load failure is logged
+    /// and leaves the restorer disabled (reconstruction still works).
     #[cfg(feature = "neural-vsr")]
-    pub fn with_neural_restorer(mut self, enabled: bool, use_gpu: bool) -> Self {
-        if enabled {
-            match crate::neural::NeuralRestorer::new(
-                "models/temporal_quantized_trained.onnx",
-                use_gpu,
-            ) {
-                Ok(restorer) => self.neural_restorer = Some(restorer),
-                Err(e) => log::error!("Failed to load neural restorer: {}", e),
-            }
-        } else {
-            self.neural_restorer = None;
+    pub fn with_neural_restorer(mut self, model_path: &str, use_gpu: bool) -> Self {
+        match crate::neural::NeuralRestorer::new(model_path, use_gpu) {
+            Ok(restorer) => self.neural_restorer = Some(restorer),
+            Err(e) => log::error!("Failed to load neural restorer from {model_path}: {e}"),
         }
         self
     }
@@ -1693,37 +1700,33 @@ impl FrameReconstructor {
         self.field_buf.copy_from_slice(frame);
 
         #[cfg(feature = "neural-vsr")]
+        // Only run with a valid previous field (a complete interlaced
+        // frame). `take()` the restorer out so the persistent in/out
+        // scratch and `hidden_state` can be borrowed without aliasing
+        // `self.neural_restorer`; put it back afterwards.
+        if self.has_prev
+            && let Some(mut restorer) = self.neural_restorer.take()
         {
-            if self.has_prev {
-                // Only run if we have a valid previous field to form a complete frame
-                if let Some(restorer) = &mut self.neural_restorer {
-                    let mut luma = vec![0.0f32; self.width * self.height];
-                    for (i, p) in frame.iter().enumerate() {
-                        let r = (p >> 16) & 0xFF;
-                        luma[i] = (r as f32) / 255.0;
-                    }
-
-                    let luma_in = luma.clone();
-                    match restorer.process_frame_luma(
-                        self.width,
-                        self.height,
-                        &luma_in,
-                        self.hidden_state.as_deref(),
-                        &mut luma,
-                    ) {
-                        Ok(new_hidden) => {
-                            self.hidden_state = Some(new_hidden);
-                            for (i, y) in luma.iter().enumerate() {
-                                let c = (y.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-                                frame[i] = 0xFF000000 | (c << 16) | (c << 8) | c;
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Neural restorer failed: {}", e);
-                        }
+            for (dst, p) in self.neural_in.iter_mut().zip(frame.iter()) {
+                *dst = (((p >> 16) & 0xFF) as f32) / 255.0;
+            }
+            match restorer.process_frame_luma(
+                self.width,
+                self.height,
+                &self.neural_in,
+                self.hidden_state.as_deref(),
+                &mut self.neural_out,
+            ) {
+                Ok(new_hidden) => {
+                    self.hidden_state = Some(new_hidden);
+                    for (px, y) in frame.iter_mut().zip(self.neural_out.iter()) {
+                        let c = (y.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                        *px = 0xFF000000 | (c << 16) | (c << 8) | c;
                     }
                 }
+                Err(e) => log::error!("Neural restorer failed: {}", e),
             }
+            self.neural_restorer = Some(restorer);
         }
         // Parity of the field just rendered, captured before the toggle:
         // the FieldMeta below describes THIS field, and reading

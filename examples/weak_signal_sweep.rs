@@ -306,7 +306,8 @@ fn main() {
                     .with_smart_doc(true, 0.5);
                 #[cfg(feature = "neural-vsr")]
                 {
-                    recon = recon.with_neural_restorer(true, false);
+                    recon =
+                        recon.with_neural_restorer("models/temporal_quantized_trained.onnx", false);
                 }
                 let mut frame = vec![0u32; recon.width * recon.height];
                 let mut last_res = None;

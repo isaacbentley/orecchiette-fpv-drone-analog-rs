@@ -58,24 +58,24 @@ impl NeuralRestorer {
             .session
             .run(inputs!["input" => input_tensor, "hidden_in" => hidden_tensor])?;
 
+        // Dims compared element-wise (no per-frame Vec allocation just
+        // to shape-check).
+        let dims_eq = |shape: &[i64], want: [usize; 4]| -> bool {
+            shape.len() == 4 && shape.iter().zip(want).all(|(&s, w)| s as usize == w)
+        };
+
         // Extract output image
         let (output_shape, output_data) = outputs["output"].try_extract_tensor::<f32>()?;
-        if output_shape.iter().map(|&x| x as usize).collect::<Vec<_>>() != vec![1, 1, height, width]
-        {
+        if !dims_eq(output_shape, [1, 1, height, width]) {
             return Err(ort::Error::new("Output tensor shape mismatch".to_string()));
         }
-
-        // Copy back to output buffer
-        for y in 0..height {
-            for x in 0..width {
-                luma_out[y * width + x] = output_data[y * width + x].clamp(0.0, 1.0);
-            }
+        for (dst, &src) in luma_out.iter_mut().zip(output_data.iter()) {
+            *dst = src.clamp(0.0, 1.0);
         }
 
         // Extract hidden out
         let (hidden_shape, hidden_data) = outputs["hidden_out"].try_extract_tensor::<f32>()?;
-        if hidden_shape.iter().map(|&x| x as usize).collect::<Vec<_>>() != vec![1, 8, height, width]
-        {
+        if !dims_eq(hidden_shape, [1, 8, height, width]) {
             return Err(ort::Error::new(
                 "Hidden output tensor shape mismatch".to_string(),
             ));
