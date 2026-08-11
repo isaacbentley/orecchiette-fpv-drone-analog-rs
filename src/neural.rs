@@ -10,10 +10,14 @@ impl NeuralRestorer {
 
         if use_gpu {
             // CoreML dispatches to the Apple Neural Engine / GPU where
-            // available; falls back to CPU otherwise.
-            let eps: Vec<ort::execution_providers::ExecutionProviderDispatch> =
-                vec![ort::ep::CoreML::default().build()];
-            builder = builder.with_execution_providers(eps)?;
+            // available; it's Apple-only, so on other platforms `use_gpu`
+            // falls through to `ort`'s default CPU provider.
+            #[cfg(target_os = "macos")]
+            {
+                let eps: Vec<ort::execution_providers::ExecutionProviderDispatch> =
+                    vec![ort::ep::CoreML::default().build()];
+                builder = builder.with_execution_providers(eps)?;
+            }
         }
 
         let num_cpus = std::thread::available_parallelism()
