@@ -243,6 +243,13 @@ pub struct FrameReconstructor {
     neural_in: Vec<f32>,
     #[cfg(feature = "neural-vsr")]
     neural_out: Vec<f32>,
+    /// Normalised link-quality conditioning in `[0, 1]` (1 = clean) fed
+    /// to the neural restorer's noise plane. Set per frame by the caller
+    /// via [`Self::set_neural_noise_level`]; defaults to 1.0 (assume
+    /// clean) so an un-wired caller gets light-touch denoising, not
+    /// worst-case smoothing.
+    #[cfg(feature = "neural-vsr")]
+    neural_noise_level: f32,
 
     /// Holds the complete RGB frame between calls so consecutive
     /// `reconstruct_frame_into` calls (each one capturing a single
@@ -582,6 +589,8 @@ impl FrameReconstructor {
             neural_in: vec![0.0; width * height],
             #[cfg(feature = "neural-vsr")]
             neural_out: vec![0.0; width * height],
+            #[cfg(feature = "neural-vsr")]
+            neural_noise_level: 1.0,
 
             field_buf: vec![0u32; width * height],
             field_parity: 0,
@@ -710,6 +719,18 @@ impl FrameReconstructor {
         self.use_smart_doc = enable;
         self.smart_doc_spatial_weight = spatial_weight.clamp(0.0, 1.0);
         self
+    }
+
+    /// Set the neural restorer's per-frame link-quality conditioning
+    /// from a CNR estimate in dB (e.g. [`crate::levels::estimate_cnr_db`]
+    /// on the current IQ chunk). The reconstructor only sees demodulated
+    /// data, so the caller — which has the IQ — must push this in before
+    /// each `reconstruct_frame_into`. Normalised with the SAME map the
+    /// model trained against (`CNR_FULL_SCALE_DB = 30` in
+    /// `models/train_temporal.py`): `(cnr_db / 30).clamp(0, 1)`.
+    #[cfg(feature = "neural-vsr")]
+    pub fn set_neural_noise_level(&mut self, cnr_db: f32) {
+        self.neural_noise_level = (cnr_db / 30.0).clamp(0.0, 1.0);
     }
 
     /// Enable the optional temporal neural denoiser, loading the ONNX
@@ -1714,6 +1735,7 @@ impl FrameReconstructor {
                 self.width,
                 self.height,
                 &self.neural_in,
+                self.neural_noise_level,
                 self.hidden_state.as_deref(),
                 &mut self.neural_out,
             ) {
