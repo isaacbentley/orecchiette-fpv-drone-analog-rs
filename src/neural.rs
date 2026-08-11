@@ -6,19 +6,22 @@ pub struct NeuralRestorer {
 
 impl NeuralRestorer {
     pub fn new(model_path: &str, use_gpu: bool) -> ort::Result<Self> {
+        // `mut` is only exercised on macOS (the CoreML EP reassigns
+        // `builder`); on other targets that block is cfg'd out.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut builder = Session::builder()?;
 
+        // CoreML dispatches to the Apple Neural Engine / GPU; it's
+        // Apple-only, so on every other target `use_gpu` simply falls
+        // through to `ort`'s default CPU provider (nothing to configure).
+        #[cfg(target_os = "macos")]
         if use_gpu {
-            // CoreML dispatches to the Apple Neural Engine / GPU where
-            // available; it's Apple-only, so on other platforms `use_gpu`
-            // falls through to `ort`'s default CPU provider.
-            #[cfg(target_os = "macos")]
-            {
-                let eps: Vec<ort::execution_providers::ExecutionProviderDispatch> =
-                    vec![ort::ep::CoreML::default().build()];
-                builder = builder.with_execution_providers(eps)?;
-            }
+            let eps: Vec<ort::execution_providers::ExecutionProviderDispatch> =
+                vec![ort::ep::CoreML::default().build()];
+            builder = builder.with_execution_providers(eps)?;
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = use_gpu;
 
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
