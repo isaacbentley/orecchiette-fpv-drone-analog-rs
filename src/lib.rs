@@ -1,7 +1,5 @@
 pub mod bands;
 pub mod ddc;
-#[cfg(feature = "neural-vsr")]
-pub mod neural;
 pub mod demod;
 pub mod detector;
 pub mod frame_history;
@@ -10,6 +8,8 @@ pub mod gpu;
 pub mod impairments;
 pub mod levels;
 pub mod metrics;
+#[cfg(feature = "neural-vsr")]
+pub mod neural;
 pub mod scanner;
 pub mod synthetic;
 pub mod types;

@@ -5,6 +5,42 @@ push weak-NTSC/PAL recovery toward the current state of the art. Ordered
 by return-on-effort for this project's actual use case: real-time,
 edge-class hardware, often a single inexpensive SDR.
 
+## Status (0.3.0)
+
+Phases 0, 1, and part of 4 have landed and are **on by default** (a
+deliberate project choice; each is one builder call to disable):
+
+- **Phase 0 — measurement**: `metrics` (PSNR, gradient correlation) and
+  `impairments` (multipath, burst dropout, slow fade, impulsive noise)
+  modules; `weak_signal_sweep` now reports GCOR and a σ-cliff per demod
+  across all impairment profiles.
+- **Phase 1 — TBC/dropout**: matched-filter sync acquisition
+  (`FrameReconstructor::use_matched_sync`), robust OLS line-locked-clock
+  TBC (`use_line_locked_clock`, MAD-reweighted refit so a few noisy tips
+  can't slant the field), and spatial+temporal SmartDOC concealment
+  (`use_smart_doc`). All default on.
+- **Phase 4 — neural restoration**: an optional temporal ONNX denoiser
+  (`neural::NeuralRestorer`, `neural-vsr` feature — *not* in default
+  cargo features, so it never forces ONNX Runtime on consumers).
+  `models/train_temporal.py` generates synthetic FM/AWGN/dot-crawl
+  training data.
+
+**Measured tradeoff, stated honestly.** Matched-sync recovers the exact
+integer sync phase on a clean signal (GCOR 1.0) and the OLS TBC gives
+straight verticals; both are net wins at low-to-moderate noise. Under
+heavy noise the GCOR fidelity metric collapses for *every* technique
+(you can't gradient-correlate a picture buried in noise), and the neural
+denoiser trades spatial precision for temporal smoothing — its GCOR
+falls even on clean input. Sync-lock and detection (whether a picture is
+recoverable at all) are preserved, and PLL still extends the sync
+threshold. The on-by-default choice favours the low-noise wins; disable
+per-instance if operating deep in the threshold region. See
+`weak_signal_sweep` and the `phase2_dsp_*` tests.
+
+Still open: **Phase 2** (nonlinear-estimation demod — the fabricated
+"UKF" from the prototype was removed; a real EKF/UKF is future work) and
+**Phase 3** (diversity combining).
+
 ## Baseline (shipped, as of lib 0.2.1 / viewer 0.2.0)
 
 The pipeline is a classically-correct FM video receiver, pushed to a

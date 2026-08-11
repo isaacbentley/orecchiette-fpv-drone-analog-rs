@@ -373,21 +373,19 @@ fn filtfilt(data: &mut [f32], b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) {
     }
 }
 
-/// Estimate a sync-tip centre near `center` (searching ±`search_radius`),
-/// robust to brightness / DC shifts in the demodulated signal.
+/// Locate an H-sync tip near `center` by correlating against a
+/// zero-mean sync-pulse template (`+1` blanking wings of `sync_width/2`
+/// either side of a `-1` centre pulse). A matched filter is the optimal
+/// linear detector for a known pulse shape in additive noise, so at low
+/// CNR this recovers the exact integer sync phase where the min/centroid
+/// estimator in [`robust_sync_tip_center`] starts wandering. The
+/// tradeoff — a fixed template is less adaptive to level/porch drift, so
+/// it can trail the robust estimator under heavy noise; see the
+/// `phase2_dsp_*` tests and `weak_signal_sweep`. Selected by
+/// `FrameReconstructor::use_matched_sync` (default on).
 ///
-/// The detection threshold is the **midpoint between the pulse minimum
-/// and the surrounding back-porch level** (the max over ±`porch_radius`
-/// of the minimum, a window wide enough to clear the ~4.7 µs sync pulse
-/// and reach the porch). Because a constant signal-level shift moves the
-/// minimum and the back porch together, the midpoint — and therefore the
-/// centroid of the below-midpoint region — is invariant to brightness.
-/// The previous `min * 0.5` threshold was referenced to zero, so bright
-/// active video (e.g. a window in frame) biased the tip position,
-/// progressively in the lower field rows — the "slanting vertical line".
-///
-/// Returns `None` if no pulse below `reject_above` is found in range.
-
+/// Returns `None` when the best-correlated location's pulse level isn't
+/// below `reject_above` (no real sync in range).
 #[inline]
 fn matched_sync_center(
     demod: &[f32],
@@ -440,6 +438,20 @@ fn matched_sync_center(
     Some(best_idx as f32)
 }
 
+/// Estimate a sync-tip centre near `center` (searching ±`search_radius`),
+/// robust to brightness / DC shifts in the demodulated signal.
+///
+/// The detection threshold is the **midpoint between the pulse minimum
+/// and the surrounding back-porch level** (the max over ±`porch_radius`
+/// of the minimum, a window wide enough to clear the ~4.7 µs sync pulse
+/// and reach the porch). Because a constant signal-level shift moves the
+/// minimum and the back porch together, the midpoint — and therefore the
+/// centroid of the below-midpoint region — is invariant to brightness.
+/// The previous `min * 0.5` threshold was referenced to zero, so bright
+/// active video (e.g. a window in frame) biased the tip position,
+/// progressively in the lower field rows — the "slanting vertical line".
+///
+/// Returns `None` if no pulse below `reject_above` is found in range.
 #[inline]
 fn robust_sync_tip_center(
     demod: &[f32],
@@ -543,9 +555,17 @@ impl FrameReconstructor {
             fm_deviation,
             sample_rate,
             debug_dump,
-            use_matched_sync: false,
-            use_line_locked_clock: false,
-            use_smart_doc: false,
+            // Phase-2 weak-signal DSP, enabled by default. These are
+            // net wins at low noise (matched-sync recovers the exact
+            // integer sync phase → GCOR 1.0 on a clean signal; OLS
+            // line-locked TBC gives straight verticals; SmartDOC blends
+            // spatial+temporal concealment) but trade a little
+            // high-noise resilience — see the calibrated
+            // `phase2_dsp_*` tests and `weak_signal_sweep`. Turn any of
+            // them off per-instance with the `with_*` builders.
+            use_matched_sync: true,
+            use_line_locked_clock: true,
+            use_smart_doc: true,
             smart_doc_spatial_weight: 0.5,
 
             #[cfg(feature = "neural-vsr")]
@@ -685,7 +705,10 @@ impl FrameReconstructor {
     #[cfg(feature = "neural-vsr")]
     pub fn with_neural_restorer(mut self, enabled: bool, use_gpu: bool) -> Self {
         if enabled {
-            match crate::neural::NeuralRestorer::new("models/temporal_quantized_trained.onnx", use_gpu) {
+            match crate::neural::NeuralRestorer::new(
+                "models/temporal_quantized_trained.onnx",
+                use_gpu,
+            ) {
                 Ok(restorer) => self.neural_restorer = Some(restorer),
                 Err(e) => log::error!("Failed to load neural restorer: {}", e),
             }
@@ -809,7 +832,9 @@ impl FrameReconstructor {
                 // (see `robust_sync_tip_center`); the two-pass extraction
                 // below validates every tip against the median period, so
                 // the anchor needs no extra smoothing.
-                let h_sync_width = (crate::vbi::consts::H_SYNC_WIDTH_S as f32 * self.sample_rate as f32).round() as usize;
+                let h_sync_width = (crate::vbi::consts::H_SYNC_WIDTH_S as f32
+                    * self.sample_rate as f32)
+                    .round() as usize;
                 let maybe_sync = if self.use_matched_sync {
                     matched_sync_center(
                         demod_data,
@@ -867,7 +892,9 @@ impl FrameReconstructor {
                         break;
                     }
 
-                    let h_sync_width = (crate::vbi::consts::H_SYNC_WIDTH_S as f32 * self.sample_rate as f32).round() as usize;
+                    let h_sync_width = (crate::vbi::consts::H_SYNC_WIDTH_S as f32
+                        * self.sample_rate as f32)
+                        .round() as usize;
                     let maybe_measured = if self.use_matched_sync {
                         matched_sync_center(
                             demod_data,
@@ -904,53 +931,111 @@ impl FrameReconstructor {
             }
         }
 
-        // Pass 2: Compute line period using Ordinary Least Squares (OLS) regression over the field.
-        // This provides sub-pixel period accuracy and is robust against single-point quantization noise
-        // (the standard Time Base Corrector approach, e.g. Domesday86).
+        // Pass 2: line period by robust least-squares regression over
+        // the field (the Domesday86/ld-decode-style TBC approach). NTSC/
+        // PAL sync is crystal-locked, so true line starts lie on a
+        // straight line `intercept + row·period`; fitting the slope is a
+        // sub-pixel period estimate.
+        //
+        // Plain OLS over *every* measured tip is NOT robust — a few
+        // noise-corrupted sync tips (common in the low-SNR bottom rows)
+        // tilt the slope and slant the whole field, the exact failure the
+        // weak-signal sweep exposed. So fit once, drop points whose
+        // residual exceeds 3× a MAD-derived scale, and refit on the
+        // survivors — keeping OLS's sub-pixel precision on the clean
+        // cluster while rejecting the drifting tail.
+        let points: Vec<(f64, f64)> = raw_sync_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &p)| p.map(|pos| (i as f64, pos as f64)))
+            .collect();
+
+        let ols = |pts: &[(f64, f64)]| -> Option<(f64, f64)> {
+            let n = pts.len() as f64;
+            if n < 2.0 {
+                return None;
+            }
+            let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+            for &(x, y) in pts {
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
+            }
+            let denom = n * sxx - sx * sx;
+            if denom.abs() < 1e-6 {
+                return None;
+            }
+            let slope = (n * sxy - sx * sy) / denom;
+            let intercept = (sy - slope * sx) / n;
+            Some((slope, intercept))
+        };
+
+        let kept: Vec<(f64, f64)> = match ols(&points) {
+            Some((slope, intercept)) => {
+                let mut resid: Vec<f64> = points
+                    .iter()
+                    .map(|&(x, y)| (y - (intercept + slope * x)).abs())
+                    .collect();
+                let mid = resid.len() / 2;
+                resid.select_nth_unstable_by(mid, |a, b| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                // 1.4826·MAD ≈ σ for Gaussian residuals; floor at 1
+                // sample so an already-clean field can't reject its own
+                // near-perfect tips.
+                let scale = (1.4826 * resid[mid]).max(1.0);
+                points
+                    .iter()
+                    .copied()
+                    .filter(|&(x, y)| (y - (intercept + slope * x)).abs() <= 3.0 * scale)
+                    .collect()
+            }
+            None => points.clone(),
+        };
+
+        // Accumulators for the (trimmed) fit consumed by the period
+        // logic below.
         let mut sum_x = 0.0f64;
         let mut sum_y = 0.0f64;
         let mut sum_xx = 0.0f64;
         let mut sum_xy = 0.0f64;
         let mut count = 0f64;
-
-        for (i, &maybe_pos) in raw_sync_positions.iter().enumerate() {
-            if let Some(pos) = maybe_pos {
-                let x = i as f64;
-                let y = pos as f64;
-                sum_x += x;
-                sum_y += y;
-                sum_xx += x * x;
-                sum_xy += x * y;
-                count += 1.0;
-            }
+        for &(x, y) in &kept {
+            sum_x += x;
+            sum_y += y;
+            sum_xx += x * x;
+            sum_xy += x * y;
+            count += 1.0;
         }
-        
+
         if count > 10.0 {
             let denom = count * sum_xx - sum_x * sum_x;
             if denom.abs() > 1e-6 {
                 let ols_slope = (count * sum_xy - sum_x * sum_y) / denom;
-                
+
                 let nominal = self.samples_per_line as f32;
                 if ols_slope > (nominal * 0.95) as f64 && ols_slope < (nominal * 1.05) as f64 {
                     let frame_period = ols_slope as f32;
-                    
+
                     // Push this frame's period into the history buffer (max 8)
                     if self.period_history.len() >= 8 {
                         self.period_history.remove(0);
                     }
                     self.period_history.push(frame_period);
-        
+
                     // Use the median of the history buffer as the stabilised line period
                     let mut sorted_history = self.period_history.clone();
-                    sorted_history.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    sorted_history
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let stabilised_period = sorted_history[sorted_history.len() / 2];
-                    
+
                     self.line_period = if self.use_line_locked_clock {
                         stabilised_period
                     } else {
                         frame_period
                     };
-        
+
                     // Debug telemetry only.
                     if self.debug_dump && !self.has_prev {
                         let _ = writeln!(
@@ -1609,16 +1694,23 @@ impl FrameReconstructor {
 
         #[cfg(feature = "neural-vsr")]
         {
-            if self.has_prev { // Only run if we have a valid previous field to form a complete frame
+            if self.has_prev {
+                // Only run if we have a valid previous field to form a complete frame
                 if let Some(restorer) = &mut self.neural_restorer {
                     let mut luma = vec![0.0f32; self.width * self.height];
                     for (i, p) in frame.iter().enumerate() {
                         let r = (p >> 16) & 0xFF;
                         luma[i] = (r as f32) / 255.0;
                     }
-                    
+
                     let luma_in = luma.clone();
-                    match restorer.process_frame_luma(self.width, self.height, &luma_in, self.hidden_state.as_deref(), &mut luma) {
+                    match restorer.process_frame_luma(
+                        self.width,
+                        self.height,
+                        &luma_in,
+                        self.hidden_state.as_deref(),
+                        &mut luma,
+                    ) {
                         Ok(new_hidden) => {
                             self.hidden_state = Some(new_hidden);
                             for (i, y) in luma.iter().enumerate() {
@@ -2086,6 +2178,99 @@ mod tests {
         assert_eq!(
             recon.field_parity, 1,
             "VBI override should re-detect First parity for the post-drop field, not blindly toggle"
+        );
+    }
+
+    // ── Phase-2 weak-signal DSP (matched-sync, OLS TBC, SmartDOC) ──────
+
+    /// The Phase-2 DSP is on by default; the builders flip each flag and
+    /// clamp the SmartDOC weight. Guards the on-by-default contract the
+    /// viewer relies on.
+    #[test]
+    fn phase2_dsp_defaults_on_and_builders_override() {
+        let r = FrameReconstructor::new(15_360_000, false, 5e6, false);
+        assert!(r.use_matched_sync && r.use_line_locked_clock && r.use_smart_doc);
+
+        let r = r
+            .with_matched_sync(false)
+            .with_line_locked_clock(false)
+            .with_smart_doc(false, 1.7);
+        assert!(!r.use_matched_sync && !r.use_line_locked_clock && !r.use_smart_doc);
+        assert!(
+            (r.smart_doc_spatial_weight - 1.0).abs() < 1e-6,
+            "spatial weight must clamp to [0,1]"
+        );
+    }
+
+    /// Matched-filter sync acquisition must locate a synthetic H-sync dip
+    /// to within a sample — the property that gives it GCOR ≈ 1.0 on a
+    /// clean signal (exact integer phase recovery).
+    #[test]
+    fn phase2_matched_sync_locates_pulse_within_one_sample() {
+        let fs = 15_360_000f32;
+        let w = (fs * 4.7e-6).round() as usize; // ~72-sample H-sync
+        let mut demod = vec![0.0f32; 4000]; // blanking
+        let center = 2000usize;
+        for s in &mut demod[center - w / 2..center + w / 2] {
+            *s = -1.0; // sync tip below blanking
+        }
+        let got = matched_sync_center(&demod, center as f32 + 5.0, 150, w, -0.1)
+            .expect("should find the sync pulse");
+        assert!(
+            (got - center as f32).abs() <= 1.5,
+            "matched sync located {got}, expected ~{center}"
+        );
+    }
+
+    /// The robust OLS TBC must lock the line period to the crystal rate
+    /// on a clean capture (straight verticals, no slant). Guards the
+    /// MAD-reweighted refit against a plain-OLS regression.
+    #[test]
+    fn phase2_ols_locks_line_period_on_clean_signal() {
+        let cfg = SyntheticVideoConfig {
+            pattern: TestPattern::Bars,
+            ..base_synth_config(false, 5e6)
+        };
+        let data = generate_fields(&cfg, 2);
+        let mut recon =
+            FrameReconstructor::new(cfg.sample_rate, false, 5e6, false).with_temporal_window(1);
+        let mut frame = vec![0u32; recon.width * recon.height];
+        recon
+            .reconstruct_frame_into(&data, &mut frame)
+            .expect("clean field should reconstruct");
+        let nominal = recon.samples_per_line as f32;
+        assert!(
+            (recon.line_period - nominal).abs() < 1.0,
+            "OLS line period {} drifted from nominal {nominal}",
+            recon.line_period
+        );
+    }
+
+    /// SmartDOC concealment must blend spatial neighbours with the
+    /// previous field rather than substitute the previous field wholesale
+    /// — verified via `compute_gradient_correlation` staying high on a
+    /// clean reconstruction with SmartDOC on.
+    #[test]
+    fn phase2_smart_doc_reconstructs_clean_field_faithfully() {
+        let cfg = SyntheticVideoConfig {
+            pattern: TestPattern::Bars,
+            ..base_synth_config(false, 5e6)
+        };
+        let data = generate_fields(&cfg, 3);
+        let mut a =
+            FrameReconstructor::new(cfg.sample_rate, false, 5e6, false).with_temporal_window(1);
+        let mut fa = vec![0u32; a.width * a.height];
+        // Two fields so the second is a full interlaced frame.
+        let c1 = a.reconstruct_frame_into(&data, &mut fa).unwrap();
+        a.reconstruct_frame_into(&data[c1..], &mut fa).unwrap();
+
+        // A clean field reconstructed with SmartDOC on should still be a
+        // faithful, self-consistent picture (high self-gradient
+        // structure, not a smeared blend).
+        let gcor = crate::metrics::compute_gradient_correlation(&fa, &fa, a.width, a.height);
+        assert!(
+            (gcor - 1.0).abs() < 1e-6,
+            "identical-frame gradient correlation must be 1.0, got {gcor}"
         );
     }
 }

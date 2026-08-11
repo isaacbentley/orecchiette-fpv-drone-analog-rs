@@ -443,3 +443,45 @@ this is classic noncoherent (post-detection) integration.
 - fpv-viewer-rs feeds one integrator per scan session (persisting across
   sweeps and rescans) and gives single-channel standard detection up to 4
   chunks of patience before settling for an ambiguous answer.
+
+## 12. Phase-1 TBC/Dropout & Optional Neural Restoration
+
+Weak-signal recovery techniques ported from the phase-2 development
+line (see `ROADMAP.md` for the full plan and the honest measured
+tradeoff). The three DSP stages are `FrameReconstructor` flags, **on by
+default**, each disableable via a `with_*` builder:
+
+- **Matched-filter sync** (`use_matched_sync`): locates H-sync by
+  correlating against a zero-mean sync-pulse template instead of a
+  min/centroid search. Optimal for a known pulse in noise; recovers the
+  exact integer sync phase on a clean signal (GCOR 1.0). A fixed
+  template is less adaptive to porch drift, so it can trail the
+  brightness-invariant estimator under heavy noise — `robust_sync_tip_center`
+  remains the fallback.
+- **OLS line-locked clock** (`use_line_locked_clock`): fits the line
+  period by least-squares regression over all field sync positions
+  (Domesday86-style TBC), then **reweights**: drop points whose residual
+  exceeds 3× a MAD-derived scale and refit, so a few noise-corrupted
+  bottom-row tips can't slant the field. Plain OLS is not robust; the
+  reweighting is what makes it safe on-by-default.
+- **SmartDOC** (`use_smart_doc`, `smart_doc_spatial_weight`): dropout
+  concealment blends the spatial mean of adjacent good lines with the
+  previous-field pixel (weight `smart_doc_spatial_weight`), instead of
+  substituting the previous field wholesale.
+
+**Supporting modules**: `metrics` (PSNR, gradient correlation for
+frame-fidelity scoring) and `impairments` (multipath, burst dropout,
+slow fade, impulsive noise) drive `examples/weak_signal_sweep.rs`, which
+reports a σ-cliff per demod across every impairment profile.
+
+**Optional neural restoration** (`neural-vsr` feature — deliberately
+**not** in default cargo features, so ONNX Runtime is never forced on
+consumers): `neural::NeuralRestorer` runs a small quantized temporal
+denoiser (`models/temporal_quantized_trained.onnx`, ~13 KB) over the
+reconstructed luma field via `ort`, with a CoreML execution provider for
+the Apple Neural Engine / GPU and a carried hidden state for temporal
+context. `models/train_temporal.py` generates the synthetic
+FM/AWGN/dot-crawl training data. It is wired as an explicit
+`with_neural_restorer` builder rather than a `::new` default — the
+constructor never does disk I/O — and its fidelity tradeoff (temporal
+smoothing at the cost of spatial GCOR) is documented in `ROADMAP.md`.

@@ -19,7 +19,12 @@ pub fn add_multipath(iq: &mut [Complex<f32>], echoes: &[(usize, f32, f32, f32)],
 
 /// Clamps the signal to pure AWGN (burst dropout) for the specified runs.
 /// `runs` is a list of (start_index, length).
-pub fn add_burst_dropouts(iq: &mut [Complex<f32>], runs: &[(usize, usize)], sigma: f32, seed: &mut u64) {
+pub fn add_burst_dropouts(
+    iq: &mut [Complex<f32>],
+    runs: &[(usize, usize)],
+    sigma: f32,
+    seed: &mut u64,
+) {
     for &(start, len) in runs {
         let end = (start + len).min(iq.len());
         for z in &mut iq[start..end] {
@@ -44,7 +49,12 @@ pub fn add_slow_fade(iq: &mut [Complex<f32>], sample_rate: f32, frequency_hz: f3
 /// Randomly injects high-amplitude spikes to simulate motor/ESC spark noise.
 /// `probability` (0.0 to 1.0) is the chance per sample of a spike occurring.
 /// `amplitude` is the maximum magnitude of the spike.
-pub fn add_impulsive_noise(iq: &mut [Complex<f32>], probability: f32, amplitude: f32, seed: &mut u64) {
+pub fn add_impulsive_noise(
+    iq: &mut [Complex<f32>],
+    probability: f32,
+    amplitude: f32,
+    seed: &mut u64,
+) {
     for z in iq.iter_mut() {
         let rand_val = ((crate::synthetic::gaussian_noise(seed) + 6.0) / 12.0).clamp(0.0, 1.0);
         if rand_val < probability {
