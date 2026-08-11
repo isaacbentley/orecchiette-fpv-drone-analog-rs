@@ -31,14 +31,14 @@ A high-performance Rust crate for detecting analog FPV drone video signals using
 Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = "0.2.0"
+orecchiette-fpv-drone-analog-rs = "0.2.1"
 num-complex = "0.4"
 ```
 
 To enable the optional GPU-accelerated wideband sweep:
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = { version = "0.2.0", features = ["gpu"] }
+orecchiette-fpv-drone-analog-rs = { version = "0.2.1", features = ["gpu"] }
 ```
 ```rust
 use orecchiette_fpv_drone_analog_rs::detector::AnalogFpvDetector;
