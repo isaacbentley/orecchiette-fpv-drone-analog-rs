@@ -210,7 +210,7 @@ fn xorshift01(state: &mut u64) -> f32 {
 /// samples has mean 6, variance 1, so subtracting 6 gives an
 /// approximately N(0,1) value without pulling in `rand_distr`.
 #[inline]
-fn gaussian_noise(state: &mut u64) -> f32 {
+pub fn gaussian_noise(state: &mut u64) -> f32 {
     let mut sum = 0.0f32;
     for _ in 0..12 {
         sum += xorshift01(state);
