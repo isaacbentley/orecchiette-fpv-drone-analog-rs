@@ -228,6 +228,15 @@ pub struct FrameReconstructor {
     pub fm_deviation: f32,
     pub sample_rate: u32,
     pub debug_dump: bool,
+    pub use_matched_sync: bool,
+    pub use_line_locked_clock: bool,
+    pub use_smart_doc: bool,
+    pub smart_doc_spatial_weight: f32,
+
+    #[cfg(feature = "neural-vsr")]
+    pub neural_restorer: Option<crate::neural::NeuralRestorer>,
+    #[cfg(feature = "neural-vsr")]
+    pub hidden_state: Option<Vec<f32>>,
 
     /// Holds the complete RGB frame between calls so consecutive
     /// `reconstruct_frame_into` calls (each one capturing a single
@@ -378,6 +387,59 @@ fn filtfilt(data: &mut [f32], b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) {
 /// progressively in the lower field rows — the "slanting vertical line".
 ///
 /// Returns `None` if no pulse below `reject_above` is found in range.
+
+#[inline]
+fn matched_sync_center(
+    demod: &[f32],
+    center: f32,
+    search_radius: usize,
+    sync_width: usize,
+    reject_above: f32,
+) -> Option<f32> {
+    let c = center.round() as usize;
+    let half_template = sync_width;
+    let qtr_template = sync_width / 2;
+
+    let lo = c.saturating_sub(search_radius).max(half_template);
+    let hi = (c + search_radius).min(demod.len().saturating_sub(half_template));
+    if lo >= hi {
+        return None;
+    }
+
+    let mut max_corr = f32::NEG_INFINITY;
+    let mut best_idx = lo;
+    let mut best_pulse_val = 0.0;
+
+    for i in lo..hi {
+        let mut corr = 0.0;
+        let mut pulse_sum = 0.0;
+        // outer left (+1)
+        for j in (i - half_template)..(i - half_template + qtr_template) {
+            corr += demod[j];
+        }
+        // center negative pulse (-1)
+        for j in (i - half_template + qtr_template)..(i + half_template - qtr_template) {
+            corr -= demod[j];
+            pulse_sum += demod[j];
+        }
+        // outer right (+1)
+        for j in (i + half_template - qtr_template)..(i + half_template) {
+            corr += demod[j];
+        }
+
+        if corr > max_corr {
+            max_corr = corr;
+            best_idx = i;
+            best_pulse_val = pulse_sum / sync_width as f32;
+        }
+    }
+
+    if best_pulse_val >= reject_above {
+        return None;
+    }
+    Some(best_idx as f32)
+}
+
 #[inline]
 fn robust_sync_tip_center(
     demod: &[f32],
@@ -481,6 +543,16 @@ impl FrameReconstructor {
             fm_deviation,
             sample_rate,
             debug_dump,
+            use_matched_sync: false,
+            use_line_locked_clock: false,
+            use_smart_doc: false,
+            smart_doc_spatial_weight: 0.5,
+
+            #[cfg(feature = "neural-vsr")]
+            neural_restorer: None,
+            #[cfg(feature = "neural-vsr")]
+            hidden_state: None,
+
             field_buf: vec![0u32; width * height],
             field_parity: 0,
             prev_frame_tbc: vec![0.0; field_pixels],
@@ -592,6 +664,35 @@ impl FrameReconstructor {
         } else {
             crate::types::SignalType::AnalogVideoNtsc
         }
+    }
+
+    pub fn with_matched_sync(mut self, enable: bool) -> Self {
+        self.use_matched_sync = enable;
+        self
+    }
+
+    pub fn with_line_locked_clock(mut self, enable: bool) -> Self {
+        self.use_line_locked_clock = enable;
+        self
+    }
+
+    pub fn with_smart_doc(mut self, enable: bool, spatial_weight: f32) -> Self {
+        self.use_smart_doc = enable;
+        self.smart_doc_spatial_weight = spatial_weight.clamp(0.0, 1.0);
+        self
+    }
+
+    #[cfg(feature = "neural-vsr")]
+    pub fn with_neural_restorer(mut self, enabled: bool, use_gpu: bool) -> Self {
+        if enabled {
+            match crate::neural::NeuralRestorer::new("models/temporal_quantized_trained.onnx", use_gpu) {
+                Ok(restorer) => self.neural_restorer = Some(restorer),
+                Err(e) => log::error!("Failed to load neural restorer: {}", e),
+            }
+        } else {
+            self.neural_restorer = None;
+        }
+        self
     }
 
     pub fn reconstruct_frame(&mut self, demod_data: &[f32]) -> Option<(Vec<u32>, usize)> {
@@ -708,15 +809,27 @@ impl FrameReconstructor {
                 // (see `robust_sync_tip_center`); the two-pass extraction
                 // below validates every tip against the median period, so
                 // the anchor needs no extra smoothing.
-                first_sync_center = robust_sync_tip_center(
-                    demod_data,
-                    (skip_lines + self.samples_per_line) as f32,
-                    self.samples_per_line,
-                    porch_radius,
-                    ma_win,
-                    v_sync_threshold * 0.8,
-                )
-                .unwrap_or((skip_lines + self.samples_per_line) as f32);
+                let h_sync_width = (crate::vbi::consts::H_SYNC_WIDTH_S as f32 * self.sample_rate as f32).round() as usize;
+                let maybe_sync = if self.use_matched_sync {
+                    matched_sync_center(
+                        demod_data,
+                        (skip_lines + self.samples_per_line) as f32,
+                        self.samples_per_line,
+                        h_sync_width,
+                        v_sync_threshold * 0.8,
+                    )
+                } else {
+                    robust_sync_tip_center(
+                        demod_data,
+                        (skip_lines + self.samples_per_line) as f32,
+                        self.samples_per_line,
+                        porch_radius,
+                        ma_win,
+                        v_sync_threshold * 0.8,
+                    )
+                };
+                first_sync_center =
+                    maybe_sync.unwrap_or((skip_lines + self.samples_per_line) as f32);
             } else {
                 first_sync_center = 0.0; // unused: the length check below returns None first
             }
@@ -754,15 +867,27 @@ impl FrameReconstructor {
                         break;
                     }
 
-                    // Brightness-invariant tip centre near `expected`.
-                    match robust_sync_tip_center(
-                        demod_data,
-                        expected,
-                        sync_window,
-                        porch_radius,
-                        ma_win,
-                        v_sync_threshold * 0.8,
-                    ) {
+                    let h_sync_width = (crate::vbi::consts::H_SYNC_WIDTH_S as f32 * self.sample_rate as f32).round() as usize;
+                    let maybe_measured = if self.use_matched_sync {
+                        matched_sync_center(
+                            demod_data,
+                            expected,
+                            sync_window,
+                            h_sync_width,
+                            v_sync_threshold * 0.8,
+                        )
+                    } else {
+                        robust_sync_tip_center(
+                            demod_data,
+                            expected,
+                            sync_window,
+                            porch_radius,
+                            ma_win,
+                            v_sync_threshold * 0.8,
+                        )
+                    };
+
+                    match maybe_measured {
                         // Sanity: reject a tip that landed too far from
                         // where the constant period predicts (noise / a
                         // wrong feature); interpolate it later instead.
@@ -779,48 +904,64 @@ impl FrameReconstructor {
             }
         }
 
-        // Pass 2: Compute median line period from valid intervals,
-        // then use period history buffer for cross-frame stabilisation.
-        let mut intervals: Vec<f32> = Vec::new();
-        for w in raw_sync_positions.windows(2) {
-            if let (Some(a), Some(b)) = (w[0], w[1]) {
-                let interval = b - a;
-                let nominal = self.samples_per_line as f32;
-                if interval > nominal * 0.95 && interval < nominal * 1.05 {
-                    intervals.push(interval);
-                }
+        // Pass 2: Compute line period using Ordinary Least Squares (OLS) regression over the field.
+        // This provides sub-pixel period accuracy and is robust against single-point quantization noise
+        // (the standard Time Base Corrector approach, e.g. Domesday86).
+        let mut sum_x = 0.0f64;
+        let mut sum_y = 0.0f64;
+        let mut sum_xx = 0.0f64;
+        let mut sum_xy = 0.0f64;
+        let mut count = 0f64;
+
+        for (i, &maybe_pos) in raw_sync_positions.iter().enumerate() {
+            if let Some(pos) = maybe_pos {
+                let x = i as f64;
+                let y = pos as f64;
+                sum_x += x;
+                sum_y += y;
+                sum_xx += x * x;
+                sum_xy += x * y;
+                count += 1.0;
             }
         }
-
-        if !intervals.is_empty() {
-            intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let frame_median = intervals[intervals.len() / 2];
-
-            // Push this frame's median into the history buffer (max 8)
-            if self.period_history.len() >= 8 {
-                self.period_history.remove(0);
-            }
-            self.period_history.push(frame_median);
-
-            // Use the median of the history buffer as the stabilised
-            // line period. After 3-5 frames this is rock-solid.
-            let mut sorted_history = self.period_history.clone();
-            sorted_history.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let stabilised_period = sorted_history[sorted_history.len() / 2];
-            self.line_period = stabilised_period;
-
-            // Debug telemetry only. This is a library — writing to the
-            // caller's stdout (the `fpv_viewer` TUI renders there) would
-            // corrupt their output, so gate on `debug_dump` like the
-            // `[SYNC RESID]` print below, not on `!has_prev`.
-            if self.debug_dump && !self.has_prev {
-                let _ = writeln!(
-                    std::io::stdout(),
-                    "TBC: median line period = {:.3} samples ({} intervals, {} history frames)",
-                    self.line_period,
-                    intervals.len(),
-                    self.period_history.len()
-                );
+        
+        if count > 10.0 {
+            let denom = count * sum_xx - sum_x * sum_x;
+            if denom.abs() > 1e-6 {
+                let ols_slope = (count * sum_xy - sum_x * sum_y) / denom;
+                
+                let nominal = self.samples_per_line as f32;
+                if ols_slope > (nominal * 0.95) as f64 && ols_slope < (nominal * 1.05) as f64 {
+                    let frame_period = ols_slope as f32;
+                    
+                    // Push this frame's period into the history buffer (max 8)
+                    if self.period_history.len() >= 8 {
+                        self.period_history.remove(0);
+                    }
+                    self.period_history.push(frame_period);
+        
+                    // Use the median of the history buffer as the stabilised line period
+                    let mut sorted_history = self.period_history.clone();
+                    sorted_history.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let stabilised_period = sorted_history[sorted_history.len() / 2];
+                    
+                    self.line_period = if self.use_line_locked_clock {
+                        stabilised_period
+                    } else {
+                        frame_period
+                    };
+        
+                    // Debug telemetry only.
+                    if self.debug_dump && !self.has_prev {
+                        let _ = writeln!(
+                            std::io::stdout(),
+                            "TBC: OLS line period = {:.3} samples ({} points, {} history frames)",
+                            self.line_period,
+                            count as usize,
+                            self.period_history.len()
+                        );
+                    }
+                }
             }
         }
 
@@ -1277,6 +1418,10 @@ impl FrameReconstructor {
         );
         let notch_enabled = self.notch_enabled;
         let motion_threshold = TEMPORAL_MOTION_THRESHOLD * radians_per_volt;
+        let use_smart_doc = self.use_smart_doc;
+        let current_frame_tbc_ref = &current_frame_tbc;
+        let current_frame_doc_ref = &current_frame_doc;
+
         current_frame_y
             .par_chunks_mut(line_width)
             .enumerate()
@@ -1286,15 +1431,44 @@ impl FrameReconstructor {
                 // Work in place on this row's output chunk — the row
                 // used to copy into a per-row `Vec` and back, an
                 // allocation and two copies per row for nothing.
-                y_out.copy_from_slice(&current_frame_tbc[offset..offset + line_width]);
+                y_out.copy_from_slice(&current_frame_tbc_ref[offset..offset + line_width]);
                 let y_line = y_out;
-                let doc_mask = &current_frame_doc[offset..offset + line_width];
+                let doc_mask = &current_frame_doc_ref[offset..offset + line_width];
 
                 // 1. DOC replacement from the previous field.
                 if has_prev {
                     for col in 0..line_width {
                         if doc_mask[col] {
-                            y_line[col] = prev_frame_tbc[offset + col];
+                            if use_smart_doc {
+                                let mut spatial_val = 0.0;
+                                let mut spatial_count = 0.0;
+                                if row > 0 {
+                                    let up_off = (row - 1) * line_width;
+                                    if !current_frame_doc_ref[up_off + col] {
+                                        spatial_val += current_frame_tbc_ref[up_off + col];
+                                        spatial_count += 1.0;
+                                    }
+                                }
+                                if row + 1 < rows_to_process {
+                                    let down_off = (row + 1) * line_width;
+                                    if !current_frame_doc_ref[down_off + col] {
+                                        spatial_val += current_frame_tbc_ref[down_off + col];
+                                        spatial_count += 1.0;
+                                    }
+                                }
+                                let temporal_val = prev_frame_tbc[offset + col];
+                                if spatial_count > 0.0 {
+                                    let spatial_mean = spatial_val / spatial_count;
+                                    let w_spatial = self.smart_doc_spatial_weight;
+                                    let w_temporal = 1.0 - w_spatial;
+                                    y_line[col] =
+                                        spatial_mean * w_spatial + temporal_val * w_temporal;
+                                } else {
+                                    y_line[col] = temporal_val;
+                                }
+                            } else {
+                                y_line[col] = prev_frame_tbc[offset + col];
+                            }
                         }
                     }
                 }
@@ -1432,6 +1606,33 @@ impl FrameReconstructor {
         // to *both* parities (current and complementary) when it
         // pulls the complementary parity in.
         self.field_buf.copy_from_slice(frame);
+
+        #[cfg(feature = "neural-vsr")]
+        {
+            if self.has_prev { // Only run if we have a valid previous field to form a complete frame
+                if let Some(restorer) = &mut self.neural_restorer {
+                    let mut luma = vec![0.0f32; self.width * self.height];
+                    for (i, p) in frame.iter().enumerate() {
+                        let r = (p >> 16) & 0xFF;
+                        luma[i] = (r as f32) / 255.0;
+                    }
+                    
+                    let luma_in = luma.clone();
+                    match restorer.process_frame_luma(self.width, self.height, &luma_in, self.hidden_state.as_deref(), &mut luma) {
+                        Ok(new_hidden) => {
+                            self.hidden_state = Some(new_hidden);
+                            for (i, y) in luma.iter().enumerate() {
+                                let c = (y.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                                frame[i] = 0xFF000000 | (c << 16) | (c << 8) | c;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Neural restorer failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
         // Parity of the field just rendered, captured before the toggle:
         // the FieldMeta below describes THIS field, and reading
         // `self.field_parity` after `^= 1` stamped every history entry
