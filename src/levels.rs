@@ -148,6 +148,39 @@ fn mad(values: &[f32], center: f32) -> f32 {
     median(&mut abs_devs)
 }
 
+/// Envelope-based CNR estimate for a constant-envelope (FM) capture,
+/// in dB. FM carries no amplitude information, so the envelope of the
+/// (band-limited) signal is carrier + noise only: for a Rice-
+/// distributed envelope at moderate-to-high CNR, `mean(|z|)² /
+/// (2·var(|z|))` recovers `A²/(2σ²)` — the CNR in the filtered
+/// bandwidth. Accurate to ~1–2 dB above ≈5 dB CNR; below that the Rice
+/// small-signal regime biases it optimistic, which is fine for its
+/// job: a cheap link-quality meter to drive adaptive processing
+/// (integration depth, denoise blending) and telemetry. Returns `None`
+/// on degenerate input (too short, zero/non-finite variance).
+pub fn estimate_cnr_db(iq: &[num_complex::Complex<f32>]) -> Option<f32> {
+    if iq.len() < 256 {
+        return None;
+    }
+    // Single pass, one sqrt per sample; f64 accumulators keep the
+    // sum-of-squares variance form safe from cancellation even at high
+    // CNR (envelope nearly constant).
+    let n = iq.len() as f64;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for z in iq {
+        let m = z.norm() as f64;
+        sum += m;
+        sum_sq += m * m;
+    }
+    let mean = sum / n;
+    let var = (sum_sq / n - mean * mean).max(0.0);
+    if !(mean.is_finite() && var.is_finite()) || var <= 0.0 || mean <= 0.0 {
+        return None;
+    }
+    Some((10.0 * (mean * mean / (2.0 * var)).log10()) as f32)
+}
+
 /// Estimate absolute sync-tip / blanking levels. A thin wrapper over
 /// [`estimate_fm_deviation`] for callers that only need the levels
 /// (e.g. a reconstructor fallback path), not the Hz conversion.
@@ -417,6 +450,41 @@ mod tests {
             est.deviation_hz,
             err * 100.0
         );
+    }
+
+    #[test]
+    fn envelope_cnr_estimate_tracks_true_cnr() {
+        // Unit carrier + complex AWGN at known per-component sigma:
+        // true CNR = 1/(2·sigma²).
+        let mut seed = 0xFEEDu64;
+        let gauss = |s: &mut u64| -> f32 {
+            let mut acc = 0.0f32;
+            for _ in 0..12 {
+                *s ^= *s << 13;
+                *s ^= *s >> 7;
+                *s ^= *s << 17;
+                acc += (*s >> 11) as f32 / (1u64 << 53) as f32;
+            }
+            acc - 6.0
+        };
+        for &(sigma, true_db) in &[(0.1f32, 16.99f32), (0.2, 10.97), (0.35, 6.1)] {
+            let iq: Vec<num_complex::Complex<f32>> = (0..200_000)
+                .map(|i| {
+                    let phase = 0.37 * i as f32; // arbitrary FM-ish rotation
+                    num_complex::Complex::from_polar(1.0, phase)
+                        + num_complex::Complex::new(
+                            sigma * gauss(&mut seed),
+                            sigma * gauss(&mut seed),
+                        )
+                })
+                .collect();
+            let est = estimate_cnr_db(&iq).expect("estimate expected");
+            assert!(
+                (est - true_db).abs() < 1.5,
+                "sigma={sigma}: estimated {est:.1} dB vs true {true_db:.1} dB"
+            );
+        }
+        assert!(estimate_cnr_db(&[]).is_none());
     }
 
     #[test]

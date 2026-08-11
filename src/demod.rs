@@ -143,6 +143,127 @@ impl Deemphasis {
     }
 }
 
+/// Streaming PLL FM demodulator — the coherent-tracking alternative to
+/// [`fm_demod`]'s per-sample discriminator, for **threshold extension**
+/// on weak signals.
+///
+/// A discriminator demodulates every sample pair independently, so each
+/// noise-induced origin encirclement of the composite phasor lands in
+/// the output as a full ±2π "click" — the impulsive noise that defines
+/// the FM threshold cliff. A PLL instead tracks the carrier phase
+/// through a second-order (PI) loop; the loop's inertia rides through
+/// noise events whose energy lies outside the closed-loop bandwidth,
+/// which is what buys the classic couple of dB of threshold extension
+/// (satellite receivers used exactly this for weak FM video).
+///
+/// The output convention matches [`fm_demod`] exactly — instantaneous
+/// frequency in radians/sample (`freq + kp·e`, the loop's tracked
+/// frequency plus the proportional correction) — so it is a drop-in
+/// upstream of [`Deemphasis`] and the reconstructor.
+///
+/// ## Tuning and honest limits
+///
+/// `loop_bw_hz` (the loop natural frequency) trades threshold
+/// extension (narrower = more) against modulation-tracking error
+/// (narrower = the phase error `e` grows on fast video edges, and past
+/// ±π the loop cycle-slips — the very artifact we're avoiding). A
+/// discrete PI loop also needs a healthy sample-rate-to-loop-bandwidth
+/// ratio: the constructor clamps the normalised natural frequency to
+/// ≤ 0.5 rad/sample for stability, so at low decode rates the
+/// requested bandwidth may be reduced. Whether the PLL beats the
+/// discriminator for a given `(sample_rate, deviation, CNR)` is an
+/// empirical question — `examples/weak_signal_sweep.rs` measures
+/// exactly that, and the viewer keeps the discriminator as its default
+/// until the numbers say otherwise for your configuration.
+///
+/// [`Self::phase_error_rms`] exposes an EMA of the phase-detector
+/// error as a free lock-quality/CNR telemetry signal.
+pub struct PllFmDemod {
+    /// NCO phasor (cos, sin of current phase), Newton-renormalised.
+    nco: Complex<f32>,
+    /// PI integrator state: tracked frequency, radians/sample.
+    freq: f32,
+    kp: f32,
+    ki: f32,
+    /// Clamp on `|freq|` (radians/sample) — 1.25× the stated peak
+    /// deviation, so noise can't run the integrator away during deep
+    /// fades.
+    freq_max: f32,
+    /// EMA of the squared phase-detector error (lock telemetry).
+    err_sq_ema: f32,
+}
+
+impl PllFmDemod {
+    /// `loop_bw_hz` is the loop natural frequency (see the struct doc
+    /// for the trade); `max_deviation_hz` bounds the frequency
+    /// integrator. Panics on zero/non-finite parameters, matching
+    /// [`Deemphasis::new`]'s rationale.
+    pub fn new(sample_rate: u32, loop_bw_hz: f32, max_deviation_hz: f32) -> Self {
+        assert!(sample_rate > 0, "PllFmDemod: sample_rate must be > 0");
+        assert!(
+            loop_bw_hz.is_finite() && loop_bw_hz > 0.0,
+            "PllFmDemod: loop_bw_hz must be finite and > 0"
+        );
+        assert!(
+            max_deviation_hz.is_finite() && max_deviation_hz > 0.0,
+            "PllFmDemod: max_deviation_hz must be finite and > 0"
+        );
+        let fs = sample_rate as f32;
+        // Normalised natural frequency, clamped for discrete-loop
+        // stability (see struct doc).
+        let wn = (2.0 * std::f32::consts::PI * loop_bw_hz / fs).min(0.5);
+        let zeta = std::f32::consts::FRAC_1_SQRT_2;
+        Self {
+            nco: Complex::new(1.0, 0.0),
+            freq: 0.0,
+            kp: 2.0 * zeta * wn,
+            ki: wn * wn,
+            freq_max: 2.0 * std::f32::consts::PI * max_deviation_hz / fs * 1.25,
+            err_sq_ema: 0.0,
+        }
+    }
+
+    /// Demodulate a chunk, appending instantaneous-frequency samples
+    /// (radians/sample) into `out` after clearing it. Output length
+    /// equals input length (the loop is stateful across calls, so no
+    /// carry sample is needed — chunk boundaries are seamless).
+    pub fn process_into(&mut self, iq: &[Complex<f32>], out: &mut Vec<f32>) {
+        out.clear();
+        out.reserve(iq.len());
+        for &z in iq {
+            // Phase detector: full atan2 (not a small-angle shortcut) so
+            // large transient errors still steer the loop the right way.
+            let e = (z * self.nco.conj()).arg();
+            self.freq = (self.freq + self.ki * e).clamp(-self.freq_max, self.freq_max);
+            let inst = self.freq + self.kp * e;
+            out.push(inst);
+            // Advance the NCO by the instantaneous estimate.
+            let (s, c) = inst.sin_cos();
+            self.nco *= Complex::new(c, s);
+            let mag_sq = self.nco.re * self.nco.re + self.nco.im * self.nco.im;
+            let inv = 0.5 * (3.0 - mag_sq);
+            self.nco.re *= inv;
+            self.nco.im *= inv;
+            // Lock telemetry (~256-sample time constant).
+            self.err_sq_ema += (e * e - self.err_sq_ema) / 256.0;
+        }
+    }
+
+    /// RMS phase-detector error (radians) over the last ~256 samples —
+    /// a free lock-quality / CNR proxy (small when locked and clean,
+    /// approaching the ~1.8 rad RMS of uniform noise when unlocked).
+    pub fn phase_error_rms(&self) -> f32 {
+        self.err_sq_ema.max(0.0).sqrt()
+    }
+
+    /// Clear all loop state (retune / rebuild).
+    pub fn reset(&mut self) {
+        self.nco = Complex::new(1.0, 0.0);
+        self.freq = 0.0;
+        self.err_sq_ema = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +420,89 @@ mod tests {
             after_reset, fresh_data,
             "reset should behave like a fresh instance"
         );
+    }
+
+    // ── PllFmDemod ─────────────────────────────────────────────────
+
+    /// On a clean, modest-deviation FM tone the PLL must agree with the
+    /// discriminator after settling — same output convention, same
+    /// scale.
+    #[test]
+    fn pll_matches_discriminator_on_clean_signal() {
+        let fs = 15_360_000u32;
+        let n = 60_000;
+        // 1 MHz deviation, 100 kHz sinusoidal modulation.
+        let dev = 2.0 * PI * 1.0e6 / fs as f32;
+        let fm = 100_000.0 / fs as f32;
+        let mut phase = 0.0f32;
+        let iq: Vec<Complex<f32>> = (0..n)
+            .map(|i| {
+                let inst = dev * (2.0 * PI * fm * i as f32).sin();
+                phase += inst;
+                Complex::from_polar(1.0, phase)
+            })
+            .collect();
+
+        let disc = fm_demod(&iq);
+        let mut pll = PllFmDemod::new(fs, 2.5e6, 5.0e6);
+        let mut out = Vec::new();
+        pll.process_into(&iq, &mut out);
+
+        // Compare over the settled tail (PLL output[i] estimates the
+        // frequency advancing INTO sample i; disc[i-1] measures the
+        // same transition).
+        let skip = 10_000;
+        let mut err = 0.0f64;
+        let mut sig = 0.0f64;
+        for i in skip..n {
+            let d = (out[i] - disc[i - 1]) as f64;
+            err += d * d;
+            sig += (disc[i - 1] as f64).powi(2);
+        }
+        let rel = (err / sig.max(1e-12)).sqrt();
+        assert!(
+            rel < 0.05,
+            "PLL diverges from discriminator on clean signal: {:.3} relative RMS",
+            rel
+        );
+        assert!(
+            pll.phase_error_rms() < 0.2,
+            "lock telemetry should read near zero on a clean signal, got {}",
+            pll.phase_error_rms()
+        );
+    }
+
+    /// Chunked processing must equal one-shot processing bit-for-bit —
+    /// the loop state carries across chunk boundaries with no seams.
+    #[test]
+    fn pll_streaming_matches_one_shot() {
+        let fs = 15_360_000u32;
+        let iq: Vec<Complex<f32>> = (0..4000)
+            .map(|i| Complex::from_polar(1.0, 0.3 * i as f32 + 0.05 * (i as f32 * 0.01).sin()))
+            .collect();
+        let mut one_shot = Vec::new();
+        PllFmDemod::new(fs, 2.5e6, 5.0e6).process_into(&iq, &mut one_shot);
+
+        let mut streamed = Vec::new();
+        let mut pll = PllFmDemod::new(fs, 2.5e6, 5.0e6);
+        let mut part = Vec::new();
+        for chunk in iq.chunks(700) {
+            pll.process_into(chunk, &mut part);
+            streamed.extend_from_slice(&part);
+        }
+        assert_eq!(one_shot, streamed);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample_rate")]
+    fn pll_rejects_zero_sample_rate() {
+        PllFmDemod::new(0, 2.5e6, 5.0e6);
+    }
+
+    #[test]
+    #[should_panic(expected = "loop_bw_hz")]
+    fn pll_rejects_bad_loop_bw() {
+        PllFmDemod::new(15_360_000, 0.0, 5.0e6);
     }
 
     #[test]

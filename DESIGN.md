@@ -107,11 +107,8 @@ The harmonic-comb + cepstrum checks (items 6–7 above) only ever see one FFT's 
 
 - **Sample Rate**: Minimum 1 MSPS for sync pulse detection at baseband. ≥ 20 MSPS recommended for wideband scanning. The B210 over USB 3.0 runs clean at 25 MSPS; at 50 MSPS the USB transport saturates (~400 MB/s), producing intermittent hardware FIFO overflows. 25 MSPS is the recommended maximum for the B210.
 - **Packet Size**: 262,144 samples per packet (at 100 MSPS = 2.6 ms). Larger packets improve PAL/NTSC discrimination.
-- **Bands**: `bands.rs` carries channel tables (used for display/labeling and `--channel` resolution, not detection) for 1.2 GHz, 3.3 GHz, and the 5.3–5.9 GHz bands — A/B/E/F/R plus Lowband L (5333 + 40 MHz grid) and Boscam D (5362 + 37 MHz grid). The 6–7 GHz evasion band is scanned by the viewer's UA sweep but has no channel table (detections there report raw frequency).
-- **Scan Dwell**: 10 ms per hop in the auto-scanner — sized for USRP PLL settle (~2 ms) + one full 65536-sample chunk (~2.6 ms at 25 MSPS). The detector only needs a single chunk per hop. All remaining duplicate-frequency packets are skipped to prevent queue buildup.
-- **Scan Modes** (via `fpv-viewer --scan-mode`):
-  - `58` (default): 5.8 GHz FPV band only (5.645–5.945 GHz). ~16 hops at 25 MSPS, ~160 ms per sweep.
-  - `ua` (Ukraine): covers 1.2 GHz (1080–1360 MHz), 3.3 GHz (2870–4080 MHz), 5.3–5.9 GHz (5300–5945 MHz), and 6–7 GHz (6100–7300 MHz). ~100+ hops, ~1–2 s per sweep. Modelled after the Chuyka 3.0 detector and PEAK THOR T67 VTX evasion band used in the Ukraine theatre (2024–2025).
+- **Bands**: `bands.rs` carries channel tables (used for display/labeling and `--channel` resolution, not detection) for 1.2 GHz, 3.3 GHz, and the 5.3–5.9 GHz bands — A/B/E/F/R plus Lowband L (5333 + 40 MHz grid) and Boscam D (5362 + 37 MHz grid).
+- **Scan Dwell**: 10 ms per hop in the auto-scanner, which sweeps the 5.8 GHz FPV band (5.645–5.945 GHz; ~16 hops at 25 MSPS, ~160 ms per sweep) — sized for USRP PLL settle (~2 ms) + one full 65536-sample chunk (~2.6 ms at 25 MSPS). The detector only needs a single chunk per hop. All remaining duplicate-frequency packets are skipped to prevent queue buildup.
 
 ## 6. Known Follow-ups & Historical Notes
 
@@ -385,6 +382,41 @@ single- and two-signal wideband captures. All skip gracefully with no
 adapter — and CI's lavapipe backend is a different code path from
 Metal, so these are only fully conclusive when run locally on real
 hardware.
+
+## 11a. PLL FM Demodulation (Threshold Extension)
+
+`demod::PllFmDemod` is a second-order (PI) phase-locked demodulator —
+the coherent-tracking alternative to the per-sample discriminator, for
+weak-signal decode. A discriminator reports every noise-induced origin
+encirclement as a ±2π click; the loop's inertia rides through noise
+outside its closed-loop bandwidth. Output convention matches
+`fm_demod` (radians/sample), so it drops in upstream of `Deemphasis`
+and the reconstructor; `phase_error_rms()` is free lock/CNR telemetry.
+
+**Measured** (`examples/weak_signal_sweep.rs`, NTSC bars, 5 MHz
+deviation, 1 MHz loop): at 25 MSPS the PLL gains +6–8 dB demod MSE
+across the threshold region and reconstruction survives a full σ-step
+deeper (discriminator dies at σ=1.1, PLL still produces frames there);
+at 61.44 MSPS, +13–17 dB with comparable sync. At 15.36 MSPS the loop
+**cannot track** a 5 MHz deviation (the constructor's ωₙ ≤ 0.5
+rad/sample stability clamp caps loop bandwidth at ~fs/4π) and produces
+unusable output — which is why fpv-viewer keeps the discriminator as
+its default and offers `--demod pll` with a ≥ 25 MSPS recommendation.
+
+`levels::estimate_cnr_db` complements this: on a constant-envelope
+signal the envelope is carrier + noise only, so Rice statistics
+(`mean²/(2·var)` of `|z|`) give a ~1–2 dB-accurate CNR meter above
+≈5 dB — the hook for future adaptive processing (integration depth,
+denoise aggressiveness).
+
+**FMFB (frequency-compressive feedback) is the known next rung** —
+deviation compression inside the loop lets a genuinely narrow IF
+filter precede demodulation, historically worth ~3–5 dB beyond a PLL.
+Its digital obstacle is in-loop group delay: the 63-tap linear-phase
+FIR is unusable inside a feedback loop (31-sample delay collapses the
+stable loop bandwidth), so an FMFB prototype needs a short IIR in-loop
+filter and careful stability work. Revisit if PLL-at-25-MSPS headroom
+proves insufficient in the field.
 
 ## 11. Cross-Batch Spectral Integration
 

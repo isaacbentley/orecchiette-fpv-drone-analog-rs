@@ -9,12 +9,9 @@ This document provides a step-by-step technical walkthrough of how Orecchiette d
 Phase 1 handles the wideband IQ capture. The hardware-specific code lives in dedicated `SdrSource` implementation crates (`orecchiette-sdr-usrp-rs`, `orecchiette-sdr-hackrf-rs`, `sdr-aaronia-rs`, `orecchiette-sdr-file-rs`); the consumer — fpv-viewer-rs's `src/main.rs` — selects a backend at runtime and consumes the same `IqPacket` stream regardless of which one is feeding it.
 
 1.  **Multi-Band Orchestration & Auto-Scanning**:
-    - **Frequency Pool**: The system can scan a consolidated list of 100+ channels, including Band A, B, E (Boscam), F (FatShark), R (RaceBand), L (LowBand), D (Boscam D / "5.3G"), and the 1.2GHz/3.3GHz ranges.
+    - **Frequency Pool**: The system can scan a consolidated list of channels, including Band A, B, E (Boscam), F (FatShark), R (RaceBand), L (LowBand), and D (Boscam D / "5.3G").
     - **Tuning**: USRP (`orecchiette-sdr-usrp-rs`), HackRF (`orecchiette-sdr-hackrf-rs`), or Aaronia (`sdr-aaronia-rs`) hardware is tuned to each center frequency. Typical capture rates are 25 MSPS (USRP B2xx), 20 MSPS (HackRF, USB 2.0 ceiling), and a 61.44 MHz span (Aaronia); the 300 MHz-wide 5.8 GHz band is covered by frequency hopping, not one capture. The detector itself is rate-agnostic and handles captures up to 100 MSPS+.
-    - **Auto-Scanner & Fine-Tuning**: For SDRs with smaller bandwidths (e.g. 25 MSPS), a state machine continuously sweeps the bands. Once a signal is found, it automatically stops scanning and transitions to a fine-tuning mode to snap precisely to the center channel. If the signal is lost for more than 2 seconds, the scanner automatically resumes sweeping.
-    - **Scan Modes**: The fpv-viewer supports two scan modes:
-      - `--scan-mode 58` (default): standard 5.8 GHz FPV band (5.645–5.945 GHz).
-      - `--scan-mode ua`: Ukraine theatre — scans all confirmed analog video TX bands (1.2 GHz, 3.3 GHz, 5.3–5.9 GHz, 6–7 GHz) modelled after the Chuyka 3.0 detector and the PEAK THOR T67 VTX evasion band.
+    - **Auto-Scanner & Fine-Tuning**: For SDRs with smaller bandwidths (e.g. 25 MSPS), a state machine continuously sweeps the 5.8 GHz band (5.645–5.945 GHz). Once a signal is found, it automatically stops scanning and transitions to a fine-tuning mode to snap precisely to the center channel. If the signal is lost for more than 2 seconds, the scanner automatically resumes sweeping.
     - **Optimized Dwell**: The scan dwell is **10 ms per hop** — just enough for the USRP PLL to settle (~2 ms) and deliver one full 65536-sample chunk (~2.6 ms at 25 MSPS). The detector only needs a single chunk per hop to run the wideband DDC probe sweep. All remaining duplicate-frequency packets are skipped to prevent queue backlog.
     - **No Power Gating**: To maximize sensitivity for weak drone signals, all sync pulse correlation runs regardless of the raw RSSI power level. This guarantees that faint signals below the noise floor are still processed and detected.
 
@@ -98,7 +95,9 @@ The detector sweeps the entire capture bandwidth to find analog video signals at
 
 Once a signal is detected, full FM demodulation recovers the video content:
 
-12. **Quadrature Demodulation**:
+12. **Quadrature Demodulation** (or PLL — `demod::PllFmDemod` offers
+    measured threshold extension at ≥ 25 MSPS decode rates, selected in
+    fpv-viewer via `--demod pll`; see DESIGN.md §11a):
     - **The Math**: `arg(iq[n] × conj(iq[n-1]))` — phase difference between consecutive samples.
     - **Implementation**: exact scalar `f32::atan2` (via `Complex::arg`) per sample. The complex multiply + `conj` ahead of the atan2 auto-vectorises cleanly under `-O3` (it's the bulk of the work). The atan2 itself is intentionally NOT replaced with a polynomial approximation — `fast_math::atan2` was tried for edge-device throughput and reverted because image quality wins here: approximate kernels lose precision near ±π, exactly where high-deviation FM operates, and the resulting quadrant errors show up as click-noise sparkles in the reconstructed picture.
     - **Output**: A 1D stream of floating-point values representing the instantaneous frequency (brightness) of the video signal.
