@@ -379,6 +379,21 @@ def _grad_corr_np(a, b):
     return float((ax * bx).sum() / denom) if denom > 0 else 0.0
 
 
+def _inline_external_weights(path):
+    """Rewrite `path` so all tensor data lives inside the `.onnx` file,
+    removing any `.data` sidecar dependency (and the sidecar itself)."""
+    import onnx
+
+    model = onnx.load(path)  # resolves external data relative to `path`
+    onnx.save_model(model, path, save_as_external_data=False)
+    sidecar = path + ".data"
+    if os.path.exists(sidecar):
+        os.remove(sidecar)
+    if any(i.data_location == onnx.TensorProto.EXTERNAL for i in model.graph.initializer):
+        raise RuntimeError(f"{path} still references external data after inlining")
+    print(f"Inlined weights into {path} ({os.path.getsize(path)} bytes, self-contained)")
+
+
 def export_and_quantize(model, hidden_channels, quantize=True, keep_fp32=True):
     model.eval()
 
@@ -407,6 +422,15 @@ def export_and_quantize(model, hidden_channels, quantize=True, keep_fp32=True):
             "hidden_out": {2: "height", 3: "width"},
         },
     )
+
+    # Inline any externalised weights BEFORE anything downstream copies
+    # the graph. `torch.onnx.export` can split weights into a `.data`
+    # sidecar; a bare `.onnx` then references it by relative name, and
+    # shipping/renaming the graph alone yields a model that loads only if
+    # that exact sidecar sits beside it. That shipped a broken artifact
+    # once (ORT: "External data path does not exist"). A self-contained
+    # file is the only safe thing to hand to a consumer at this size.
+    _inline_external_weights(fp32_path)
 
     if not quantize:
         # Ship fp32 at the canonical path the Rust loads. If the export
