@@ -312,6 +312,49 @@ default via `--deemphasis-tau`, 0 to disable).
   many FPV cameras are effectively monochrome, and for those the
   notch deleted real luma detail around 3.58/4.43 MHz for nothing.
 
+### 9.1 Sync acquisition must not assume a signal scale
+
+Two independent parts of sync acquisition used to assume the demod
+output arrives at exactly its nominal scale and phase. Both failed the
+same way — not gracefully, but by losing *every* row of *every* field at
+once, which is far harder to diagnose than a gradual degradation.
+
+**Thresholds are measured, not assumed.** The V-sync test and the H-sync
+reject were fixed offsets from zero (`-0.3·rad_per_volt`, and `×0.8` of
+it). That is only correct if the carrier is centred, nothing changed the
+gain between the discriminator and here, and `fm_deviation` was
+estimated right. Deemphasis breaks it: at the default 0.75 µs — a
+~210 kHz single pole — the 4.7 µs sync pulse is attenuated enough that
+its tip no longer clears a threshold pinned to the un-deemphasised
+scale. Sync quality went from 0.98 to **0.00**. Both thresholds now come
+from the demod's own p2/p50 spread (`levels::robust_sync_threshold_at`,
+the construction §3's detector and `detect_video_standard` already use),
+so they follow whatever the upstream chain did. The nominal values
+remain as a fallback for slices with no measurable downward spread.
+
+**The pass-1 anchor is snapped to a real sync tip.** Neither source of
+the anchor is guaranteed to *be* one: the VBI parser reports
+`field_active_start`, a datum derived from the vertical-sync group, and
+the fallback path's own search is bounded by the same narrow window used
+per row. Measured against the reference captures, the anchor lands a
+consistent ~35 samples (≈2.3 µs at 15.36 MSPS) ahead of the first active
+line's tip — just outside pass 1's ±2 µs search. This survived only
+because partial overlap with the pulse still correlates well enough to
+be accepted, after which `cursor = measured` drags the tracker into
+alignment over the next few rows. That pull-in needs a crisp pulse:
+soften it and the early rows miss instead, and every miss advances the
+cursor by the *nominal* period. For NTSC that is 976 against a true
+976.23, so the window walks further off with each one and the field
+never recovers — NTSC lost all 240 rows this way, while PAL, whose
+nominal period is ~6× closer (983 vs 983.04), still limped in. Searching
+a full line width at the anchor removes the dependency entirely: row 0
+is locked as well as row 200.
+
+Both are covered by `sync_survives_deemphasis_gain_change`, which runs
+PAL and NTSC through the viewer's real deemphasis settings. Neither fix
+costs weak-signal performance — σ-cliffs in `weak_signal_sweep` are
+unchanged across all five impairment profiles.
+
 ## 10. Optional GPU Acceleration (`gpu` feature)
 
 §6's per-probe DDC mixer + FIR pass (`ddc_and_decimate`) is the wideband

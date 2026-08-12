@@ -120,13 +120,52 @@ pub(crate) fn median(values: &mut [f32]) -> f32 {
 /// a global minimum. Returns `None` when the slice is too short or has
 /// no downward spread (`p50 <= p2`) — i.e. nothing sync-like to find.
 pub(crate) fn robust_sync_threshold(smoothed: &[f32]) -> Option<f32> {
+    robust_sync_threshold_at(smoothed, 0.25)
+}
+
+/// [`robust_sync_threshold`] with an explicit position between the 2nd
+/// percentile and the median: `p2 + frac·(p50 − p2)`.
+///
+/// `frac` chooses how much of the tip→median span still counts as
+/// "sync". 0.25 is the crate's default detection test; the
+/// reconstructor uses a looser 0.40 when *rejecting* candidate H-sync
+/// tips, because there a false reject costs a whole line (the row gets
+/// interpolated) while a false accept is caught immediately afterwards
+/// by the line-period sanity check.
+///
+/// Callers needing more than one `frac` over the same slice should take
+/// the pair from [`robust_sync_levels`] once and interpolate directly —
+/// each call here re-decimates and re-partitions.
+pub(crate) fn robust_sync_threshold_at(smoothed: &[f32], frac: f32) -> Option<f32> {
+    let (p2, p50) = robust_sync_levels(smoothed)?;
+    Some(p2 + frac * (p50 - p2))
+}
+
+/// The `(p2, p50)` pair the sync thresholds interpolate between, taken
+/// on a 16×-decimated copy for speed — the same construction
+/// [`estimate_fm_deviation`] uses (see its algorithm notes).
+///
+/// Both order statistics come from one buffer: `select_nth` doesn't
+/// need sorted input, so the p2 partition can't corrupt the later median
+/// selection, and no defensive clone is needed.
+///
+/// `p50` is the median of everything in the slice, so it moves with
+/// picture content, not just blanking. That is tolerable because the
+/// span it defines has a floor: sync tip sits 40 IRE below blanking by
+/// standard, and the median of blanking-plus-picture can never fall
+/// below blanking, so `p50 − p2` cannot collapse even on a fully black
+/// scene. A bright scene widens the span instead, which loosens the
+/// reject — the safe direction, since an over-accepted tip is caught by
+/// the line-period sanity check while an over-rejected one silently
+/// costs a row.
+///
+/// Returns `None` when the slice is too short or has no downward spread
+/// (`p50 <= p2`) — nothing sync-like to find.
+pub(crate) fn robust_sync_levels(smoothed: &[f32]) -> Option<(f32, f32)> {
     let mut decimated: Vec<f32> = smoothed.iter().step_by(16).copied().collect();
     if decimated.len() < 16 {
         return None;
     }
-    // Both order statistics come from the same buffer: select_nth
-    // doesn't need sorted input, so the p2 partition can't corrupt the
-    // later median selection — no defensive clone needed.
     let p2_idx = (((decimated.len() as f32) * 0.02) as usize).min(decimated.len() - 1);
     decimated.select_nth_unstable_by(p2_idx, |a, b| {
         a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
@@ -136,7 +175,7 @@ pub(crate) fn robust_sync_threshold(smoothed: &[f32]) -> Option<f32> {
     if !(p2.is_finite() && p50.is_finite()) || p50 <= p2 {
         return None;
     }
-    Some(p2 + 0.25 * (p50 - p2))
+    Some((p2, p50))
 }
 
 /// Median absolute deviation around `center`.

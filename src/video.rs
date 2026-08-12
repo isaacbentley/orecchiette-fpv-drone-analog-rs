@@ -268,6 +268,10 @@ pub struct FrameReconstructor {
     /// "consumed = 1.66 M samples = half a frame's worth" on the
     /// first call was the direct symptom of that.
     pub field_buf: Vec<u32>,
+    /// Smoothed-demod scratch reused across frames by the per-frame
+    /// sync-threshold measurement, so the ~5 ms window it needs isn't
+    /// reallocated 50×/second.
+    sync_level_scratch: Vec<f32>,
     /// Which output row parity the next captured field renders into.
     /// Toggles 0 ↔ 1 on every successful `reconstruct_frame_into`
     /// call. NTSC's field-1-vs-field-2 distinction isn't explicitly
@@ -592,6 +596,7 @@ impl FrameReconstructor {
             #[cfg(feature = "neural-vsr")]
             neural_noise_level: 1.0,
 
+            sync_level_scratch: Vec::new(),
             field_buf: vec![0u32; width * height],
             field_parity: 0,
             prev_frame_tbc: vec![0.0; field_pixels],
@@ -771,9 +776,51 @@ impl FrameReconstructor {
 
         let fs = self.sample_rate as f32;
         let radians_per_volt = 2.0 * std::f32::consts::PI * self.fm_deviation / fs;
-        let v_sync_threshold = -0.3 * radians_per_volt;
         let window_len = self.samples_per_line;
         let ma_win = ((fs * 0.5e-6) as usize).max(1);
+
+        // ── Sync thresholds, measured from the signal itself ──────────
+        //
+        // These used to be fixed offsets from zero (`-0.3·rad_per_volt`,
+        // and `×0.8` of it for the H-sync reject), which silently
+        // assumed the demod output arrives at exactly the nominal scale
+        // — carrier centred, no gain change between the discriminator
+        // and here, and `fm_deviation` estimated correctly. Any of those
+        // being off shifts the sync tip relative to a threshold that
+        // does not follow it, and because *every* line is tested against
+        // the same fixed number, the failure is all-or-nothing: one
+        // frame decodes perfectly, and a slightly flatter one loses all
+        // 288 rows at once with no partial degradation to warn you.
+        //
+        // Deemphasis is the case that actually bit: at the default
+        // 0.75 µs (a ~210 kHz single pole) the 4.7 µs sync pulse is
+        // attenuated enough that its tip no longer clears a threshold
+        // pinned to the *un*-deemphasised scale — sync quality went
+        // straight from 0.98 to 0.00. Deriving both thresholds from the
+        // demod's own p2/p50 spread tracks whatever gain the upstream
+        // chain applied, which is the same construction the detector and
+        // `detect_video_standard` already use.
+        //
+        // The nominal values remain the fallback for slices with no
+        // measurable downward spread (too short, flat, or inverted).
+        let scan_len = ((fs * 5000e-6) as usize).min(demod_data.len());
+        crate::levels::moving_average_into(
+            &demod_data[..scan_len],
+            ma_win,
+            &mut self.sync_level_scratch,
+        );
+        // One decimate-and-partition for both thresholds: they differ
+        // only in where they sit between the same p2 and p50.
+        let sync_levels_pq = crate::levels::robust_sync_levels(&self.sync_level_scratch);
+        let at = |frac: f32, fallback: f32| {
+            sync_levels_pq.map_or(fallback, |(p2, p50)| p2 + frac * (p50 - p2))
+        };
+        let v_sync_threshold = at(0.25, -0.3 * radians_per_volt);
+        // Looser than the V-sync test for the reason given on
+        // `robust_sync_threshold_at`; 0.40 reproduces the tip→blanking
+        // position the old `h_sync_reject` had on a nominally scaled
+        // signal.
+        let h_sync_reject = at(0.40, -0.24 * radians_per_volt);
         let sync_window = (fs * 2.0e-6) as usize;
         // Back-porch reference window: wider than the ~4.7 µs sync pulse
         // so the max reaches the blanking level on both sides.
@@ -869,7 +916,7 @@ impl FrameReconstructor {
                         (skip_lines + self.samples_per_line) as f32,
                         self.samples_per_line,
                         h_sync_width,
-                        v_sync_threshold * 0.8,
+                        h_sync_reject,
                     )
                 } else {
                     robust_sync_tip_center(
@@ -878,7 +925,7 @@ impl FrameReconstructor {
                         self.samples_per_line,
                         porch_radius,
                         ma_win,
-                        v_sync_threshold * 0.8,
+                        h_sync_reject,
                     )
                 };
                 first_sync_center =
@@ -890,7 +937,57 @@ impl FrameReconstructor {
         if demod_data.len() < required_samples {
             return None;
         }
-        self.sync_phase = first_sync_center;
+
+        // Snap the anchor onto a real sync tip before pass 1 starts.
+        //
+        // Neither source of `first_sync_center` above is guaranteed to
+        // *be* a sync-tip centre: the VBI parser reports
+        // `field_active_start`, a datum derived from the vertical-sync
+        // group, and the fallback path's own tip search is bounded by
+        // the same narrow window used below. Measured against the
+        // synthetic reference captures, the anchor lands a consistent
+        // ~35 samples (≈2.3 µs at 15.36 MSPS) ahead of the first active
+        // line's tip — and pass 1 searches only ±`sync_window` (2 µs),
+        // so the true tip starts out *just* beyond reach.
+        //
+        // That was survivable only because a partial overlap with the
+        // pulse still correlates well enough to be accepted, after which
+        // `cursor = measured` drags the tracker into alignment over the
+        // next few rows. It is a pull-in that depends on the pulse being
+        // crisp: soften it (deemphasis) and the first rows miss instead,
+        // each miss advancing `cursor` by the *nominal* period, which
+        // for NTSC is 976 against a true 976.23 — so the window walks
+        // further off with every miss and the field never recovers.
+        // NTSC lost all 240 rows this way while PAL, whose nominal
+        // period is ~6× closer (983 vs 983.04), still limped in.
+        //
+        // Searching a full line width removes the dependency entirely:
+        // the anchor is placed on the tip rather than pulled towards it,
+        // so row 0 is locked as well as row 200. `saturating_sub` keeps
+        // the fallback (`None` → unchanged anchor) available for slices
+        // with nothing tip-like in range.
+        let anchor_search = (self.samples_per_line / 2).max(sync_window);
+        let h_sync_width =
+            (crate::vbi::consts::H_SYNC_WIDTH_S as f32 * self.sample_rate as f32).round() as usize;
+        let snapped = if self.use_matched_sync {
+            matched_sync_center(
+                demod_data,
+                first_sync_center,
+                anchor_search,
+                h_sync_width,
+                h_sync_reject,
+            )
+        } else {
+            robust_sync_tip_center(
+                demod_data,
+                first_sync_center,
+                anchor_search,
+                porch_radius,
+                ma_win,
+                h_sync_reject,
+            )
+        };
+        self.sync_phase = snapped.unwrap_or(first_sync_center);
 
         // ═══════════════════════════════════════════════════════════
         //  TWO-PASS SYNC EXTRACTION
@@ -929,7 +1026,7 @@ impl FrameReconstructor {
                             expected,
                             sync_window,
                             h_sync_width,
-                            v_sync_threshold * 0.8,
+                            h_sync_reject,
                         )
                     } else {
                         robust_sync_tip_center(
@@ -938,7 +1035,7 @@ impl FrameReconstructor {
                             sync_window,
                             porch_radius,
                             ma_win,
-                            v_sync_threshold * 0.8,
+                            h_sync_reject,
                         )
                     };
 
@@ -2297,5 +2394,81 @@ mod tests {
             (gcor - 1.0).abs() < 1e-6,
             "identical-frame gradient correlation must be 1.0, got {gcor}"
         );
+    }
+
+    /// Sync detection must survive a gain change between the
+    /// discriminator and the reconstructor. Deemphasis is the one that
+    /// bit in practice: the viewer applies it by default at 0.75 µs, and
+    /// through that identical chain a signal that scored 0.98 on the raw
+    /// demod dropped to **0.00** — every row of every field lost at
+    /// once, with no partial degradation in between to hint at why.
+    ///
+    /// Two independent causes, which is why this covers both standards:
+    ///
+    /// 1. Thresholds pinned to the nominal demod scale rather than the
+    ///    signal's own level. Deemphasis attenuates the 4.7 µs sync
+    ///    pulse enough to lift its tip above a fixed cutoff. Hit PAL and
+    ///    NTSC alike.
+    /// 2. The pass-1 anchor never being snapped to a real sync tip, so
+    ///    tracking relied on pulling in from ~35 samples out through a
+    ///    ±2 µs window — which only works while the pulse is crisp. This
+    ///    one hit NTSC alone: on a miss the cursor advances by the
+    ///    nominal period, and 976 vs a true 976.23 walks away ~6× faster
+    ///    than PAL's 983 vs 983.04.
+    ///
+    /// The pass bar sits just under the un-deemphasised score: a real
+    /// regression here is catastrophic, not marginal, so a few percent
+    /// of drift is not what this guards.
+    #[test]
+    fn sync_survives_deemphasis_gain_change() {
+        use crate::demod::{Deemphasis, fm_demod};
+        use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+        use crate::vbi::FieldParity;
+
+        let sample_rate = 15_360_000u32;
+        for is_pal in [true, false] {
+            let std_name = if is_pal { "PAL" } else { "NTSC" };
+            let height = if is_pal { 576 } else { 480 };
+            let cfg = SyntheticVideoConfig {
+                sample_rate,
+                is_pal,
+                deviation_hz: 5.0e6,
+                pattern: TestPattern::Bars,
+                start_field: FieldParity::First,
+                noise_sigma: 0.0,
+                dc_offset: 0.0,
+            };
+            let iq = generate_iq(&cfg, 8, 0.0);
+            let baseline_demod = fm_demod(&iq);
+
+            let sync_quality_of = |demod: &[f32]| {
+                let mut rec = FrameReconstructor::new(sample_rate, is_pal, 5.0e6, false);
+                let mut frame = vec![0u32; 720 * height];
+                assert!(
+                    rec.reconstruct_frame_into(demod, &mut frame).is_some(),
+                    "{std_name}: reconstruction must succeed on a clean synthetic field"
+                );
+                rec.latest_sync_quality()
+            };
+
+            let baseline = sync_quality_of(&baseline_demod);
+            assert!(
+                baseline > 0.9,
+                "clean synthetic {std_name} should lock solidly, got {baseline}"
+            );
+
+            for tau in [0.25e-6f32, 0.5e-6, crate::demod::DEFAULT_DEEMPHASIS_TAU_S] {
+                let mut demod = baseline_demod.clone();
+                Deemphasis::new(sample_rate, tau).process_in_place(&mut demod);
+                let q = sync_quality_of(&demod);
+                assert!(
+                    q > baseline - 0.05,
+                    "{std_name}: deemphasis at tau={tau:e}s collapsed sync quality \
+                     to {q} (un-deemphasised baseline {baseline}) — the sync \
+                     threshold is not tracking the signal's own level, or the \
+                     pass-1 anchor is not landing on a real sync tip"
+                );
+            }
+        }
     }
 }

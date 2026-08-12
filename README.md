@@ -4,111 +4,151 @@
 [![Codecov](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-fpv-drone-analog-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-A high-performance Rust crate for detecting analog FPV drone video signals using FM demodulation and spectral sync-pulse analysis.
+A Rust crate for detecting and decoding analog FPV drone video from raw
+I/Q samples. It covers FM demodulation, sync detection, and frame
+reconstruction, and is independent of SDR hardware.
+
+Analog FPV video is an FM-modulated television signal. The crate searches
+a capture for one, classifies it as PAL or NTSC, and reconstructs frames.
+
+[DESIGN.md](./DESIGN.md) documents the architecture and the underlying
+math. Section references below point into it.
 
 ## Features
-- **Wideband Detection Strategy**: Utilizes a sliding Digital Down Converter (DDC) to scan capture bandwidths autonomously without relying on predefined channel tables, supporting rates from 1 MSPS to 100+ MSPS.
-- **FM Demodulation**: Implements baseband video recovery from FM-modulated signals using polar phase differentiation (`arg(z[n] × conj(z[n-1]))`).
-- **PAL/NTSC Classification**: Performs windowed FFT analysis to discriminate horizontal sync pulses at 15,625 Hz (PAL) and 15,734 Hz (NTSC).
-- **Cepstral Analysis Validation**: Applies post-harmonic cepstrum validation (`IFFT(ln|FFT|²)`) to distinguish periodic pulse trains from multi-CW interference.
-- **Vertical-Sync (VBI) Parsing**: Classifies equalizing / serrated-broad / horizontal pulses by width, locates the true vertical-sync group, and determines field parity by direct hypothesis test against the standard's calibrated active-video timing — not a phase fit, which this signal's own structure can't actually carry (see `DESIGN.md` §7).
-- **VBI-Confirmed Detection**: The detector cross-checks a harmonic-comb match against real, field-period-spaced vertical syncs, boosting confidence to 0.95 (or promoting a standard-ambiguous hit to 0.75) — essentially unfakeable by a non-video interferer.
-- **FM Deviation Auto-Estimation**: Recovers a transmitter's true peak FM deviation directly from the demodulated waveform (`levels::estimate_fm_deviation`), with no sync lock required, so playback and detection thresholds don't depend on a fixed assumption that's wrong for a given VTX.
-- **PLL FM Demodulation** (`demod::PllFmDemod`): second-order phase-locked demod for weak-signal threshold extension — measured +6–17 dB demod SNR and ~one σ-step deeper sync survival at ≥ 25 MSPS decode rates (`examples/weak_signal_sweep.rs`); the discriminator remains the right choice at low rates. `levels::estimate_cnr_db` provides a matching envelope-based link-quality meter.
-- **Cross-Batch Spectral Integration**: `SpectralIntegrator` + the `_integrated` detection entry points noncoherently average magnitude spectra per frequency across batches — several dB of extra sensitivity on weak signals (a calibrated test pins detection at a noise level where four independent single batches all fail). See `DESIGN.md` §11.
-- **Optional Deemphasis**: A single-pole IIR deemphasis filter (`demod::Deemphasis`) with unity DC gain, approximating the inverse of a VTX's video pre-emphasis (doesn't affect deviation estimation or sync detection either way); `fpv-viewer-rs` applies it by default.
-- **Burst-Gated Subcarrier Notch**: the dot-crawl notch runs only while a Goertzel burst detector finds a real colour burst — burst-free (effectively monochrome) FPV cameras keep their full luma detail.
-- **Sync Extraction & Time Base Correction**: Employs median and MAD outlier rejection on raw sync tips, combined with Catmull-Rom cubic interpolation for sub-sample Time Base Correction (TBC).
-- **Temporal Noise Reduction**: Features a configurable fixed-capacity ring buffer for multi-field temporal denoising, utilizing per-pixel median and motion-weighted blending to improve SNR on static regions.
-- **Monochrome Rendering**: Outputs luma-only frames — analog FPV's color subcarrier carries comparatively little of what an operator needs, and low-SNR RF links look better in clean grayscale than in noisy decoded color (see `DESIGN.md` §9).
-- **Signal Clustering**: Aggregates proximate DDC probe hits (within 25 MHz) to emit single, consolidated detection events.
-- **Standardized Scoring**: Employs a 0.0–1.0 confidence scoring model consistent across workspace detection heuristics.
-- **Hardware Agnostic**: Processes standard complex I/Q samples independent of the underlying SDR hardware.
-- **Optional GPU Acceleration** (`gpu` feature, off by default): batches the wideband sweep's per-probe DDC mixer + FIR + decimate across every probe in one wgpu compute dispatch, instead of running it sequentially per probe on the CPU — the sweep's dominant cost on wide (50+ MSPS) captures. See `DESIGN.md` §10 for the numerical-precision approach and why classification stays on the CPU either way.
+
+### Detection
+
+- **Wideband sweep.** A sliding down-converter scans the full capture
+  bandwidth, from 1 MSPS to over 100 MSPS, without a predefined channel
+  table.
+- **PAL/NTSC classification.** An FFT measures the horizontal sync rate,
+  15,625 Hz for PAL against 15,734 Hz for NTSC.
+- **Interference rejection.** A candidate must present a consistent
+  harmonic series, and a cepstral check (§3) distinguishes a genuine
+  repeating pulse train from several continuous-wave carriers.
+- **Vertical-sync confirmation.** Detections are cross-checked against
+  real vertical sync groups at the correct field spacing, which a
+  non-video signal cannot readily imitate (§7).
+- **Cross-batch integration.** `SpectralIntegrator` averages magnitude
+  spectra across batches for additional sensitivity. A calibrated test
+  holds detection at a noise level where four independent single batches
+  all fail (§11).
+- **Clustering and scoring.** Detections within 25 MHz are merged into a
+  single event, scored from 0.0 to 1.0.
+
+### Decoding
+
+- **FM demodulation.** The default is a quadrature discriminator,
+  `arg(z[n] × conj(z[n-1]))`. `demod::PllFmDemod` is a phase-locked
+  alternative for weak signals, measuring 6–17 dB better demodulated SNR
+  and holding sync approximately one noise step longer at 25 MSPS and
+  above (`examples/weak_signal_sweep.rs`). The discriminator remains
+  preferable below that rate.
+- **FM deviation estimation.** `levels::estimate_fm_deviation` recovers a
+  transmitter's true peak deviation from the demodulated waveform without
+  requiring sync lock, so downstream thresholds do not depend on a fixed
+  assumption. `levels::estimate_cnr_db` provides a link-quality measure.
+- **VBI parsing.** Pulses are classified by width into equalizing, broad,
+  and horizontal; the parser locates the vertical sync group and resolves
+  field parity by hypothesis test against the standard's active-video
+  timing (§7).
+- **Sync extraction and time-base correction.** Sync tips are filtered by
+  median and MAD outlier rejection, then aligned to sub-sample accuracy
+  with Catmull-Rom interpolation. Detection thresholds derive from the
+  signal's own level distribution, so an upstream gain change such as
+  deemphasis or AGC cannot push every sync tip out of range (§9.1).
+- **Temporal noise reduction.** A fixed-capacity ring buffer of recent
+  fields feeds a per-pixel median, blended according to local motion.
+- **Deemphasis.** `demod::Deemphasis` is a unity-DC-gain single-pole IIR
+  filter that inverts a transmitter's video pre-emphasis, suppressing the
+  high-frequency noise that pre-emphasis would otherwise leave in the
+  picture. It affects neither deviation estimation nor sync detection.
+- **Burst-gated subcarrier notch.** The dot-crawl notch engages only when
+  a Goertzel burst detector confirms a colour burst. Many FPV cameras are
+  effectively monochrome, and on those the notch removed real luma
+  detail.
+- **Monochrome output.** Analog FPV's colour subcarrier carries little of
+  the information an operator needs, and weak links resolve better in
+  clean grayscale than in noisy decoded colour (§9).
+
+### Optional
+
+- **GPU acceleration** (`gpu` feature, disabled by default). Batches the
+  sweep's per-probe down-conversion, filtering, and decimation into a
+  single wgpu dispatch rather than running them sequentially on the CPU.
+  This is the dominant cost on captures of 50 MSPS and above.
+  Classification remains on the CPU (§10).
 
 ## Installation
 
-Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = "0.3.4"
+orecchiette-fpv-drone-analog-rs = "0.5.0"
 num-complex = "0.4"
 ```
 
-To enable the optional GPU-accelerated wideband sweep:
+To enable the GPU sweep:
+
 ```toml
-[dependencies]
-orecchiette-fpv-drone-analog-rs = { version = "0.3.4", features = ["gpu"] }
+orecchiette-fpv-drone-analog-rs = { version = "0.5.0", features = ["gpu"] }
 ```
+
+Construct one `GpuAnalog` and share it across detectors.
+`AnalogFpvDetector` holds an `FftPlanner` and should be kept per-thread;
+`GpuAnalog` is `Send + Sync`:
+
 ```rust
 use orecchiette_fpv_drone_analog_rs::detector::AnalogFpvDetector;
 use orecchiette_fpv_drone_analog_rs::gpu::GpuAnalog;
 use std::sync::Arc;
 
-// Build once (opens a GPU device) and share across every detector —
-// AnalogFpvDetector itself stays per-thread (it holds an FftPlanner),
-// but GpuAnalog is Send + Sync and meant to be Arc-shared.
+// The CPU sweep is used automatically if try_new() returns None.
 if let Some(gpu) = GpuAnalog::try_new() {
     let detector = AnalogFpvDetector::with_gpu(Arc::new(gpu));
-    // ... detector.detect_from_iq(...) as usual — falls back to the
-    // CPU sweep automatically if GpuAnalog::try_new() returns None.
+    // ... detector.detect_from_iq(...) as usual
 }
 ```
 
 ## Usage
 
-### Single-Slice Baseband Detection (≤ 10 MSPS)
-For isolated baseband signals where the FM carrier is already centered (the sliding-DDC sweep needs > 10 MHz of capture to form a probe grid; below that the whole capture is classified as one slice):
+`detect_from_iq` selects its strategy from the sample rate:
 
 ```rust
 use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
 use num_complex::Complex;
 
 let detector = AnalogFpvDetector::default();
-let iq_data: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 65536]; // Replace with raw samples
-let sample_rate = 1_000_000;
-let center_freq = 5_800_000_000;
+let iq_data: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 262_144]; // raw samples
+let results = detector.detect_from_iq(&iq_data, 5_800_000_000, 100_000_000);
 
-let results = detector.detect_from_iq(&iq_data, center_freq, sample_rate);
-for res in &results {
-    println!("Signal: {:?}, confidence: {:.2}", res.signal_type, res.confidence);
-}
-```
-
-### Wideband Detection (> 10 MSPS)
-For wideband captures containing multiple signals at arbitrary frequencies (captures between ~10 and ~25 MSPS — fewer than 4 probe positions — are still classified as a single slice at the tuned centre):
-
-```rust
-use orecchiette_fpv_drone_analog_rs::detector::{AnalogFpvDetector, FpvDetector};
-use num_complex::Complex;
-
-let detector = AnalogFpvDetector::default();
-let iq_data: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 262_144]; // 100 MSPS packet
-let sample_rate = 100_000_000;
-let center_freq = 5_800_000_000;
-
-// Sliding DDC probe automatically sweeps the full 100 MHz bandwidth
-let results = detector.detect_from_iq(&iq_data, center_freq, sample_rate);
 for res in &results {
     println!("Found {:?} at {:.1} MHz, confidence {:.2}",
-        res.signal_type,
-        res.frequency_hz as f64 / 1e6,
-        res.confidence);
+        res.signal_type, res.frequency_hz as f64 / 1e6, res.confidence);
 }
 ```
 
-## Detection Model
+Above roughly 25 MSPS the sliding down-converter sweeps the full
+bandwidth and may return several signals at arbitrary frequencies. Below
+that there are too few probe positions to form a grid, and the capture is
+classified as a single slice at the tuned centre frequency, which suits
+an already-centred baseband signal.
+
+## Confidence levels
+
 | Confidence | `SignalType` | Meaning |
 | :--- | :--- | :--- |
-| **0.6** | `AnalogVideoUnknown` | H-sync detected but FFT bin resolution too coarse to discriminate PAL (15625 Hz) from NTSC (15734 Hz); harmonic check passed |
-| **0.6** | `AnalogVideoPal` / `AnalogVideoNtsc` | Demoted from 0.8/0.95 by the opt-in `demote_unconfirmed_video` check (default off) — a harmonic-comb match with zero confirmed vertical-sync groups over ≥ 2.5 field periods |
-| **0.75** | `AnalogVideoUnknown` | The 0.6 (bin-collision) case above, but real periodic vertical-sync structure was confirmed underneath |
-| **0.8** | `AnalogVideoPal` / `AnalogVideoNtsc` | Distinct H-sync bin AND ≥ 2 harmonics above the −20 dB threshold (high-confidence pulse-train classification) |
-| **0.95** | `AnalogVideoPal` / `AnalogVideoNtsc` | The 0.8 case above, additionally confirmed by real vertical-sync structure — essentially unfakeable by a non-video interferer |
+| **0.6** | `AnalogVideoUnknown` | Horizontal sync detected, but FFT bin resolution is too coarse to separate PAL from NTSC. Harmonic check passed. |
+| **0.6** | `AnalogVideoPal` / `AnalogVideoNtsc` | Demoted from 0.8 or 0.95 by the optional `demote_unconfirmed_video` check (disabled by default): harmonics matched, but no vertical sync was confirmed over 2.5 field periods. |
+| **0.75** | `AnalogVideoUnknown` | The bin-collision case above, with real vertical sync structure confirmed underneath. |
+| **0.8** | `AnalogVideoPal` / `AnalogVideoNtsc` | Distinct horizontal sync bin and at least 2 harmonics above −20 dB. |
+| **0.95** | `AnalogVideoPal` / `AnalogVideoNtsc` | The 0.8 case, additionally confirmed by vertical sync structure. |
 
-The harmonic-consistency check is a *gate*: candidates with fewer than 2 harmonics above the −20 dB threshold are rejected as `Unknown` regardless of fundamental energy. This holds across both the bins-distinct and bin-collision paths.
+The harmonic-consistency check is a gate rather than a bonus: fewer than
+2 harmonics above −20 dB is rejected as `Unknown` regardless of
+fundamental energy.
 
-Use `SignalType::is_analog_video()` to gate on "is this an analog FPV signal at all?" — returns `true` for all three video variants including `AnalogVideoUnknown`.
+`SignalType::is_analog_video()` reports whether a detection is analog FPV
+video of any kind, including `AnalogVideoUnknown`.
 
 ## Testing
 
@@ -116,32 +156,70 @@ Use `SignalType::is_analog_video()` to gate on "is this an analog FPV signal at 
 cargo test -p orecchiette-fpv-drone-analog-rs
 ```
 
-DSP hot paths are benchmarked with criterion (`cargo bench`):
-`detect_from_iq` on a live-shaped 65 k chunk (single-shot and
-integrated, 25 / 61.44 MSPS) and field reconstruction at 15.36 MSPS —
-so "real-time" is an enforced number, not an assumption.
+Tests generate their own FM-modulated I/Q, so the repository carries no
+large fixture files. `synthetic::generate_fields` and `generate_iq`
+produce standards-shaped PAL and NTSC fields with complete vertical sync
+structure, and every module's tests share them, so the generator and the
+parser cannot drift apart independently.
 
-Tests generate FM-modulated synthetic IQ data programmatically — no large fixture files needed. `synthetic::generate_fields`/`generate_iq` build standards-shaped NTSC/PAL fields with real vertical-sync structure (equalizing/serrated-broad pulses, correct blanking, interlace parity), shared by every module's tests so generator and parser can't independently drift. Coverage includes narrowband PAL/NTSC, wideband sliding DDC, two-signal detection, noise rejection, CW rejection, clustering verification, the `StreamingDDC` mixer round-trip, the FM demodulator's near-±π precision, cepstrum gate verification (harmonic comb pass / flat spectrum reject / noise reject), the VBI parser (broad-group location, field-parity hypothesis test for both standards and parities, noise robustness), the confidence-tier policy (boost/promote/demote, as a pure function independent of any specific IQ signal), the FM-deviation estimator's accuracy across a range of deviation/sample-rate pairs, and the deemphasis filter's DC gain / −3 dB point / streaming continuity.
+Coverage spans detection (narrowband, wideband sweep, two-signal
+captures, noise and carrier rejection, clustering, the cepstral gate, and
+the confidence rules), DSP (down-converter round trip, demodulator
+accuracy near ±π, deviation estimation, deemphasis response and
+continuity across chunks), the VBI parser for both standards and both
+field parities, and `FrameReconstructor` — geometry per standard,
+interlace recovery after a dropped field, sync survival through an
+upstream gain change, and returning `None` rather than panicking on
+mismatched buffers or degenerate configuration.
 
-`video::FrameReconstructor` additionally has regression tests confirming `reconstruct_frame_into` degrades to `None` rather than panicking on a mismatched output-buffer size, empty input, and degenerate configuration (`sample_rate = 0`), plus geometry tests proving a test pattern lands on the correct output row for both NTSC and PAL (the standards-correct-blanking fix) and a dropped-field test proving the VBI parser's parity override — not a naive per-call toggle — recovers correct interlacing after a lost field.
+`cargo bench` (criterion) times detection on realistic 65 k chunks at 25
+and 61.44 MSPS and frame reconstruction at 15.36 MSPS, so real-time
+performance is measured rather than assumed.
 
-With `--features gpu`, `cargo test --features gpu` additionally runs `detector::tests::gpu_ddc_matches_cpu_ddc_and_decimate` (a stage-level check comparing the batched GPU DDC directly against the CPU's `ddc_and_decimate`) and `tests/gpu_equivalence.rs`'s two end-to-end tests (`AnalogFpvDetector::with_gpu` vs `::default()` agreeing on signal type and frequency for a single-signal and a two-signal wideband capture). All three skip gracefully with no GPU adapter.
+`--features gpu` adds a stage-level GPU-against-CPU comparison and two
+end-to-end equivalence tests. All three skip cleanly when no GPU adapter
+is present.
 
-### End-to-end decode check
+### Reference captures
 
-For a visual sanity check, use the [fpv-viewer-rs](https://github.com/isaacbentley/fpv-viewer-rs) binary with `--debug`, which renders the full DDC → FM-demod → reconstruction pipeline live, dumps startup frames 1–3 and steady-state frames 30–32 as `fpv_frame_<freq>MHz_<n>.png` in the working directory, and keeps running until quit. See the `fpv-viewer-rs` README for the full flag set.
+`examples/make_reference_capture.rs` writes standards-conformant PAL and
+NTSC captures in SigMF format (`.sigmf-data` and `.sigmf-meta`) using the
+same generator as the test suite. Because they are correct by
+construction, they can be used to establish whether a decoder is at
+fault:
 
-See [DESIGN.md](./DESIGN.md) for the full architecture and math.
+```bash
+cargo run --release --example make_reference_capture -- --standard pal
+cargo run --release --example make_reference_capture -- --standard ntsc
+cargo run --release --example make_reference_capture -- --standard pal --noise-sigma 0.45 --out reference_pal_weak
+```
 
-## MSRV & Semver Policy
+A correct decoder reports the expected standard and geometry and holds
+sync quality near 1.0 on every field of both parities. The clean PAL and
+NTSC files decode at 0.99 and 1.00 respectively, with no interpolated
+rows. If a real capture decodes poorly on alternate fields while these do
+not, the fault lies in the capture.
 
-- **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
-- **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`).
+The reference files carry no transmitter pre-emphasis, so
+`--deemphasis-tau 0` reproduces the generated waveform exactly. The
+viewer's default of 0.75 µs also decodes them correctly, though with
+softer edges, as there is no pre-emphasis to invert. Both settings are
+worth exercising: that gain change between demodulator and reconstructor
+is the condition covered by `sync_survives_deemphasis_gain_change`
+(§9.1).
+
+### Visual verification
+
+The [fpv-viewer-rs](https://github.com/isaacbentley/fpv-viewer-rs) binary
+run with `--debug` renders the complete pipeline live and writes frames
+1–3 and 30–32 to `fpv_frame_<freq>MHz_<n>.png`.
 
 ## Contributing
 
-Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite and formatting your code before submitting a Pull Request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for running the test suite and
+formatting before submitting a pull request.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](LICENSE) file for details.
+GNU General Public License v3.0 or later (GPL-3.0-or-later). See
+[LICENSE](LICENSE).
