@@ -159,7 +159,7 @@ mod tests {
     fn test_neural_pass_through() {
         // Skip gracefully if the trained model isn't present (it ships
         // in `models/`, but a checkout without LFS/blobs might lack it).
-        const MODEL: &str = "models/temporal_quantized_trained.onnx";
+        const MODEL: &str = "models/temporal_denoiser.onnx";
         if !Path::new(MODEL).exists() {
             return;
         }

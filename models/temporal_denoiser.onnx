@@ -1,6 +1,6 @@
 
-pytorch2.13.0:«ì
-‡
+pytorch2.13.0:ëë
+÷
 input
 noise
 	hidden_incatnode_cat"Concat*
@@ -8,10 +8,10 @@
 	namespace1: __main__.TemporalDenoiser/cat: aten.cat.defaultJS
 pkg.torch.onnx.class_hierarchy1['__main__.TemporalDenoiser', 'aten.cat.default']Jò
 pkg.torch.onnx.fx_node~%cat : [num_users=1] = call_function[target=torch.ops.aten.cat.default](args = ([%input, %noise, %hidden_in], 1), kwargs = {})J)
-pkg.torch.onnx.name_scopes['', 'cat']J≈
-pkg.torch.onnx.stack_trace¶File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 80, in forward
+pkg.torch.onnx.name_scopes['', 'cat']Jª
+pkg.torch.onnx.stack_traceúFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
     x = torch.cat([input, noise, hidden_in], dim=1)
-˛	
+‡	
 cat
 net.0.weight
 
@@ -24,27 +24,26 @@ net.0.biasconv2dnode_conv2d"Conv*
 	namespaceÜ: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.0: torch.nn.modules.conv.Conv2d/conv2d: aten.conv2d.defaultJü
 pkg.torch.onnx.class_hierarchy}['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']J¥
 pkg.torch.onnx.fx_nodeô%conv2d : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%cat, %p_net_0_weight, %p_net_0_bias, [1, 1], [1, 1]), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.0', 'conv2d']Jµ
-pkg.torch.onnx.stack_traceñFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes['', 'net', 'net.0', 'conv2d']Jó
+pkg.torch.onnx.stack_trace¯File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
     return self._conv_forward(input, self.weight, self.bias)
-Ã
+Æ
 conv2drelu	node_relu"ReluJî
 	namespaceÜ: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.1: torch.nn.modules.activation.ReLU/relu: aten.relu.defaultJ°
 pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']JÉ
 pkg.torch.onnx.fx_nodei%relu : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d,), kwargs = {})J:
-pkg.torch.onnx.name_scopes['', 'net', 'net.1', 'relu']J≠
-pkg.torch.onnx.stack_traceéFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes['', 'net', 'net.1', 'relu']Jè
+pkg.torch.onnx.stack_traceFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
     return F.relu(input, inplace=self.inplace)
-ä
-
+Ï	
 relu
 net.2.weight
 
@@ -57,27 +56,26 @@ net.2.biasconv2d_1node_conv2d_1"Conv*
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.2: torch.nn.modules.conv.Conv2d/conv2d_1: aten.conv2d.defaultJü
 pkg.torch.onnx.class_hierarchy}['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']J∑
 pkg.torch.onnx.fx_nodeú%conv2d_1 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu, %p_net_2_weight, %p_net_2_bias, [1, 1], [1, 1]), kwargs = {})J>
-pkg.torch.onnx.name_scopes ['', 'net', 'net.2', 'conv2d_1']Jµ
-pkg.torch.onnx.stack_traceñFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes ['', 'net', 'net.2', 'conv2d_1']Jó
+pkg.torch.onnx.stack_trace¯File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
     return self._conv_forward(input, self.weight, self.bias)
-⁄
+º
 conv2d_1relu_1node_relu_1"ReluJñ
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.3: torch.nn.modules.activation.ReLU/relu_1: aten.relu.defaultJ°
 pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']Já
 pkg.torch.onnx.fx_nodem%relu_1 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_1,), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.3', 'relu_1']J≠
-pkg.torch.onnx.stack_traceéFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes['', 'net', 'net.3', 'relu_1']Jè
+pkg.torch.onnx.stack_traceFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
     return F.relu(input, inplace=self.inplace)
-é
-
+	
 relu_1
 net.4.weight
 
@@ -90,27 +88,26 @@ net.4.biasconv2d_2node_conv2d_2"Conv*
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.4: torch.nn.modules.conv.Conv2d/conv2d_2: aten.conv2d.defaultJü
 pkg.torch.onnx.class_hierarchy}['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']Jπ
 pkg.torch.onnx.fx_nodeû%conv2d_2 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_1, %p_net_4_weight, %p_net_4_bias, [1, 1], [1, 1]), kwargs = {})J>
-pkg.torch.onnx.name_scopes ['', 'net', 'net.4', 'conv2d_2']Jµ
-pkg.torch.onnx.stack_traceñFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes ['', 'net', 'net.4', 'conv2d_2']Jó
+pkg.torch.onnx.stack_trace¯File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
     return self._conv_forward(input, self.weight, self.bias)
-⁄
+º
 conv2d_2relu_2node_relu_2"ReluJñ
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.5: torch.nn.modules.activation.ReLU/relu_2: aten.relu.defaultJ°
 pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']Já
 pkg.torch.onnx.fx_nodem%relu_2 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_2,), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.5', 'relu_2']J≠
-pkg.torch.onnx.stack_traceéFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes['', 'net', 'net.5', 'relu_2']Jè
+pkg.torch.onnx.stack_traceFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
     return F.relu(input, inplace=self.inplace)
-é
-
+	
 relu_2
 net.6.weight
 
@@ -123,27 +120,26 @@ net.6.biasconv2d_3node_conv2d_3"Conv*
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.6: torch.nn.modules.conv.Conv2d/conv2d_3: aten.conv2d.defaultJü
 pkg.torch.onnx.class_hierarchy}['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']Jπ
 pkg.torch.onnx.fx_nodeû%conv2d_3 : [num_users=1] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_2, %p_net_6_weight, %p_net_6_bias, [1, 1], [1, 1]), kwargs = {})J>
-pkg.torch.onnx.name_scopes ['', 'net', 'net.6', 'conv2d_3']Jµ
-pkg.torch.onnx.stack_traceñFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes ['', 'net', 'net.6', 'conv2d_3']Jó
+pkg.torch.onnx.stack_trace¯File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
     return self._conv_forward(input, self.weight, self.bias)
-⁄
+º
 conv2d_3relu_3node_relu_3"ReluJñ
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.7: torch.nn.modules.activation.ReLU/relu_3: aten.relu.defaultJ°
 pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']Já
 pkg.torch.onnx.fx_nodem%relu_3 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_3,), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.7', 'relu_3']J≠
-pkg.torch.onnx.stack_traceéFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes['', 'net', 'net.7', 'relu_3']Jè
+pkg.torch.onnx.stack_traceFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
     return F.relu(input, inplace=self.inplace)
-é
-
+	
 relu_3
 net.8.weight
 
@@ -156,14 +152,14 @@ net.8.biasconv2d_4node_conv2d_4"Conv*
 	namespaceà: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.8: torch.nn.modules.conv.Conv2d/conv2d_4: aten.conv2d.defaultJü
 pkg.torch.onnx.class_hierarchy}['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.conv.Conv2d', 'aten.conv2d.default']Jπ
 pkg.torch.onnx.fx_nodeû%conv2d_4 : [num_users=2] = call_function[target=torch.ops.aten.conv2d.default](args = (%relu_3, %p_net_8_weight, %p_net_8_bias, [1, 1], [1, 1]), kwargs = {})J>
-pkg.torch.onnx.name_scopes ['', 'net', 'net.8', 'conv2d_4']Jµ
-pkg.torch.onnx.stack_traceñFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
+pkg.torch.onnx.name_scopes ['', 'net', 'net.8', 'conv2d_4']Jó
+pkg.torch.onnx.stack_trace¯File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 82, in forward
     out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
     input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
+  File "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/conv.py", line 565, in forward
     return self._conv_forward(input, self.weight, self.bias)
-⁄
+–
 conv2d_4
 val_11
 val_14
@@ -172,19 +168,19 @@ net.8.biasconv2d_4node_conv2d_4"Conv*
 	namespace6: __main__.TemporalDenoiser/slice_1: aten.slice.TensorJT
 pkg.torch.onnx.class_hierarchy2['__main__.TemporalDenoiser', 'aten.slice.Tensor']Jê
 pkg.torch.onnx.fx_nodev%slice_1 : [num_users=1] = call_function[target=torch.ops.aten.slice.Tensor](args = (%conv2d_4, 1, 0, 1), kwargs = {})J-
-pkg.torch.onnx.name_scopes['', 'slice_1']J≤
-pkg.torch.onnx.stack_traceìFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 83, in forward
+pkg.torch.onnx.name_scopes['', 'slice_1']J®
+pkg.torch.onnx.stack_traceâFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 84, in forward
     image_out = out[:, :1, :, :]
-≤
+®
 input
 slice_1outputnode_add_65"AddJ@
 	namespace3: __main__.TemporalDenoiser/add_65: aten.add.TensorJR
 pkg.torch.onnx.class_hierarchy0['__main__.TemporalDenoiser', 'aten.add.Tensor']Jã
 pkg.torch.onnx.fx_nodeq%add_65 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%input, %slice_3), kwargs = {})J,
-pkg.torch.onnx.name_scopes['', 'add_65']J≥
-pkg.torch.onnx.stack_traceîFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 86, in forward
+pkg.torch.onnx.name_scopes['', 'add_65']J©
+pkg.torch.onnx.stack_traceäFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 87, in forward
     image_out = input + image_out
-Ò
+Á
 conv2d_4
 val_14
 val_47
@@ -194,15 +190,17 @@ hidden_outnode_slice_4"SliceJC
 	namespace6: __main__.TemporalDenoiser/slice_4: aten.slice.TensorJT
 pkg.torch.onnx.class_hierarchy2['__main__.TemporalDenoiser', 'aten.slice.Tensor']J£
 pkg.torch.onnx.fx_nodeà%slice_4 : [num_users=1] = call_function[target=torch.ops.aten.slice.Tensor](args = (%conv2d_4, 1, 1, 9223372036854775807), kwargs = {})J-
-pkg.torch.onnx.name_scopes['', 'slice_4']J≥
-pkg.torch.onnx.stack_traceîFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 88, in forward
+pkg.torch.onnx.name_scopes['', 'slice_4']J©
+pkg.torch.onnx.stack_traceäFile "/Users/ibentley/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 89, in forward
     hidden_out = out[:, 1:, :, :]
 main_graph*RB
-net.0.biasJ@Z≈=+iFΩEΩÜÃ€<1!=EÅ=ÎóΩÖœº+·w:òÀç=DBwºl’Òºgï+=∆7d=¯ué=]‘c=*RB
-net.2.biasJ@Œè=F!ô<Ú¨.ΩKŸ<Z`5=Í8¬;„oÖΩ¬L=≤Ì<æ“aΩgÏQ="-ΩHW–<ÔÇ=ØÄ˛ºövîΩ*RB
-net.4.biasJ@Çº?1g=¯ºΩã˘ºê,=Äÿªzàô<:oK=ê4v=à˝S=≥Eº„Ω’‘B=”êòΩ}=;<^”y=*RB
-net.6.biasJ@ˇïΩP8à∫‡q÷8®YΩKçô=Ló=]ëó=ÎsÄΩuıÏ<Îú)=DQ#<ÍGfºQ⁄ºfı´=€|é=ÚÿÒº*VB
-net.8.biasJD2ráΩP<|Ãùºgfì<°Ω∏˜8ΩåI=ª´C=|†¢=»~:Ωπµº⁄Oî=RÀΩË*=«ºiÑ=4∑Ö=*iBnet.0.weightj+
+net.0.biasJ@^¥>Cï€>°·}æœ∏;≠í“æ‹2>j«£>Ú¡ø'’èΩÑ=Ò∑sæÒv÷>úéî?sæº6ü<∏—=*RB
+net.2.biasJ@¥Æ[Ωá#ÎΩ.˘0æcJ~<dtòº„‘î=àÙd>:z=ÒxØ=øà“Ωg«€ΩË-âΩ&⁄yΩüÚ√Ω‹O=dÙΩ*RB
+net.4.biasJ@o}Ω≠
+ßΩrb-º'äΩ<9>4QŸ=Àˇ™=·‚,ΩÍ¿ΩWÌÀΩQË=≥í>‚ˇ™:®è‡=C<>¢Ó=*RB
+net.6.biasJ@æùæÑ«æ‹”á<œÀ≤∫ÿò€<∫/òª0N4<„oˇ=∑¥Öæh>”¢læ<ætæFΩ‘S«Ω6…ΩßJ=*VB
+net.8.biasJD÷í≈ºÂ!= ?ΩÃfbæÆmΩ¸v»Ωá√†>@íÄ=ñ/
+æzØØΩî±>ΩmΩA'ı=Hî‘Ω˚.=pR™ºR«dΩ*iBnet.0.weightj+
 locationtemporal_trained_fp32.onnx.dataj
 offset37440j
 length10368p*dBnet.2.weightj+

@@ -8,3 +8,10 @@ truth_debug.txt
 
 # ML training data (STL10 etc.) — never commit
 data/
+
+# Training intermediates (models/temporal_denoiser.onnx is the shipped
+# artifact; the export scratch file and checkpoints are not)
+models/__pycache__/
+models/temporal_export_fp32.onnx*
+models/checkpoint.pt
+models/temporal_trained_fp32.onnx*

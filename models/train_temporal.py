@@ -1,5 +1,5 @@
 """Train the temporal luma denoiser shipped as
-`models/temporal_quantized_trained.onnx` and consumed by
+`models/temporal_denoiser.onnx` and consumed by
 `src/neural.rs` (behind the `neural-vsr` feature).
 
 Design notes (why this looks the way it does):
@@ -30,6 +30,9 @@ Design notes (why this looks the way it does):
 
 import argparse
 import os
+import time
+
+import multiprocessing as mp
 
 import numpy as np
 import torch
@@ -202,6 +205,20 @@ class AnalogNoiseDataset(Dataset):
         self.snr_lo = snr_lo
         self.snr_hi = snr_hi
         self.seed = seed
+        # Folded into the per-item seed so every epoch draws fresh
+        # impairments (see `__getitem__`). This is a shared-memory value
+        # rather than a plain int on purpose: with `persistent_workers`
+        # the workers are forked ONCE and hold their own copy of this
+        # object, so a normal attribute assignment in the parent would
+        # never reach them and the epoch would stay pinned at 0.
+        self._epoch = mp.Value("i", 0)
+
+    @property
+    def epoch(self):
+        return self._epoch.value
+
+    def set_epoch(self, epoch):
+        self._epoch.value = int(epoch)
 
     def __len__(self):
         return len(self.base_dataset)
@@ -251,11 +268,46 @@ class AnalogNoiseDataset(Dataset):
         noisy = np.clip((demod + 1.0) / 2.0, 0.0, 1.0).reshape(frame.shape)
         return noisy.astype(np.float32), float(snr_db)
 
-    def __getitem__(self, idx):
-        # Per-item RNG so DataLoader workers are deterministic yet varied.
-        rng = np.random.default_rng(self.seed * 1_000_003 + idx)
+    def _load_base(self, idx, rng):
+        """Fetch a base image, surviving transient storage stalls.
 
-        img, _ = self.base_dataset[idx]
+        Reading the image corpus can raise `TimeoutError`/`OSError` when
+        the volume hiccups (observed: `[Errno 60] Operation timed out`
+        mid-epoch on a network/external disk). A DataLoader worker that
+        raises kills the whole run — losing every epoch since the last
+        checkpoint — so retry the same index a few times, then fall back
+        to other random indices rather than taking the process down.
+        """
+        last_err = None
+        for attempt in range(3):
+            try:
+                return self.base_dataset[idx]
+            except (TimeoutError, OSError) as e:  # noqa: PERF203
+                last_err = e
+                time.sleep(0.5 * (attempt + 1))  # brief backoff; disks recover
+        # Same index keeps failing (stalled or corrupt) — substitute
+        # another sample so training continues.
+        for _ in range(5):
+            alt = int(rng.integers(0, len(self.base_dataset)))
+            try:
+                return self.base_dataset[alt]
+            except (TimeoutError, OSError) as e:
+                last_err = e
+        raise RuntimeError(f"dataset unreadable near index {idx}: {last_err}")
+
+    def __getitem__(self, idx):
+        # Per-item RNG: worker-safe (each item's stream is independent of
+        # how the DataLoader shards work), but it MUST also advance per
+        # epoch. Seeding on `idx` alone froze one impairment realisation
+        # per image for the whole run, so the model saw the same noise on
+        # that image every epoch and could memorise it instead of learning
+        # to denoise — exactly the augmentation the RF channel exists to
+        # provide. `set_epoch` folds the epoch into the seed.
+        rng = np.random.default_rng(
+            (self.seed * 1_000_003 + idx) * 1_000_033 + self.epoch * 2_654_435_761
+        )
+
+        img, _ = self._load_base(idx, rng)
         if img.shape[0] == 3:
             img = 0.299 * img[0:1] + 0.587 * img[1:2] + 0.114 * img[2:3]
 
@@ -334,8 +386,8 @@ def export_and_quantize(model, hidden_channels, quantize=True, keep_fp32=True):
     dummy_noise = torch.ones(1, 1, 128, 128)
     dummy_hidden = torch.zeros(1, hidden_channels, 128, 128)
 
-    fp32_path = "models/temporal_trained_fp32.onnx"
-    quant_path = "models/temporal_quantized_trained.onnx"
+    fp32_path = "models/temporal_export_fp32.onnx"
+    quant_path = "models/temporal_denoiser.onnx"
 
     print(f"\nExporting FP32 model to {fp32_path}...")
     torch.onnx.export(
@@ -357,10 +409,19 @@ def export_and_quantize(model, hidden_channels, quantize=True, keep_fp32=True):
     )
 
     if not quantize:
-        # Ship fp32 at the canonical path the Rust loads.
+        # Ship fp32 at the canonical path the Rust loads. If the export
+        # externalised its weights to a `.data` sidecar, that file must
+        # travel too — the `.onnx` references it by name, so copying the
+        # graph alone would ship a model with dangling weights. (Small
+        # models like this one inline everything, but don't depend on
+        # that.)
         import shutil
 
         shutil.copyfile(fp32_path, quant_path)
+        sidecar = fp32_path + ".data"
+        if os.path.exists(sidecar):
+            shutil.copyfile(sidecar, quant_path + ".data")
+            print(f"Copied external weights sidecar → {quant_path}.data")
         print(f"Quantization disabled; wrote FP32 weights to {quant_path}")
         return
 
@@ -412,7 +473,15 @@ def main():
     parser.add_argument("--hidden-channels", type=int, default=16)
     parser.add_argument("--num-layers", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--limit", type=int, default=0, help="cap dataset size (0 = all)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="cap dataset size, sampled at random across all corpora (0 = all)",
+    )
+    parser.add_argument(
+        "--subset-seed", type=int, default=0, help="seed for --limit's random subset"
+    )
     parser.add_argument("--lambda-grad", type=float, default=0.75, help="weight of the gradient loss term")
     parser.add_argument("--clean-prob", type=float, default=0.15, help="fraction of clean-passthrough sequences")
     parser.add_argument("--chroma-prob", type=float, default=0.6, help="fraction of impaired sequences carrying a subcarrier")
@@ -420,8 +489,25 @@ def main():
     parser.add_argument("--snr-lo", type=float, default=5.0)
     parser.add_argument("--snr-hi", type=float, default=30.0)
     parser.add_argument("--no-quantize", action="store_true", help="ship FP32 weights instead of INT8")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="models/checkpoint.pt",
+        help="per-epoch checkpoint path (training resumes from here)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="ignore an existing checkpoint and train from scratch",
+    )
     parser.add_argument("--dummy-data", action="store_true", help="tiny random dataset for a sanity run")
     parser.add_argument("--add-places365", action="store_true", help="Add Places365 val split to the training data for more diversity")
+    parser.add_argument(
+        "--places-only",
+        action="store_true",
+        help="train on Places365 val ONLY (native 256px → real 128px crops, no STL10 upscaling)",
+    )
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -436,6 +522,16 @@ def main():
     if args.dummy_data:
         print("Using dummy random data...")
         base_dataset = [(torch.rand(3, 128, 128), 0) for _ in range(32)]
+    elif args.places_only:
+        # Places365-small is native 256x256, so a 128px crop is a REAL
+        # crop. STL10 is 96px and must be upscaled to 128 — interpolation
+        # softens it, which is counterproductive when the whole point of
+        # this training run is to stop the model blurring. Prefer real
+        # pixels.
+        print("Loading Places365 (val split) only...")
+        base_dataset = torchvision.datasets.Places365(
+            root="./data", split="val", small=True, download=False, transform=transform
+        )
     else:
         print("Downloading/Loading STL10 Dataset...")
         base_dataset = torchvision.datasets.STL10(root="./data", split="unlabeled", download=True, transform=transform)
@@ -447,8 +543,16 @@ def main():
             except RuntimeError as e:
                 print(f"Warning: Failed to load Places365 ({e}). Falling back to STL10 only.")
 
-    if args.limit > 0:
-        base_dataset = torch.utils.data.Subset(base_dataset, range(min(args.limit, len(base_dataset))))
+    if args.limit > 0 and args.limit < len(base_dataset):
+        # Sample the subset RANDOMLY, not as a leading range: the corpora
+        # are concatenated (STL10 then Places365), so `range(limit)` would
+        # draw entirely from the first dataset and silently exclude
+        # Places365 — training on none of the high-resolution photos the
+        # flag was added to provide. A fixed seed keeps runs comparable.
+        g = torch.Generator().manual_seed(args.subset_seed)
+        idx = torch.randperm(len(base_dataset), generator=g)[: args.limit].tolist()
+        base_dataset = torch.utils.data.Subset(base_dataset, idx)
+        print(f"Sampled {len(idx)} images at random from the combined corpus.")
 
     train_dataset = AnalogNoiseDataset(
         base_dataset,
@@ -460,12 +564,31 @@ def main():
         snr_lo=args.snr_lo,
         snr_hi=args.snr_hi,
     )
+    # Measured on an M4 with the corpus on local SSD: JPEG decode is
+    # ~1.1 ms/image and a full sequence (decode + crop + motion + FM
+    # round trip) ~7.6 ms, so even 3 workers feed batches several times
+    # faster than the GPU consumes them — training is GPU-bound, which is
+    # where we want it. These flags keep it that way:
+    #  - persistent_workers: don't tear down and respawn the worker pool
+    #    every epoch (20 epochs = 20 needless respawns, each re-importing
+    #    torch and re-opening the dataset).
+    #  - prefetch_factor: keep batches queued so the loader stays ahead of
+    #    the ~232 ms model step instead of being sampled just-in-time.
+    #  - pin_memory: page-locked staging buffers for faster host→device
+    #    copies. CUDA only — MPS ignores it and warns, so don't ask for
+    #    it there.
+    loader_kwargs = {}
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         drop_last=True,
+        pin_memory=(device.type == "cuda"),
+        **loader_kwargs,
     )
 
     model = TemporalDenoiser(
@@ -475,9 +598,25 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     l1 = nn.L1Loss()
 
+    # Resume from a checkpoint if one exists, so a crash (or a stalled
+    # disk taking a worker down) costs at most the current epoch rather
+    # than the whole run.
+    start_epoch = 0
+    if args.resume and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"]
+        print(f"Resumed from {args.checkpoint} at epoch {start_epoch}")
+
     print("Starting training...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
+        # Advance the impairment RNG stream so this epoch draws fresh
+        # noise/fades/interferers for every image (shared-memory value, so
+        # it reaches persistent workers too). Set BEFORE iterating.
+        train_dataset.set_epoch(epoch)
         epoch_loss = 0.0
 
         for batch_idx, (noisy_seq, clean_seq, noise_seq) in enumerate(train_loader):
@@ -505,6 +644,23 @@ def main():
 
         scheduler.step()
         print(f"==> Epoch {epoch+1} Average Loss: {epoch_loss / max(len(train_loader), 1):.4f}")
+
+        # Checkpoint after every epoch (atomic rename so an interrupted
+        # write can't leave a corrupt file behind).
+        tmp = args.checkpoint + ".tmp"
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "hidden_channels": args.hidden_channels,
+                "num_layers": args.num_layers,
+            },
+            tmp,
+        )
+        os.replace(tmp, args.checkpoint)
+        print(f"    checkpoint → {args.checkpoint}")
 
     print("Training complete.")
     export_and_quantize(model, hidden_channels=args.hidden_channels, quantize=not args.no_quantize)

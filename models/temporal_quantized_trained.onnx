@@ -1,524 +1,0 @@
-
-onnx.quantize0.1.0:èâ
-L
-
-net.0.bias
-conv2d_bias_reshape_shapeconv2d_bias_reshape_output"Reshape
-P
-
-net.2.bias
-conv2d_1_bias_reshape_shapeconv2d_1_bias_reshape_output"Reshape
-P
-
-net.4.bias
-conv2d_2_bias_reshape_shapeconv2d_2_bias_reshape_output"Reshape
-P
-
-net.6.bias
-conv2d_3_bias_reshape_shapeconv2d_3_bias_reshape_output"Reshape
-P
-
-net.8.bias
-conv2d_4_bias_reshape_shapeconv2d_4_bias_reshape_output"Reshape
-à
-input
-noise
-	hidden_incatnode_cat"Concat*
-axis J>
-	namespace1: __main__.TemporalDenoiser/cat: aten.cat.defaultJS
-pkg.torch.onnx.class_hierarchy1['__main__.TemporalDenoiser', 'aten.cat.default']J˜
-pkg.torch.onnx.fx_node~%cat : [num_users=1] = call_function[target=torch.ops.aten.cat.default](args = ([%input, %noise, %hidden_in], 1), kwargs = {})J)
-pkg.torch.onnx.name_scopes['', 'cat']JÅ
-pkg.torch.onnx.stack_trace¦File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 80, in forward
-    x = torch.cat([input, noise, hidden_in], dim=1)
-Z
-catcat_quantized	cat_scalecat_zero_pointcat_QuantizeLinear"DynamicQuantizeLinear
-b
-	cat_scale
-net.0.weight_scalenode_conv2d_quant_scales_mul:0node_conv2d_quant_scales_mul"Mul
-ç
-cat_quantized
-net.0.weight_quantized
-cat_zero_point
-net.0.weight_zero_pointconv2d_output_quantizednode_conv2d_quant"ConvInteger*
-auto_pad"NOTSET *
-	dilations@@ *
-group *
-pads@@@@ *
-strides@@ 
-m
-conv2d_output_quantized#conv2d_output_quantized_cast_outputconv2d_output_quantized_cast"Cast*	
-to 
-‰
-#conv2d_output_quantized_cast_output
-node_conv2d_quant_scales_mul:0conv2dquant_scaled_output"node_conv2d_quant_output_scale_mul"Mul
-U
-conv2dquant_scaled_output
-conv2d_bias_reshape_outputconv2dconv2d_bias_add"Add
-Ì
-conv2drelu	node_relu"ReluJ”
-	namespace†: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.1: torch.nn.modules.activation.ReLU/relu: aten.relu.defaultJ¡
-pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']Jƒ
-pkg.torch.onnx.fx_nodei%relu : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d,), kwargs = {})J:
-pkg.torch.onnx.name_scopes['', 'net', 'net.1', 'relu']J­
-pkg.torch.onnx.stack_traceFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
-    out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
-    input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
-    return F.relu(input, inplace=self.inplace)
-_
-relurelu_quantized
-relu_scalerelu_zero_pointrelu_QuantizeLinear"DynamicQuantizeLinear
-g
-
-relu_scale
-net.2.weight_scale node_conv2d_1_quant_scales_mul:0node_conv2d_1_quant_scales_mul"Mul
-í
-relu_quantized
-net.2.weight_quantized
-relu_zero_point
-net.2.weight_zero_pointconv2d_1_output_quantizednode_conv2d_1_quant"ConvInteger*
-auto_pad"NOTSET *
-	dilations@@ *
-group *
-pads@@@@ *
-strides@@ 
-s
-conv2d_1_output_quantized%conv2d_1_output_quantized_cast_outputconv2d_1_output_quantized_cast"Cast*	
-to 
-‘
-%conv2d_1_output_quantized_cast_output
- node_conv2d_1_quant_scales_mul:0conv2d_1quant_scaled_output$node_conv2d_1_quant_output_scale_mul"Mul
-]
-conv2d_1quant_scaled_output
-conv2d_1_bias_reshape_outputconv2d_1conv2d_1_bias_add"Add
-Ú
-conv2d_1relu_1node_relu_1"ReluJ–
-	namespaceˆ: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.3: torch.nn.modules.activation.ReLU/relu_1: aten.relu.defaultJ¡
-pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']J‡
-pkg.torch.onnx.fx_nodem%relu_1 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_1,), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.3', 'relu_1']J­
-pkg.torch.onnx.stack_traceFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
-    out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
-    input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
-    return F.relu(input, inplace=self.inplace)
-i
-relu_1relu_1_quantizedrelu_1_scalerelu_1_zero_pointrelu_1_QuantizeLinear"DynamicQuantizeLinear
-i
-relu_1_scale
-net.4.weight_scale node_conv2d_2_quant_scales_mul:0node_conv2d_2_quant_scales_mul"Mul
-ñ
-relu_1_quantized
-net.4.weight_quantized
-relu_1_zero_point
-net.4.weight_zero_pointconv2d_2_output_quantizednode_conv2d_2_quant"ConvInteger*
-auto_pad"NOTSET *
-	dilations@@ *
-group *
-pads@@@@ *
-strides@@ 
-s
-conv2d_2_output_quantized%conv2d_2_output_quantized_cast_outputconv2d_2_output_quantized_cast"Cast*	
-to 
-‘
-%conv2d_2_output_quantized_cast_output
- node_conv2d_2_quant_scales_mul:0conv2d_2quant_scaled_output$node_conv2d_2_quant_output_scale_mul"Mul
-]
-conv2d_2quant_scaled_output
-conv2d_2_bias_reshape_outputconv2d_2conv2d_2_bias_add"Add
-Ú
-conv2d_2relu_2node_relu_2"ReluJ–
-	namespaceˆ: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.5: torch.nn.modules.activation.ReLU/relu_2: aten.relu.defaultJ¡
-pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']J‡
-pkg.torch.onnx.fx_nodem%relu_2 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_2,), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.5', 'relu_2']J­
-pkg.torch.onnx.stack_traceFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
-    out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
-    input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
-    return F.relu(input, inplace=self.inplace)
-i
-relu_2relu_2_quantizedrelu_2_scalerelu_2_zero_pointrelu_2_QuantizeLinear"DynamicQuantizeLinear
-i
-relu_2_scale
-net.6.weight_scale node_conv2d_3_quant_scales_mul:0node_conv2d_3_quant_scales_mul"Mul
-ñ
-relu_2_quantized
-net.6.weight_quantized
-relu_2_zero_point
-net.6.weight_zero_pointconv2d_3_output_quantizednode_conv2d_3_quant"ConvInteger*
-auto_pad"NOTSET *
-	dilations@@ *
-group *
-pads@@@@ *
-strides@@ 
-s
-conv2d_3_output_quantized%conv2d_3_output_quantized_cast_outputconv2d_3_output_quantized_cast"Cast*	
-to 
-‘
-%conv2d_3_output_quantized_cast_output
- node_conv2d_3_quant_scales_mul:0conv2d_3quant_scaled_output$node_conv2d_3_quant_output_scale_mul"Mul
-]
-conv2d_3quant_scaled_output
-conv2d_3_bias_reshape_outputconv2d_3conv2d_3_bias_add"Add
-Ú
-conv2d_3relu_3node_relu_3"ReluJ–
-	namespaceˆ: __main__.TemporalDenoiser/net: torch.nn.modules.container.Sequential/net.7: torch.nn.modules.activation.ReLU/relu_3: aten.relu.defaultJ¡
-pkg.torch.onnx.class_hierarchy['__main__.TemporalDenoiser', 'torch.nn.modules.container.Sequential', 'torch.nn.modules.activation.ReLU', 'aten.relu.default']J‡
-pkg.torch.onnx.fx_nodem%relu_3 : [num_users=1] = call_function[target=torch.ops.aten.relu.default](args = (%conv2d_3,), kwargs = {})J<
-pkg.torch.onnx.name_scopes['', 'net', 'net.7', 'relu_3']J­
-pkg.torch.onnx.stack_traceFile "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 81, in forward
-    out = self.net(x)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/container.py", line 253, in forward
-    input = module(input)
-  File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/.venv/lib/python3.14/site-packages/torch/nn/modules/activation.py", line 143, in forward
-    return F.relu(input, inplace=self.inplace)
-i
-relu_3relu_3_quantizedrelu_3_scalerelu_3_zero_pointrelu_3_QuantizeLinear"DynamicQuantizeLinear
-i
-relu_3_scale
-net.8.weight_scale node_conv2d_4_quant_scales_mul:0node_conv2d_4_quant_scales_mul"Mul
-ñ
-relu_3_quantized
-net.8.weight_quantized
-relu_3_zero_point
-net.8.weight_zero_pointconv2d_4_output_quantizednode_conv2d_4_quant"ConvInteger*
-auto_pad"NOTSET *
-	dilations@@ *
-group *
-pads@@@@ *
-strides@@ 
-s
-conv2d_4_output_quantized%conv2d_4_output_quantized_cast_outputconv2d_4_output_quantized_cast"Cast*	
-to 
-‘
-%conv2d_4_output_quantized_cast_output
- node_conv2d_4_quant_scales_mul:0conv2d_4quant_scaled_output$node_conv2d_4_quant_output_scale_mul"Mul
-]
-conv2d_4quant_scaled_output
-conv2d_4_bias_reshape_outputconv2d_4conv2d_4_bias_add"Add
-Ú
-conv2d_4
-val_11
-val_14
-val_14
-val_14slice_1node_slice_1"SliceJC
-	namespace6: __main__.TemporalDenoiser/slice_1: aten.slice.TensorJT
-pkg.torch.onnx.class_hierarchy2['__main__.TemporalDenoiser', 'aten.slice.Tensor']J
-pkg.torch.onnx.fx_nodev%slice_1 : [num_users=1] = call_function[target=torch.ops.aten.slice.Tensor](args = (%conv2d_4, 1, 0, 1), kwargs = {})J-
-pkg.torch.onnx.name_scopes['', 'slice_1']J²
-pkg.torch.onnx.stack_trace“File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 83, in forward
-    image_out = out[:, :1, :, :]
-ñ
-conv2d_4
-val_14
-val_47
-val_14
-val_14
-hidden_outnode_slice_4"SliceJC
-	namespace6: __main__.TemporalDenoiser/slice_4: aten.slice.TensorJT
-pkg.torch.onnx.class_hierarchy2['__main__.TemporalDenoiser', 'aten.slice.Tensor']J£
-pkg.torch.onnx.fx_nodeˆ%slice_4 : [num_users=1] = call_function[target=torch.ops.aten.slice.Tensor](args = (%conv2d_4, 1, 1, 9223372036854775807), kwargs = {})J-
-pkg.torch.onnx.name_scopes['', 'slice_4']J³
-pkg.torch.onnx.stack_trace”File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 88, in forward
-    hidden_out = out[:, 1:, :, :]
-²
-input
-slice_1outputnode_add_65"AddJ@
-	namespace3: __main__.TemporalDenoiser/add_65: aten.add.TensorJR
-pkg.torch.onnx.class_hierarchy0['__main__.TemporalDenoiser', 'aten.add.Tensor']J‹
-pkg.torch.onnx.fx_nodeq%add_65 : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%input, %slice_3), kwargs = {})J,
-pkg.torch.onnx.name_scopes['', 'add_65']J³
-pkg.torch.onnx.stack_trace”File "/Users/ibentley/Documents/src/orecchiette-fpv-drone-analog-rs/models/train_temporal.py", line 86, in forward
-    image_out = input + image_out
-main_graph*RB
-net.0.biasJ@ZÅ=+iF½E½†ÌÛ<1!=E=ë—½…Ï¼+áw:˜Ë=DBw¼lÕñ¼g•+=Æ7d=øu=]Ôc=*RB
-net.2.biasJ@Î=F!™<ò¬.½KÙ<Z`5=ê8Â;ão…½ÂL=²í<¾Òa½gìQ="-½HWĞ<ï‚=¯€ş¼šv”½*RB
-net.4.biasJ@‚¼?1g=ø¼½‹ù¼,=€Ø»zˆ™<:oK=4v=ˆıS=³ğE¼ã½ÕÔB=Ó˜½}=;<^Óy=*RB
-net.6.biasJ@ÿ•½P8ˆºàqÖ8¨Y½K™=L—=]‘—=ës€½uõì<ëœ)=DQ#<êGf¼QÚ¼fõ«=Û|=òØñ¼*VB
-net.8.biasJD2r‡½P<|Ì¼gf“<¡½¸÷8½ŒI=»«C=| ¢=È~:½¹µ¼ÚO”=RË½è*=Ç¼i„=4·…=*Bval_11J        *Bval_14J       *Bval_47Jÿÿÿÿÿÿÿ*"J’':Bnet.0.weight_scale** Bnet.0.weight_zero_point*ÅBnet.0.weight_quantizedJ 8ßMİ¡KRRS‚&E*F¤ÄÙK’Û3/ûö ›{_)çô.nü†S¼ĞçÕ'øšI$TN¢iÅ? Ö¿7h¹çJ¨uşü:©^lKI7Uô0ïšÉàõ±µ¥à¾â@ß
-Õ,Êâs\ÙÚÕN›Á›Î‹‘ïØZiNÎpFj¨È?X.£fŞâ2­,BÊœ1h$ñL—ãêA54Ù÷©ô)qÅÁÅUìäåµä\³øSøn’ˆ—7—;ú™ºªQ6¶ÅÖÓt3ğ6××Ôëpã›¨*¨‘Ş3¶–ûÇO19’¬ŒúŠâcğ°¹ÏŒ;9œ$¾š+Üqı:±ÊeñˆPJª—Y÷’\,6‹Qîáj<g	[ÒnHñQK¬”HñüØ†p0Ræ`ıŒó
-ñOC<V¦³©Ç2AĞï‡Û9ë7_µ ¶;qj‘ß¤¬ŞN–fÍ"õ§©¼£Û:ø›û»™&x¥;Btäsº@E¼›¤Ô¦·òó8–Œ#Z¦IíhC]KYwóÄjñbT¬3p¯ù²À4îÃüıf<cîLøBàbh¤4Ï:÷`úo¬½ãûñ«¦ØÇOô§õ+#õ¥‹¼ºü ŸÎ–gâ_ÿ¿%éï=DË^/x;:ÿó¼9„yä¡¹ğí¢““'yNévalz³›>q¦®o‰–([K@¯Ó“P³Èv¥ÌM’ùj°"±NºÂ6Âz×ãÄ½±ËËLòÕcİ;íb­úzÉ_8ÓÇõ¿¹§V®»,%¾ë` h½‹
-_$¼-I4¿X¬Ax(%&QI)SĞò˜Å'E»g¬şš,ï;ûsˆÌ_†ÄŒ»É*gIİ«Ï¯±!rŠÑè'f³¶4Q‘¤O˜ÛR^w8ixäÖ+†A0Å¡é»ï”$kÜZ9¦÷:=Ygo^o®Ü'µJş‰×>¤°‹†CXƒ,\Ş|Úy@¿Ñ¡Š›·e2w&Z;E"WSvĞá ¨­ò÷p¥ºìöM-)/Ñp›lEİ<%3ù$¬jşPÂËŞg'ù)'tùØˆØ.>“öÁ¯­X}lÿå5(ÅõmzKOt6½4k¬Ä¨ÃÚmç}2îÒ¥G üÂ_'3@%_LdogwÇßã«÷!Q’¾Å5ÑIÈc÷)½å$i|‡IpÛÔVÎ0¥
-°Ñ›(;MNÁÉ2ì,`jrÉ? äP«ªEî‹8—Œ) ÒÚ†CÉ7j1w9ol\¡¼–jÏ÷]Õ\”y!H¤>psF%=«§·İ´©¯¥YL_qaÜŞèÎ3®¥˜ÚçC¸ÛµËUä"!Ó³Å°4+S=>a/r‚r´L#ÀV¥vS<xí(«DLHX¼œ²nc™6ñ^ºG<æTE­Ù»sìvÓ-IÊ÷båîÛ|·ó¬b,Ã¤©Ü•YK”ÈC‚Îs²•‰÷›K0Á)Y§0¬ı± ãyh¥Jëy˜4jHt{2,IÃâáQLõ3{Q®¶²®¦ñØŸ·TëæV3:Ûû™#Qo1®gĞÒ·r9é<æµ.&ğšxafp¨->t•wÙëò	kIø`]>÷õ%%JD=„EP¿ïR.V;¢à¤˜ÓÎ~WA7xî5úE•­Œotå&Â¥­sãv–c2´Õk¡ü’8-MA–\i’ğßĞßú7¼‘Ø¡^ï½íÀ	ùš#*]ç\QÙ‹¬‡ßÚszjŠ˜x¦XËæãs@ØºÆ±Ä8Õ¡Mdære¿t"}á/¼<òš;"ÍL§ƒtj8ˆl:„W%Õë¯$—Æï§·Î§*w{1¦Óã=Å±&/dìù‹¯øxÚzz{¿ÖéúùJÌĞÂ[K¶]¿å¯ÖÌ´¨RÈ¦¤ìa¨û‘1p!²¸™
-1òü‡Òlº!ç
-‚8<@–FMï¤…ó³Û+2LÑÓÜ Â-eÈVŞò!Ë3?,¸¢Ö¡>aA§/Nê…E0%…¥ˆŠkˆDºÙsÔ¹˜ÚáîÅìzÃe SH'´7ÜãÍ.²’û	õ¥S®q³eAT@póè%w&[ÛÎúŸ$Ü`Éœbé˜Ö É™O“
-›_µŒPu¥î:{ÅÒc×XòtØQKUZìã±r§–Çì”%Ÿ<1½“¸Ì¢ë_¤ÃqGéàôÜİ6ÃÆ¡[Tıæ]Øó“FAZÜÜÕ3õR•úè(·‰8AÂ:½UÅ"•kBÃ;SÕåÕ^WÕH¿¸Sµ‡× 8Â•“WŠ™»ã®¥ûüé«kR?ûÂÎÜWôMe®o_/øsîz+¤ü[[Ü™Dp	6µv/)ezB§úï²<OT4#Â7C\Ò¦Óg³ÂËéİ‘ô‡+âØQb$µÀ¥XKğï’ (¦¼·Œ¢)~â¿Ùı?2!ô ­óŒcâ;Û¢6Xµç$DıIìfµVç6áz¼s*¾`ôşO7­éL/ş›ŠVØÍ ÷â¥ŞÛl¶Æ2Ï§O6dvnÆkÆê _*Á Ö£Bn]9Ø?¢­EæŞ;ë›ék S{¸TK@½uVÑ”›UP?O@¿Y-¾£à-À4ÙoÆà%C‹PĞ›vÃ˜›6“¯àö¯lg±QmÍ²…¦ÂÂ&ä*ºü6°Ñr)×Ñ2cq¯ñÕê¢!,úsgZÅÎ—bÇA@Àšv)&#¥ Âtõñ†Îè¼É¹ë’c· ïtr'¬ÓåHõ³òµ+saÚå¦•\M÷áŞ¢¿.èË¨4{võµùù4 iÆ·»ÄAP+»¡´sÂi¨IÖÍHİÆy<B¾Ü;H/¾0	1Ohw$Ñã¬¦GÛÃ¨a+)ôâúçÆ8•$×Øğ&˜*[“:MeŸÃÑ5ÔükÿÃ¾ñ—ÅıLÇÑÏ:ÀÕ
-- ‘ÚÕ$ìÉ×é]	9Äš*.õ¸kI<SAQrÎQê¶;@y'É›õpˆ7UZÙNõ<ß5ïÂÙ6¸™¿+7˜ğBsåƒ*í:àTsswæ#òÕô¥tš$Sÿol|>÷À©×^ì<WYì;ƒ\]"
-³8LáXôè×n¯0‚ÍñåS8ªfc™¶‘ıö°ÉÎôáp;ƒ[^äÄ–ÕÁıwy9·'÷‡Ù‡:Í©¿ñ*û±$p^oBTÚH,¼—²:ÛÔ> Èg IşRCñgİæh]úO#Ç}Soi‘’÷såÎèLF6MP'ÖŞhŞî<²9dãŠCÄluÃ©ã\ä<¦Œ3LŠè
-^ÀÇ9‰uó¶]“G©úDzAéR0œUÅş=×³-Ü!°^°%ÆB´äŸ@(Èşò)tú•C*.:ÿÿÿÿÿÿÿÿÿBconv2d_bias_reshape_shape*"%º3:Bnet.2.weight_scale** Bnet.2.weight_zero_point*¥Bnet.2.weight_quantizedJ€?sßÿ¬§71™»Ü0·6dVágD[×14Q½k©¸+&©ñLN,-ĞwŒÈ’ÍPê>AA$üÈKîŸ	ÉSRTuÔ/&\Ï<†BÈ&3”aâ4A2ó´ó½­¹øÿ/)PW¾ö;qQS!,æCE-ÙU…ô5D¾9ÇÄîA©èt2oE¦<r7¹Üİ•›Q­5îa¼O^D‘¹•vH(|(,cL#BPğèÿĞàÖ8¤½°kLÈ^JAŸ9©™$´«	ñ«ñsA8ÍZf	W:ñÅ·=‹²Fß¹JÁ}v²ú+Ÿkë.Uô$ur¬‹VDQzÆùíµ’ÈĞ;±‹‘¹qA)#¶RÎyT^SlCı#Çäğ;˜c“¥³É	„=Lh¬]iŸlŞºĞYíøúîqhÛñ-Ñù	—"=$‘¢ı¿Ìè”Ÿ÷Óè¨R/»ÁU­FG£v2Rék0#MCuÍè8Å±^Ÿ\$‡ö·f•±Ã.½¯hÁİ	Moİ¡ŒŠÆNæ)E½ù7P`5é/™QQì‰4_÷L7ø´,¦q!‡R#_´‹èdÏó¤ kgç¹5MïíÕ#ßŠ"ûC6ŒßÅ³ÕæÄã/—®ÿÕuÉÔùğœ±È–=lC	ádV¨QæjZ(úïQÆ)–gU¦"Mä”ÔRĞ›0ğII7»Ñ¦‹1îäçë”ÌB·ÙP÷–¥Øá>ÀOùšå<*)6êñ]$OòÊÓ.qQ¨•Â&‹Ñào'öĞj•mtáèo.=ğÔí ™2!k·ã¹«+ZtŸEG±=0GÍ‹¬Ì“gÃËğMQ‘™´•N¡˜¨Ã:Ö±[÷ºOA×ö	ÚzNCíò`5/Ááæ÷=²A~–rúÿjKXË8øÂİr©šÿ_/ÅéõKk;‚Ã«ŒÖé¼]ŸbŞí
-üÄjÉ’hÅŞ©ÂsÅ²ÓğÇG«âª•×…›ãëâØï¢®°½:š+tÎ `mo¼EŸÄLrÒÕS8
-hÔˆ'1‰ƒğæËÓ«ãIô“ódŞè¹“; ç9ÜÕˆl-˜m—sòµb[¾ırĞ„º·÷	\‘Ï«±HŒ¦ãà%
-óñÛî½^–ÄèˆıwÓ#kŞ.Õ›œhù¾KŞòŞo™§Ğ/Î³‘È÷1¤ùŞ?ç-ã¼MIMqUÄ3UiéÅ5Y&ÿ:Z3J, çÄƒâ2ûi“‡B¨
-B«¨OŸ>şÇg„>å÷6aÇ±0ùXüWüÂ?^'3((Ö‡’Ê-‹eÆÕ¸Ÿ·“˜$B¢_ú¯¼â‚m’cWQ~éõŒÕbI»ßùÏ1}êv®ùş QWi×q±ºU1^Òİ+cUÑ™å«c#Ò{cTt@%æ¿°O3]ân osª‹¨œõÚJÁ\8zJîœû–È*/¦ëIyÂJ¡@´:vÕÕ[›Ş Ã‘ÜŒJ¼Ş¯BÄr´òéMYO-È²¶¼Ñ\ÑúïÌ.YG&ŞPjµñĞ9šş9pf\7e‘é¼—rwYI+HyÀ®íZ%şÿÉ ¶”º eÈXğ£NÌñ­&DjSLò½]»„ò›:ëZÃ#G,G?U u%ÜÕ)¯HEş=/P)“¦°Ÿ“L¦îÖPiŸ“0˜S³<Mø/ÛV+(t¿¹°°d‘Eæó”`ë†õ	âN ÿR¨@öàPtÇBÚ·fìY¹ğÌ+N t˜ØÊ°ÖóĞ*¦Özk³/oúO öÒ½-
-ó¬¬>[Î#ò½©Ip$ŠvjÉ)	ÜveoZ¦óòU¶!Owm_ó²7émpg¦î*í ì'æRa' Ã£±%=1óâS?¸Ôì?Áúµ ÷‰±Ù¶VJ¬+Ì’f]`¨Y§Än¿®µ”›%„-Ü-h+İ-6
-Ë ân†«mUóß—ƒ	—ƒêŸ˜~úqïaöë2 l‡@LçÖó çè¬NºòbÎòß¾Íµß¦ÍÊôu5"¬›½[í‚ø1Š`4‡†„©k8ÎM)Tõ’Q³ÕIfâï¸@	`,ÜmÜômFnÎê ùŒS˜İF=Êgàú÷]—¬ñ³èÊPìP ³<¾ şQ~º'÷ ò’F_j>Ÿ!rRm÷×LA‡*Ír4h»U >Í_%ä ¬µeWP”Şt-Ái sèS2Ç=Ş˜5'@`rÇ{«½Yó 'wI@Ìè§´J*+Ö
-3ç¸“i»œR›Aæcf›¹	`Hq"_Q—|¢ƒâ?CĞßq ]Óôl^ÎÌè°ÖıÍu÷Xu8( ·ÿ.ÏGÉ5"Ä¿T1YkÖ—õfhA}~i {Ã¸{à—n¨l§{#—2%BÑ*Òã(á qà•`Üò²80XÎ¯:ú^=`•Ã²Nûåÿ?á’78°œ@'e'$=<!U5â0¹Àİ" Æ Úº´MñW’²Ğo[gx¸#‘ú–™$í;;P©Ë¨Ä®àæd&¨Šø8	*rYTÜ;œ¢yÇh«U4kíÓû½]}şÛ“Ş5ŸÖå›°Ñ!a: &1á¦b`¼ØÌ<Ğ_ ¯nËvıá7¢•À/äi°¢–ùÔ[0,2kœ”Œòùã/K›½M‹ùsp•&w¢4_—m¸K8 ½’v²Í¾Ø•w‹õAğLCÜ	‘Ü¤æÃ­9WÛ:9s>²Û.®İBáÙÇèÜYN_åih³ Hq+xœæU‘¥pTJÈ]G(Ì©Şi-¨gm2âœDæVâåø"Eqg;í½ëÉmŞKer«şıéğJØéW!´ÚQ<:ÿ¼õÄ¦ÏoÙ]uî$¬“u­Í3:(ªŸ™%âŒs)I>”ÇE‡i=Ò?¸Âj™Me2YyIÓ·eRĞ|í$Ì?kd¦äàİã- üš¬Èï¯pßö±%í¼ÔæÊSåäçõ*0:ÿÿÿÿÿÿÿÿÿBconv2d_1_bias_reshape_shape*"Êa2:Bnet.4.weight_scale** Bnet.4.weight_zero_point*¥Bnet.4.weight_quantizedJ€ÈÊÊØ\’İœg£aCÔ_[…¤É¸b½´åË¤ÍìßÌuá‰æ1ÚÒ6»$açÉ=--â÷÷íï®L=À1MÀXÕ‰ÏïoêV!ñÒ>IX¹@ÿı¿ÍBpÌJâ0ÆÕï¹ïÛfŸ6Ñ2ªì3.ÿ¾c"³˜™FĞ˜hè˜œXëğ;s¤ :¨a^ÀWKú	q‡àOÆ×¡Bs4Ô•'5»'q.-/ÕR¸¶¢±eíE÷bFö·‰Y›AW	ñH©ØŸÃK¦»Æ%Ï“ƒN'pŠ	9SœKµÅ;Ğ_¯ ¬@p eæõu¥ğQ.ê¼ $(£)>O¹‘E¦ÇUİê[2Ìg `Ëß‹%¬7®Û)ò$ŠòõûŒˆSk'íñóneqaUúNüåÉW@O-^öpWÚ†MH‰ÕûFb*««²$aQ÷ıDŒ†¶(¤ÂÂöOÜ`õïSCM-)@µì.—C7áW»ß§.œßW)hÈìYD¼°öJà§#¡ZæF˜ˆ¬rbŠ½\Ì·†¯b\ ¼Ã)ûÅw@)E'à&š.&)œãá?œWÈIÄ”4æ³äl…£tä¯¤tºƒèwASÕÍ¡bâ\SZå·ôØ&l’Uå[]˜®›¨ßèÙ™³ö¸ÚÊõçK¨¾‘Ÿ5•6l`.CUør˜Qî6*GÜæ¸ÃŒs®‹C ›Ñ•mîáµ=ÓJ]j[ÒØ2d­UšØ3ÈÚK&âåC¤5\0EšqráGDi”EîŒŠ×(âxû­ûãa'ü#£Ÿÿw…´$¢%$M|DÒİ)17MW¥
-‹É:0Ûß š«±8Ô?4¸¤÷Ò«apú“ö¤Ï”øDŒ¬¯˜Jív¥tõkJSÒ°ob´¿o5à=5”Ô(|@ÉÑ„oN9úü³ÁH+$tìJéòØ_WÀæëü mÕ¥üx½¬Îº£T!º&°o”‹`R=ªÖFIÍ:aI2Ü`Ì<»ı¥kmÇ@ïì/™y=ó‹—SÌ›½‹˜lš7é•¤·ÈÓkõËj‡”ÛfJ•Hnºóà½v,ñ©4F‡Êûëí!>ï#ŸQ³>±rRçS?pµ¨‘òvœvûtlxPÈpêv¼F±2ZQ÷7ŸNô–ü·ã¼1+×æ±]ğÀùüÚîR'P˜V@XU@ Â½‹uôœÔú±šEŸ¶.)ıâÕÚİBÅÿ,fl!N¢%:ø<hú04Ö±Ì­A»	ôÌiâåJåÛv/Ya©ïS „´íexj/yÖç6ÌÂåßD¶O¨ıâ;/+¶Ê¢ÂA™(^c?ØĞ	@X*Iª¯¹üÇ-9¥¢eêÒ!_)³È¨:ä'!÷øLLÈ"Kùß‡i[ "ñ½ÈSĞ65çÙ–ã`'¨EK•&ïî-WËØæZTlZÌixj$ª)1"±ÜÜO¶×v!°n­W$!ÊmŒG¿ºÀö`Ñ;SşRçTE¾³<3Ér¬aµıaÔL·®(ò,îT)Ì&u’^ÛéıVÜoù¿Ğ/hiJTŞ\]T¥ÅĞ=çº¦™¼Ô¿I6dÑªG8pf±Âä*©Eç,Ú@á”	ràšUúÕ–n—Úv»DúHo†­[Ò«f÷ªb+™:à¿kqõº½§%¹¼£,Ô™¶ÀŠÓmN8O8çÕu¸-–bÕ¡%­ıá«ÑÕ;q^„ö¶
-É…6*‰[­çyÿ=l8âûº0ÑQ6f¸Y@ÃHkZhò®_ØoÌµHÀ$Ø#ÜŒ®Ï‡cƒèeçG;šl QšLS¤ QL š[AáËŒ2M¶¨ÏyÚî¡¾j½Š«²~ Æ}¢dúg/ß2åsâ*h³Zü.|e8£ÃQœŒRo	¶Ç80`Ï—çÀf
-CØhqÄô97èá®‘/XnÚ\TrıRôãÊÁg>BÄ­úáÄğÃÕàîÑø–±_ÀÖZ¯&–ŸŒwGP%z_±¨¨ìkgsr‘Z£u6÷sm{Ü*•B+H‡nc/ºórw¯8ärU±Fzøû©	ašÕ[¨séV	FG˜"ñsáõ)\c^§¼'Œhıó‘¨»ÄIoÑ˜T­+¶¥ıĞ©+aI¸•ÒzFša£ò¿ù®©	†Ù'Ÿ%;è“¦IG´z¨Í¯:CĞ¼É‘3£!O8¯1Ö¢8²§&¯gçìš¥Â››.GXçŸ ÛìcÊb6¾Ö-°Ú_Ùw¹,Ñö¯C:ß~Õ!qo¡ÏŞe÷_CÄE,üD¹È¯üÀg
-¢1õŸ•¥ÏÓì´Ùì½ô	K»=l™Ä°ÜÁ,úüå»İK¹ú(Î¿àÁ½4R« û å[<ãUGF-P48KhÉèle›í¢Ç¢5®Nè™uŞÚÙéÈ´¼X!§Í?Y9núÀ™b)·Xy¯	1rà‰¥§Ôfñ0Àáµ•Ûq¯Š2;ø6q_B*!;­DTÌ’÷.é¡ÚìM™}çXßh<f%‹Æ ş\SÍõpv¬™ë!Û(‘ç5Lü‹G/mšÅŒ{Wm%”½Ò=¬ •vşfB3ÿæ´•nu%
-¹§Ğ®·)Îj6bKÿí¡lALs#µºÄöûÍƒÇ—­«w3H:_ıøÛ0é4ã†„^ÃÇ9<Ğ÷ás]ïgSÁó)µT—Ïô©û?’gãÅÔ$80Ú ½õ-)²óåÒ¸%\vùöÕdŸD·Ø=ÖR¦ cİÜŠºmİgU|w½°§N]w1rh§C¸
-À;jİ®ã´d÷+4ıÓşWXz}ptÅnk3-
-?2B’¡yÏì5¤IÊæIY:Éi/sÈÅTTş˜¢¡ôÙĞŞÇ™NßÛtØâxbhÄ
-™™²™Ë³d|ÔxŸÒ«Õê%A¥á’è¼vÈ`(Ğäh*IÆ}*5=pêÓ÷s¸Èï®B‘ªTÁuîsÄ®@~ü[ÿ*0:ÿÿÿÿÿÿÿÿÿBconv2d_2_bias_reshape_shape*"]¯2:Bnet.6.weight_scale** Bnet.6.weight_zero_point*¥Bnet.6.weight_quantizedJ€È—ÒÀº&g¤êü·û3İàCÂÉà	¹^ßD»T±’ÙìL¢§He¶l¦c÷†Œúğ+Ä×.yğµ.¤½R³B¯!é%Ö‡Ã‡6ˆÁôÈOFwÂ¸@ 
-_s§‹r>33ót‰#e!Cí¼	—6È'ú§8ñnLw+2[AYD¦hÙfóz_ırEU­iÎ©JyÅ•ÔöT>^Z¹GïÈ5)XÂ(ÉïIW5bVMGÍ)ÏÅíO¢*9\(8S“lÄİ,WZ‰eˆvgˆâÈÔ'£Ù4…¾ÇJ+VïRA»ÈÁëGßÃj‰ãî¯Õ6“ÑìÌÚ#v˜åK£™'‹b9Ü&ÜÂÒ8Œ·¨×Èg nÕ$pÕÄ¥Û)¼ézlT–öÑáôA*hÉÑâä¨BıvnBô¸ÌısÀÂ#‡À>ÃEÒõie)dÚ¡béŒ"•Šm¡9ıI
-‹Ã&TÛJ”Øºœº‘œÿËÏÁM^G>Êv<¾vR(ÈÍÅáM*Ü‡nÆ,àJòº˜j¬™Ü'ÁãÛÍ´Qò³i¶ÓÑİ\ˆ°3Ñ8L‡ºWå7¢]©´xâw²
-¹ˆÙÑø´¶÷ôB_Jâ¯zµÔD3±<,pCäêÄÛnÈ/‡¹^CbÛŒUPO\Jê.âL¡©¸—üù	‡™áÇW†ÚyŠöYİ´ác	yš¡dú^ÁÍSì¶Äá+Á:ÆI“;è@Ò©+BJ°37Ø7!, óZ½–f¾?ËlÑÃošó9ÄæÖÜî}Ió¸;˜gøà÷ö\fuËÑ, rëÎŠY–6)Ê©Q½±íMï”q¨ããÒ5ëSğòoøšŞDóÙÎ–ª0 =tğèı
-Ç‡¶Ÿ©h8l“7Úx“Òk³ŒKå­My“ÛP¢.JRCèl`$ö<LmØWX,2ÃJ«ò­jheá¤–h™æq¥ìçoü* æº4Kß1I±}ìVVi^C–¾ñq‹ #-¤Iç PVu`áL[>âÆr#_XößgÂ´ÚğÁêtÁt¹õWbGYPbB¦`ÒcÆµzÁöí°ôÊ•>H_K6“Íü*şqsu`Ì¤$ô¿)™ëHÌID¾ÄÒ-,Í;©º×“U×3h5V¿eÍt†¡ØœĞT»¯J #Í‡5>œıi‡WücSOÆ±O-ø”Üı˜æ­ª‘ûÛî¤Î¤ó¢zpTî÷F`ºœ5MtåÎ¬ÕãLkÃ1¦ëñp4Õ"¯*aÆÿCŸ\¼NÅÀ‘bxĞ:Š1&ü¥±w•½cÇtb¯ÁlfDÌ6Óxø¸¾®oä­Æe@µ¦49$)šı7¥õzo¦pŒ›ë“KNéÿ÷¼¥”–´)gØ´öUSH{élü…Tş*fPWø]WÚ[PöĞZ[:òaF»] lYığŸ¸¾=E˜ñB:¾ˆEV"îa«›ñOZR¦QÊİ5n=Eûšà`Õ¿AXş|m¿×8"ˆ„õ™WËÖ—Œı³+Ø¬}¸1áŠŒr™Cİ¨'kèİTCKPã’0Z^XúAâßšŠ„²ü:¹	­R–ÖB@×ÎPRCH±Ş³5ïLS“2óó9¼xØ× qÅ<3+ıu¨¿À1×ûTrÇ¦—ûü'”Ë/C»ó nÈıfè&˜¥ü=›ÏppÍ¯¼™lU?¼à&tœeÜªÎ™aÑü4óÁZÄÓó)ÇÌUQ¢ŠQ	×SUmØ¿+È‘d¼¿¥^	[õ±jºÊ¢$Ä*)Hõ¥9=Ø^UwïÔ,M8N©ézpr¹ ÙJ½V# ±ìEŞ?66S³wL««4Ünñ‘Ñ%ãÛMñ*#q%ÎfrëÖÊ]‹–”wc»ó™—^ªV!-RîÇ°UìdèÀËHpÜ”gäŸ=ö¹Jß¯‹íô>ùØ	Î¨¸_cfö	‹6óŸ;Ås j
-+
-?üşBÎí¶ˆfÒıÈ3×[ì#º³åÆëk^ºÜUNfvë# ºŞ¬“¥ä-"îyÊBéüİ9‰HX¥›àe;,&É«Ì¤. iõ‹}Mÿ ºSJI‰‘_rTÍÄÉ÷BbbVMq/HSè^Ã&{ël'`»òYlµÁHÅJëNuÜGqT=EöU,e¿¦’áŞf n§xŸ{{“Ò,¡ñs½3÷0‘÷A6rRfi@E_^’ö[ìÛñ”¥µ}ÏÊø.
-ÅÇmŒV¬”¨5õP´±a$Y·NÃ¡DÔxŸGc*9×'fØLëê×qŒ)8Ü•: "t˜ªÒoïTÃ6ZY¦iÎÏX0ˆçğJ;Mív
-!Á3ÂônüĞõ˜g¦òVê/s#½ÔÆ
-%+²œ*•0¯§\èV8+/ù@ÁicO¶ÎFÙNî ×‹vKh•ÔŞ›XTbjJ,Èæ Äü-´7ûú÷Y’/O¶¿Øm¯Gfk¶Œ4ùUÕ“=÷Uêí=í^àd¾½ÕßèÙû®XïÙ¨P¬‘î÷é§=éN~Xf•¨G¨/ÑóŞO°<‡ÍBI«ÍÌ)ÔÃHº‹‘š¨Ç:e  ãfYÄ¼Ø[Úd.¼?èzêè#]ë„9'f 
-~ÀéãjFA^Ã¬”vV8êêÎ?rí¦ÄóèğJ5u¤‹e½’Arı¥5–I¾ÉÅÊ& 
-Ö±ÛâÉœ,§ÀáıT5NQã²$¹Õ×Ç¬óÉ,7„U¿“$H­"•£JÙ6Mœ­'M»#%Kt6×¨ÒDÎ/¸?•Ò9Øa¥cúß
-Q—#[Œ_5 j™81ì[¡Ó£È&º’qWI$Ì‰5Îµø‡èmDéDÑI7Ñ*2£Ïçx`Åb™¬¿ó¦WtsÚ’^ ¡x9$ŞÙ2Õ6lÍÉ?ˆ.Ñ@Ñcïb‘ÈoúÉ géL\ıHòP%³×Gn`åºÄø	*0:ÿÿÿÿÿÿÿÿÿBconv2d_3_bias_reshape_shape*"Ø2:Bnet.8.weight_scale** Bnet.8.weight_zero_point*µBnet.8.weight_quantizedJnÄ^÷l†ËÒ6Ñ:Gí#Š—k¶¾¡¦¢Öo¥ÎR¹–›s(tù
-BÔoÔ¢0NC80äÎ|¹â%9zšiª„ï Ù/%ØPMö–ÉÎ¤[õ’o&XofİåÕMh¶Ë9)ş¡
-K6*=¹±îgòÎ-áQS^ğPçğÎeİ {·+«¾?öaÈ±yN’Ä\ÈÔÖ65TèonÅãp¾¡³În³–I­	*‹¼ãX¥Ç	öP0}²$¥g&¿£ +Q¯şÌğ7Ëö•ä¨œ¢¼©4^Q{/ÈlÌÖi«°Æc"W¬è®ôO-¤ówF4İç |>}8%ö}ÈYÊ(®ğ"VÁe F4?îŸI{É<¾¨;~HA…­Ìîâ[˜D±H¶ – ¼ömægøoÆLäª%<îjBb	äïSFãê¿Šş=¢Î1‰Å1Çÿ4J—:ÊÚŸWTö6óÈÁË'éns“³HCë·oªEoõ!ğWÕ¨)L©çE… QêÈÈ½¬4û¡ÿÙNC/÷’@J”–/GcÙ3è¯‹¦oôõF[xpÀ©ŸªÃsWQÄùüãó+-ğµB4=˜!wˆë­¶¶¾M*5ìªï`kò›E±è7%¡öD[òöÀšö/Ãş4ÔI‹”9B¢ÃíÈAµğ/’ö—Ám›ÏÂü£k¥68üg[Éµ¹RPö•²ì„IÎœÚ)o¦"Œ	F ·â#ªA™éS¤ba<¦&2.¹rõ&Äğµ¾¬ë57n³½ÊÍMuœåÃ¤4hFËÃ^³üåË¨kM]¶‘÷	‡µªºÌ9¡¼< …óÅúš1FJ¸±ê+b’Y;jµ?ÁtÆ£–	,K™^¹3ˆDˆŞvœ¬àÿ_:—“L"S‹ÜUòŞF¶ãÑúŒcÁtK0K—l6=ê»¼bX&ì¤½T ,$°>k:[¶V–-åÕ¨%M½á:=G)ëfyÜ,˜Ò¸ä”öW•$Œu˜[±æaÚXÖR=S±µrò+euÎ)¹šÅèJur	O¬Ÿy (0»\?ò<E¦XåÍS‹n•Ğ/eµÚIß¡À¦É22”´áóLİ
-hhÖëîşu¦®úäÕ­CÁÊ‡¾*–üãŠzâafÈR:şıü³»$*ÚÈ+pSb"ˆÊ¶I¨WÎ®·1¢­|«­=÷˜QÒ¨ş_2–;Ìùpºpª>ì5apmQ%ÅáDŒYíú­›*øÇ"D<ÅLOl¨şÂ4ÑÊt,:¾KŒåZQ^Ø”àH;X7¿W’¦añ='†g÷ÑöD'#ån¬—ÅÉt/Á×Œğ×­¦İºÈ˜2Ğ•Ù©ç?3M¯lÁ­["§^.÷İĞœnDr$V’¥—¢c3MË¬/Tmé¥:®ó¨tÈ2ŸĞÛÏÍ÷¸°rÀÓQçi?ú>v3Irñ¹a™˜ÖÍş¦7ÆSgº'ıüò&Ä­1®rrGvPÖÍ»g TÊ‰OĞÆ¨Æ!j#»K¿ÓäNİ,Œ´ïü£õ»ÿŸ ŒL$°e#¸ô b¶4¡hš“®ºTv×híÌVå®#pØ:(Û`³[&rW5Êµ;‘¤l%’ïÊ“gÈÁ½6 ÖúS½/T®R}¸¤7Š/QD™cô08¾é>›È)™pTAWÏîØT‹·Ä-ñ,ğê\¤›¼À§éuSËEÙĞï	9Ãl7øi©!Ş») XR«ÎŞ@üImIêÉV
-Ê“¬öÅ9(Y¹cÛiN|æ7õ®/Á»œĞŠã›ãÉÂÄT²8£™²nB/1Z•Ürwõ¤ùèğÉ­[Q¦«¯—”ãõíÛhÂJIª0;IÂ“àhd¶Æ²—p=ÇËzï8GP¯¤g¦Œ¤F`—j®QÓq1Œï¼F©Ö–²-Ç±2hF9°r½, <¡ÑaVF85z[çC<EÑgd¹™4ÙxK#1DÜ_á³h$`öËl-+FæI©|ºÛCù³IšŠ!+7º±ªÜµµØÿŸŸ·âOt?—O7Ëİu5I>šb¨o™5Só9cÛ Ãâõ>ï:µGDÁĞQÿ§p¯ÿv¸"Éı5ü‰Ã H
-²ı£V;5Ñã©«½%ID$Gó/4X`7/Ğ"ñ_ttçKŸ Š¤ÎDOVZ/ÒíN_İ-•9Ú ‹¹©Ü5 cJıšxğ\H¼š	éKDé¼8¿cPÆÍ¡"ÁeØß‡ı·H[ôŠ[g³jÈõáF4—z©àÅ¨ªºªk­2­j‰Kâ
-)MQÒTÅÜş8â5¢ËÆN[D]ixG	·ÇµšĞô_r¸¼!!q5í˜A«ŸH7>‚“ÍĞ"›oçÁ–jŞÊßÖ0XŠËÈÄ]Íñ&DæŠQ5¢VØÉ)¥øÙò*K¥9Ô-ğÒùM7“±S&M©Ñ9kŠvä,>udâ±Zğ•ït"]l½ÏP Ía©‚òÊ^r¿	*˜`„¦e¿Œ
-™†bAØ’«BQ:ØEiòî<ú•ôØÒ*k¸¡+ör«Ã§B^¿’pBÉå8Zæ;Ÿ†×)ĞGì0‹kX£êæ ö‰/C6gËÚeZ4¶¢Ü&^E¤_Î÷ü-XpàûÉk=êøh‘ÂYn•É¡F6X]I/	U[˜Œ\İ™&M<ÎşD4W³GİG;¸µ‡Ô ÒfÒ5˜´ˆRHä¬)+¹ÌÉé’ Ñùú+¢ò©·dè†ÿ¨ã–şSúaÚøÓÄãBÖøˆvõğ·y)g™—s¢5›¶ÇÇR¥$Äÿd^'”ˆ·L3w(İëİ¶’q*ãíô^Òõsº)ìãÌ¯V#ŠSR£°ô_ş‚®Oş¤4k3ÊØ6ÙÉšP†œv©±l5¾UõUrRtœ#‰Ç„‘˜–[kô'6ÒC5û&tR©ófPŸı .©èS[zp2ÌÄŒ‘A<Å%7ığA{$µvÂ–§BÊ8Í©Xl¿n°	’g=Í’š8Íö -:U iµ½©Ê=HóŠ©5jåÆb©¶´ì´
-Û'*5È¿¶Ù“ş£xÇ–&íçŠG¿[®a“(ãe—}÷\ı£]³! OTÎiOËg­‘yÌ¤–ä‰zTš>¾q‘ŒÙ×ÿÄ¿›”_^*0:ÿÿÿÿÿÿÿÿÿBconv2d_4_bias_reshape_shapeZÔ
-input!
-
-
-
-height
-width"=
-/pkg.torch.export.graph_signature.InputSpec.kind
-USER_INPUT"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"*
-!pkg.torch.onnx.original_node_nameinputZÔ
-noise!
-
-
-
-height
-width"=
-/pkg.torch.export.graph_signature.InputSpec.kind
-USER_INPUT"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"*
-!pkg.torch.onnx.original_node_namenoiseZÜ
-	hidden_in!
-
-
-
-height
-width"=
-/pkg.torch.export.graph_signature.InputSpec.kind
-USER_INPUT"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone".
-!pkg.torch.onnx.original_node_name	hidden_inb™
-output!
-
-
-
-height
-width"?
-0pkg.torch.export.graph_signature.OutputSpec.kindUSER_OUTPUT"+
-!pkg.torch.onnx.original_node_nameadd_65b]
-
-hidden_out!
-
-
-
-height
-width",
-!pkg.torch.onnx.original_node_nameslice_6jÈ
-
-net.0.bias
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"1
-!pkg.torch.onnx.original_node_namep_net_0_biasjÈ
-
-net.2.bias
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"1
-!pkg.torch.onnx.original_node_namep_net_2_biasjÈ
-
-net.4.bias
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"1
-!pkg.torch.onnx.original_node_namep_net_4_biasjÈ
-
-net.6.bias
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"1
-!pkg.torch.onnx.original_node_namep_net_6_biasjÈ
-
-net.8.bias
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"1
-!pkg.torch.onnx.original_node_namep_net_8_biasjØ
-net.0.weight
-
-
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"3
-!pkg.torch.onnx.original_node_namep_net_0_weightjØ
-net.2.weight
-
-
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"3
-!pkg.torch.onnx.original_node_namep_net_2_weightjØ
-net.4.weight
-
-
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"3
-!pkg.torch.onnx.original_node_namep_net_4_weightjØ
-net.6.weight
-
-
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"3
-!pkg.torch.onnx.original_node_namep_net_6_weightjØ
-net.8.weight
-
-
-
-
-"<
-/pkg.torch.export.graph_signature.InputSpec.kind	PARAMETER"=
-5pkg.torch.export.graph_signature.InputSpec.persistentNone"3
-!pkg.torch.onnx.original_node_namep_net_8_weightjZ
-val_11
-
-
-"D
-$pkg.onnxscript.optimizer.folded_from['val_10', 'val_8', 'val_9']j[
-val_14
-
-
-"E
-$pkg.onnxscript.optimizer.folded_from['val_12', 'val_13', 'val_7']j\
-val_47
-
-
-"F
-$pkg.onnxscript.optimizer.folded_from['val_22', 'val_45', 'val_46']j(
-cat!
-
-
-
-height
-widthj+
-conv2d!
-
-
-
-height
-widthj)
-relu!
-
-
-
-height
-widthj-
-conv2d_1!
-
-
-
-height
-widthj+
-relu_1!
-
-
-
-height
-widthj-
-conv2d_2!
-
-
-
-height
-widthj+
-relu_2!
-
-
-
-height
-widthj-
-conv2d_3!
-
-
-
-height
-widthj+
-relu_3!
-
-
-
-height
-widthj-
-conv2d_4!
-
-
-
-height
-widthj,
-slice_1!
-
-
-
-height
-width‚ù
-0pkg.torch.export.ExportedProgram.graph_signatureÄ
-# inputs
-p_net_0_weight: PARAMETER target='net.0.weight'
-p_net_0_bias: PARAMETER target='net.0.bias'
-p_net_2_weight: PARAMETER target='net.2.weight'
-p_net_2_bias: PARAMETER target='net.2.bias'
-p_net_4_weight: PARAMETER target='net.4.weight'
-p_net_4_bias: PARAMETER target='net.4.bias'
-p_net_6_weight: PARAMETER target='net.6.weight'
-p_net_6_bias: PARAMETER target='net.6.bias'
-p_net_8_weight: PARAMETER target='net.8.weight'
-p_net_8_bias: PARAMETER target='net.8.bias'
-input: USER_INPUT
-noise: USER_INPUT
-hidden_in: USER_INPUT
-
-# outputs
-add_65: USER_OUTPUT
-slice_6: USER_OUTPUT
-‚]
-2pkg.torch.export.ExportedProgram.range_constraints'{s1: VR[0, int_oo], s19: VR[0, int_oo]}B
- r
-
-onnx.inferonnxruntime.quant

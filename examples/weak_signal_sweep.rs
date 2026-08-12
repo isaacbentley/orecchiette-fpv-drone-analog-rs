@@ -120,8 +120,12 @@ fn main() {
         Impairment::ImpulsiveNoise,
     ] {
         println!("\n=== Profile: {:?} ===", impairment);
+        #[cfg(feature = "neural-vsr")]
+        let nn_hdr = format!(" {:>5} {:>5}", "gcorN", "Δnn");
+        #[cfg(not(feature = "neural-vsr"))]
+        let nn_hdr = String::new();
         println!(
-            "{:>5} | {:>8} | {:>12} | {:>16} | {:>10} {:>10} | {:>5} {:>5} | {:>5} {:>5}",
+            "{:>5} | {:>8} | {:>12} | {:>16} | {:>10} {:>10} | {:>5} {:>5} | {:>5} {:>5}{}",
             "sigma",
             "CNRest",
             "single(4x)",
@@ -131,7 +135,8 @@ fn main() {
             "syncD",
             "syncP",
             "gcorD",
-            "gcorP"
+            "gcorP",
+            nn_hdr
         );
 
         let mut cliff_disc = None;
@@ -297,7 +302,17 @@ fn main() {
             let pll_mse = mse(&pll_out, &truth, skip);
 
             // reconstruction
-            let eval_demod = |demod: &[f32], phase1: bool, name: &str| -> (String, f64) {
+            // `use_neural` is opt-in per call so the sweep can print a
+            // denoiser-on vs denoiser-off comparison — and so the TRUTH
+            // reference is never itself denoised (comparing a denoised
+            // frame against a denoised reference hides the effect
+            // entirely, which is what the first version of this did).
+            let eval_demod = |demod: &[f32],
+                              phase1: bool,
+                              name: &str,
+                              use_neural: bool,
+                              cnr_db: f32|
+             -> (String, f64) {
                 #[allow(unused_mut)]
                 let mut recon = FrameReconstructor::new(sample_rate, false, deviation, false)
                     .with_temporal_window(1)
@@ -305,10 +320,15 @@ fn main() {
                     .with_line_locked_clock(phase1)
                     .with_smart_doc(true, 0.5);
                 #[cfg(feature = "neural-vsr")]
-                {
-                    recon =
-                        recon.with_neural_restorer("models/temporal_quantized_trained.onnx", false);
+                if use_neural {
+                    recon = recon.with_neural_restorer("models/temporal_denoiser.onnx", false);
+                    // Feed the measured link quality so the model can
+                    // modulate denoising strength — without this the
+                    // conditioning plane stays pinned at "clean".
+                    recon.set_neural_noise_level(cnr_db);
                 }
+                #[cfg(not(feature = "neural-vsr"))]
+                let _ = (use_neural, cnr_db);
                 let mut frame = vec![0u32; recon.width * recon.height];
                 let mut last_res = None;
 
@@ -361,11 +381,18 @@ fn main() {
                 last_res.unwrap_or_else(|| ("  — ".into(), 0.0))
             };
 
-            let (sync_disc, gcor_disc) = eval_demod(&disc_out, true, "Disc");
-            let (sync_pll, gcor_pll) = eval_demod(&pll_out, true, "PLL");
+            // Measured link quality drives the neural conditioning plane.
+            let cnr_db = estimate_cnr_db(&iq).unwrap_or(0.0);
 
-            // Also evaluate truth to generate the truth image
-            let _ = eval_demod(&truth[1..], true, "Truth");
+            let (sync_disc, gcor_disc) = eval_demod(&disc_out, true, "Disc", false, cnr_db);
+            let (sync_pll, gcor_pll) = eval_demod(&pll_out, true, "PLL", false, cnr_db);
+            // Same discriminator field, denoiser ON — the A/B that says
+            // whether the model earns its place.
+            #[cfg(feature = "neural-vsr")]
+            let (_sync_nn, gcor_nn) = eval_demod(&disc_out, true, "Neural", true, cnr_db);
+
+            // Truth image for reference — never denoised.
+            let _ = eval_demod(&truth[1..], true, "Truth", false, cnr_db);
 
             if gcor_disc < 0.5 && cliff_disc.is_none() {
                 cliff_disc = Some(sigma);
@@ -374,8 +401,13 @@ fn main() {
                 cliff_pll = Some(sigma);
             }
 
+            #[cfg(feature = "neural-vsr")]
+            let nn_col = format!(" {gcor_nn:5.2} {:+5.2}", gcor_nn - gcor_disc);
+            #[cfg(not(feature = "neural-vsr"))]
+            let nn_col = String::new();
+
             println!(
-                "{sigma:5.2} | {cnr} | {single:>12} | {integrated:>16} | {disc_mse:10.2e} {pll_mse:10.2e} | {sync_disc:>5} {sync_pll:>5} | {gcor_disc:5.2} {gcor_pll:5.2}"
+                "{sigma:5.2} | {cnr} | {single:>12} | {integrated:>16} | {disc_mse:10.2e} {pll_mse:10.2e} | {sync_disc:>5} {sync_pll:>5} | {gcor_disc:5.2} {gcor_pll:5.2}{nn_col}"
             );
         }
 
