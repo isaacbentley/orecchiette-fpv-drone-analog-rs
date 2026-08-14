@@ -355,8 +355,35 @@ impl AnalogFpvDetector {
         // the default block size actually hits.
         let search_range = ((fft_len as f32 / demod_len as f32).round() as usize).max(1);
 
-        let pal_energy = self.get_peak_energy(mags, bin_pal, search_range);
-        let ntsc_energy = self.get_peak_energy(mags, bin_ntsc, search_range);
+        // The PAL and NTSC line rates are 109 Hz apart, so on all but the
+        // longest records their bins are near neighbours. A search window
+        // that reaches the *other* standard's bin returns that standard's
+        // peak, and both measurements collapse to the same number —
+        // whereupon `pal_energy > ntsc_energy * 1.2` and its mirror are
+        // both false and the signal is discarded as Unknown, however
+        // strong it is.
+        //
+        // That was the dead zone: a clean carrier missed at 13 of 30
+        // capture lengths at 61.44 MSPS, in bands rather than at random,
+        // because whether the windows collided depended on where
+        // `demod_len` fell relative to the next power of two.
+        //
+        //   len     padded sep   radius   reaches other bin   result
+        //   196608      1          1            yes           identical → miss
+        //   262144      1          1            yes           identical → miss
+        //   327680      2          2            yes           identical → miss
+        //   393216      2          1            no            distinct  → hit
+        //
+        // Clamping the radius to one bin short of the separation keeps
+        // each window on its own line rate. `saturating_sub` handles the
+        // degenerate `sep == 0` case (both rates in one bin) by collapsing
+        // to a single-bin read; `bins_distinct` below rejects that record
+        // for spectral discrimination anyway.
+        let bin_sep = bin_ntsc.abs_diff(bin_pal);
+        let disc_range = search_range.min(bin_sep.saturating_sub(1));
+
+        let pal_energy = self.get_peak_energy(mags, bin_pal, disc_range);
+        let ntsc_energy = self.get_peak_energy(mags, bin_ntsc, disc_range);
 
         // Floor at bin 1 so the DC bin (nonzero even after mean-subtraction,
         // because the Hann window has nonzero mean) never enters the noise
@@ -2067,5 +2094,77 @@ mod integration_tests {
             integ.accumulate(k * 1_000_000, &tiny);
         }
         assert!(integ.buckets.len() <= integ.max_buckets);
+    }
+}
+
+#[cfg(test)]
+mod dead_zone_tests {
+    use super::*;
+    use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+    use crate::vbi::FieldParity;
+
+    /// A strong, clean carrier must not be missed because of where the
+    /// record length happens to fall.
+    ///
+    /// It used to be. `get_peak_energy` searched ±`search_range` padded
+    /// bins around each line rate, and PAL and NTSC are only 109 Hz
+    /// apart — so whenever that radius reached the other standard\'s bin,
+    /// both reads returned the same peak. `pal_energy > ntsc_energy * 1.2`
+    /// and its mirror are then both false, and an unmissable signal was
+    /// discarded as `Unknown`. Whether the windows collided depended on
+    /// where `demod_len` fell relative to the next power of two, so the
+    /// misses arrived in bands: at 61.44 MSPS, 13 of 30 block-multiple
+    /// lengths failed, nine of them consecutively.
+    ///
+    /// These three lengths are the ones measured to collide at 25 MSPS,
+    /// covering both ways it happened — a padded separation of one bin
+    /// with radius 1, and of two bins with radius 2:
+    ///
+    /// ```text
+    ///   len     padded sep   radius   reaches other bin
+    ///   196608      1          1            yes
+    ///   262144      1          1            yes
+    ///   327680      2          2            yes
+    /// ```
+    ///
+    /// Kept to one sample rate and three lengths on purpose: this runs in
+    /// a debug build, where a sweep over every rate meant million-sample
+    /// FFTs and minutes of wall clock.
+    #[test]
+    fn colliding_line_rate_windows_do_not_discard_a_strong_signal() {
+        let sample_rate = 25_000_000u32;
+        let cfg = SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let full = generate_iq(&cfg, 8, 0.0);
+        let det = AnalogFpvDetector::default();
+
+        for len in [196_608usize, 262_144, 327_680] {
+            assert!(len <= full.len(), "test signal too short for len={len}");
+            let found = det.detect_from_iq(&full[..len], 5_800_000_000, sample_rate);
+            assert!(
+                !found.is_empty(),
+                "a clean NTSC carrier at band centre was discarded at len={len} \
+                 ({:.2} ms) — the PAL and NTSC peak-search windows are \
+                 overlapping again, so both energies read identical and \
+                 neither can clear the other by the required 1.2x",
+                len as f64 / sample_rate as f64 * 1e3
+            );
+            // Reporting the opposite standard would be worse than
+            // reporting nothing: the viewer would decode with the wrong
+            // line geometry.
+            assert!(
+                !found
+                    .iter()
+                    .any(|d| d.signal_type == SignalType::AnalogVideoPal),
+                "NTSC signal reported as PAL at len={len}"
+            );
+        }
     }
 }
