@@ -162,3 +162,49 @@ fn gpu_and_cpu_detectors_agree_on_two_signal_capture() {
         );
     }
 }
+
+/// A sweep large enough to need more than 65,535 workgroups must still
+/// dispatch.
+///
+/// `dispatch_workgroups` caps *each dimension* at 65,535, and exceeding it
+/// is a validation error that wgpu's default handler turns into a panic —
+/// killing the worker rather than degrading. A 60 ms batch at 61.44 MSPS
+/// across a dozen probes asked for 120,150 groups in one dimension and did
+/// exactly that in the field, so the sweep now spills into a second
+/// dimension and re-flattens in the shader.
+///
+/// Sized from the real failure: enough samples and probes that the
+/// one-dimensional group count is comfortably past the limit.
+#[test]
+fn large_sweep_exceeds_one_dispatch_dimension() {
+    let Some(gpu) = GpuAnalog::try_new() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let sample_rate = 61_440_000u32;
+    // 60 ms — what duration-based batching produces for analog modes.
+    let n = (sample_rate as f64 * 0.060) as usize;
+    let iq = make_fm_sync_iq(sample_rate, n, 15734.0, 5_000_000.0, 0.0);
+    // A dozen probes across the span, as the wideband sweep uses.
+    let offsets: Vec<f64> = (0..12).map(|i| -25e6 + i as f64 * 5e6).collect();
+    // 6, not a larger factor: derived from the field failure's 120,150
+    // groups (12 probes x 3,686,400/6 outputs / 64), i.e. the ~10 MSPS
+    // intermediate rate the wideband sweep actually decimates to.
+    let decimation_factor = 6usize;
+    let out_len = n.div_ceil(decimation_factor);
+    let groups_1d = (offsets.len() * out_len).div_ceil(64);
+    assert!(
+        groups_1d > 65_535,
+        "test must actually exceed one dimension; got {groups_1d} groups"
+    );
+
+    let out = gpu.sweep(&iq, sample_rate, &offsets, decimation_factor, 2.0e6);
+    assert_eq!(out.len(), offsets.len(), "one baseband per probe");
+    for (i, probe) in out.iter().enumerate() {
+        assert_eq!(probe.len(), out_len, "probe {i} truncated");
+        assert!(
+            probe.iter().all(|s| s.re.is_finite() && s.im.is_finite()),
+            "probe {i} has non-finite samples — the 2-D index likely mis-flattened"
+        );
+    }
+}

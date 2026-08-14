@@ -56,6 +56,13 @@
 use crate::ddc::{DEFAULT_FIR_TAPS, design_fir_taps};
 use num_complex::Complex;
 
+/// Threads per workgroup, mirrored by `@workgroup_size(64)` in the shader.
+const WORKGROUP_SIZE: u32 = 64;
+/// `wgpu::Limits::downlevel_defaults().max_compute_workgroups_per_dimension`.
+/// Exceeding it in any dimension is a validation error, not a clamp — and
+/// wgpu's default handler turns that into a process-killing panic.
+const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+
 /// GPU compute handle for the wideband sweep's batched DDC. Build once
 /// with [`Self::try_new`] and share via `Arc` across detector instances.
 ///
@@ -317,8 +324,16 @@ impl GpuAnalog {
             total_iq_len: u32,
             out_len: u32,
             n_probes: u32,
+            dispatch_width: u32,
+            _pad: u32,
         }
 
+        // Same split as the dispatch below; the shader needs the x-extent
+        // in threads to rebuild its linear index.
+        let total_threads = n_probes as u32 * out_len;
+        let groups_x = total_threads
+            .div_ceil(WORKGROUP_SIZE)
+            .clamp(1, MAX_WORKGROUPS_PER_DIM);
         let decimate_config = DecimateConfig {
             sample_rate: sample_rate as f32,
             decimation_factor,
@@ -326,6 +341,8 @@ impl GpuAnalog {
             total_iq_len: n as u32,
             out_len,
             n_probes: n_probes as u32,
+            dispatch_width: groups_x * WORKGROUP_SIZE,
+            _pad: 0,
         };
 
         // ── Pooled buffers: grow-only, reused across sweeps ─────────
@@ -454,8 +471,17 @@ impl GpuAnalog {
             });
             cpass.set_pipeline(&self.decimate_pipeline);
             cpass.set_bind_group(0, &decimate_bg, &[]);
-            let total_threads = n_probes as u32 * out_len;
-            cpass.dispatch_workgroups(total_threads.div_ceil(64), 1, 1);
+            // `dispatch_workgroups` caps each dimension at 65535
+            // (`Limits::max_compute_workgroups_per_dimension`), which one
+            // dimension exceeds once a sweep needs more than ~4.19M
+            // threads — reachable from a normal wideband capture: a 60 ms
+            // batch at 61.44 MSPS across a dozen probes asked for 120,150
+            // groups and the dispatch failed validation, panicking the
+            // worker. Spill the excess into y and re-flatten in the shader.
+            let groups = total_threads.div_ceil(WORKGROUP_SIZE);
+            let groups_x = groups.min(MAX_WORKGROUPS_PER_DIM);
+            let groups_y = groups.div_ceil(groups_x.max(1));
+            cpass.dispatch_workgroups(groups_x, groups_y, 1);
         }
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
 

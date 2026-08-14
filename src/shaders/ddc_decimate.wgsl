@@ -31,6 +31,11 @@ struct Config {
     total_iq_len: u32,
     out_len: u32,
     n_probes: u32,
+    // Threads along x in this dispatch (`groups_x * 64`). The work is a
+    // flat 1-D range, but a single dimension caps at 65535 *workgroups*,
+    // so a large sweep is dispatched as a 2-D grid and re-flattened here.
+    dispatch_width: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> config: Config;
@@ -63,7 +68,9 @@ const MAX_TAPS: u32 = 96u;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let global_idx = global_id.x;
+    // Re-flatten the 2-D dispatch grid. `dispatch_width` is the x-extent
+    // in threads, so this reproduces the original linear index.
+    let global_idx = global_id.y * config.dispatch_width + global_id.x;
     let probe = global_idx / config.out_len;
     let out_idx = global_idx % config.out_len;
     if (probe >= config.n_probes) {
