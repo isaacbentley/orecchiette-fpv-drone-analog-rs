@@ -148,10 +148,20 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     // disambiguator exists for. Percentiles are also DC-invariant, so a
     // demod offset from a tuning error no longer breaks classification.
     let threshold = crate::levels::robust_sync_threshold(&smoothed)?;
-    // Sync gap bounds: 30–100 µs covers both NTSC (63.5 µs) and PAL
-    // (64.0 µs) with comfortable margin.
+    // The scan skip after each accepted tip. 30 µs clears the pulse
+    // comfortably without being able to skip past the *next* line's tip.
     let min_gap = (sample_rate as f32 * 30e-6) as usize;
-    let max_gap = (sample_rate as f32 * 100e-6) as usize;
+    // Interval bounds for the line-period measurement: full lines only.
+    // Both standards sit in 63.5–64.0 µs, so 55–75 µs is generous —
+    // while excluding the ~32 µs HALF-line spacing of the equalizing and
+    // broad pulses in every vertical blanking interval. The old 30 µs
+    // floor admitted those: on a short record the VBI is a large
+    // fraction of everything scanned, and eleven 320-sample half-line
+    // intervals dragging on the median was half of how a clean PAL
+    // record got called NTSC (the other half is the consensus test
+    // below).
+    let min_line = (sample_rate as f32 * 55e-6) as usize;
+    let max_line = (sample_rate as f32 * 75e-6) as usize;
     let scan_len = smoothed.len();
     let mut sync_positions: Vec<usize> = Vec::with_capacity(128);
     let mut i = 0;
@@ -177,7 +187,7 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     let mut intervals: Vec<usize> = Vec::with_capacity(sync_positions.len().saturating_sub(1));
     for w in sync_positions.windows(2) {
         let gap = w[1] - w[0];
-        if gap >= min_gap && gap <= max_gap {
+        if gap >= min_line && gap <= max_line {
             intervals.push(gap);
         }
     }
@@ -185,11 +195,50 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
         return None;
     }
     intervals.sort_unstable();
+    if std::env::var("FPV_DIAG").is_ok() {
+        let mut hist = std::collections::BTreeMap::new();
+        for &g in &intervals {
+            *hist.entry(g).or_insert(0usize) += 1;
+        }
+        let h: Vec<String> = hist.iter().map(|(g, c)| format!("{g}x{c}")).collect();
+        eprintln!(
+            "  TDHIST fs={sample_rate} n={} tips={} [{}]",
+            intervals.len(),
+            sync_positions.len(),
+            h.join(" ")
+        );
+    }
     let median = intervals[intervals.len() / 2] as f64;
     if median <= 0.0 {
         return None;
     }
-    let line_hz = sample_rate as f64 / median;
+    // Consensus, then precision. A record that is really showing its
+    // line rate produces near-identical intervals — the carrier-centred
+    // probe of the case this guards read 640 twenty-seven times out of
+    // twenty-seven. A probe looking at the signal from the wrong centre
+    // (or at noise) produces a broad smear whose median lands wherever
+    // the contamination pushes it; one such smear medianed to 627 =
+    // 15,943 Hz, inside the plausible-rate gate and closer to NTSC, and
+    // a clean PAL record was confidently misclassified. Requiring
+    // two-thirds of the intervals within ±1% of the median accepts
+    // every real lock and rejects every smear we measured.
+    //
+    // The period then comes from the MEAN of the consensus cluster, not
+    // the integer median: at a 10 MHz probe rate PAL and NTSC line
+    // periods are 640.0 and 635.6 samples — 4.4 apart — so the median's
+    // whole-sample quantisation is a ±25 Hz error against a 109 Hz
+    // decision, and the mean recovers the sub-sample rate.
+    let tol = (median * 0.01).max(1.0);
+    let cluster: Vec<f64> = intervals
+        .iter()
+        .map(|&g| g as f64)
+        .filter(|g| (g - median).abs() <= tol)
+        .collect();
+    if cluster.len() * 3 < intervals.len() * 2 {
+        return None;
+    }
+    let period = cluster.iter().sum::<f64>() / cluster.len() as f64;
+    let line_hz = sample_rate as f64 / period;
     // PAL = 15625, NTSC = 15734, midpoint = 15679.5. Reject if we're
     // within ±30 Hz of the midpoint — that's the "we genuinely
     // can't tell" zone given typical jitter.
@@ -404,8 +453,18 @@ impl AnalogFpvDetector {
             1e-6
         };
 
-        let thresh_strong = noise_floor * 5.0;
-        let thresh_weak = noise_floor * 2.5;
+        // 25x the noise floor, not 5x. Measured against a live 61.44 MSPS
+        // capture of 2.4 GHz with nothing airborne: the false positives had
+        // a line-rate fundamental only 5-7x the floor, i.e. the old
+        // threshold sat *inside* the noise tail — and a harmonic needs only
+        // 10% of the fundamental and 2.5x the floor to count, so two
+        // scattered peaks were enough to claim video. Real video is nowhere
+        // near: a healthy VTX measures 400x to 100,000x, and even the
+        // weakest case the crate intends to catch (the cross-batch
+        // integration path) still clears ~45x. 25x sits between the two
+        // with margin on both sides — 3.6x above the worst observed false
+        // positive, 1.8x below the weakest real detection.
+        let thresh_strong = noise_floor * 25.0;
 
         const N_HARMONICS: usize = 5;
         const HARMONIC_RATIO: f32 = 0.1;
@@ -416,6 +475,12 @@ impl AnalogFpvDetector {
         let mut ntsc_harmonics = 0u32;
         let max_bin = noise_end_bin;
         if line_bin > 0 {
+            // A harmonic is judged only relative to its own fundamental.
+            // There used to be an absolute `noise_floor * 2.5` floor here
+            // as well, but raising `thresh_strong` to 25x made it inert:
+            // a fundamental that clears 25x puts `fundamental * 0.1` above
+            // 2.5x by construction, so the absolute term could never bind
+            // for any signal that reaches classification.
             let pal_thresh = pal_energy * HARMONIC_RATIO;
             let ntsc_thresh = ntsc_energy * HARMONIC_RATIO;
             for k in 2..=N_HARMONICS {
@@ -424,19 +489,33 @@ impl AnalogFpvDetector {
                 let hb_ntsc = (kf * NTSC_LINE_HZ / bin_hz).round() as usize;
                 if hb_pal < max_bin {
                     let e = self.get_peak_energy(mags, hb_pal, search_range);
-                    if e > pal_thresh && e > thresh_weak {
+                    if e > pal_thresh {
                         pal_harmonics += 1;
                     }
                 }
                 if hb_ntsc < max_bin {
                     let e = self.get_peak_energy(mags, hb_ntsc, search_range);
-                    if e > ntsc_thresh && e > thresh_weak {
+                    if e > ntsc_thresh {
                         ntsc_harmonics += 1;
                     }
                 }
             }
         }
         let collide_harmonics = pal_harmonics.max(ntsc_harmonics);
+        if std::env::var_os("ANALOG_PROBE").is_some()
+            && (pal_energy.max(ntsc_energy) > thresh_strong)
+        {
+            eprintln!(
+                "PROBE floor={:.3e} pal={:.3e}({:.1}x) ntsc={:.3e}({:.1}x) pal_h={} ntsc_h={}",
+                noise_floor,
+                pal_energy,
+                pal_energy / noise_floor.max(1e-12),
+                ntsc_energy,
+                ntsc_energy / noise_floor.max(1e-12),
+                pal_harmonics,
+                ntsc_harmonics
+            );
+        }
 
         let mut sig_type = SignalType::Unknown;
         let mut conf = 0.0;
@@ -449,8 +528,8 @@ impl AnalogFpvDetector {
         // separation the data cannot support — and misclassify PAL as
         // NTSC or vice versa.
         let true_bin_hz = sample_rate as f32 / demod_len as f32;
-        let bins_distinct =
-            (15625.0f32 / true_bin_hz).round() != (15734.0f32 / true_bin_hz).round();
+        let true_sep = (15734.0f32 / true_bin_hz).round() - (15625.0f32 / true_bin_hz).round();
+        let bins_distinct = true_sep >= 2.0;
 
         if bins_distinct {
             if pal_energy > thresh_strong && pal_energy > ntsc_energy * 1.2 && pal_harmonics >= 2 {
@@ -1236,6 +1315,9 @@ impl AnalogFpvDetector {
                     }
                     None => self.detect_sync_pulses(isolated_iq, *isolated_rate),
                 };
+                if std::env::var("FPV_DIAG").is_ok() {
+                    eprintln!("  PROBE off={:+.1} MHz e={energy:.2e} -> {sig_type:?} conf {conf:.2}", *offset_hz/1e6);
+                }
                 if sig_type != SignalType::Unknown {
                     let freq_hz = center_freq as f64 + offset_hz;
                     sweep_hits.push((freq_hz, *energy, sig_type, conf));

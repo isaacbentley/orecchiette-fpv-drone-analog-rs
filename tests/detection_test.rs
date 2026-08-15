@@ -613,3 +613,95 @@ fn padding_does_not_change_classification_across_record_lengths() {
         );
     }
 }
+
+/// A marginal carrier a few times the noise floor is not analog video.
+///
+/// Measured against a live 61.44 MSPS capture of 2.4 GHz with nothing
+/// airborne: the false positives had a line-rate fundamental only **5-7x**
+/// the noise floor, while real analog video — even the weak cross-batch
+/// case `integration_detects_where_single_batches_cannot` covers — sits far
+/// above that, and a healthy VTX runs 400x to 100,000x. The old 5x
+/// `thresh_strong` sat inside the noise tail, so 2 scattered harmonic peaks
+/// (each needing only 10% of the fundamental) were enough to claim video.
+///
+/// This pins the *low* side of the window. The weak-signal integration test
+/// pins the high side; between them the threshold cannot drift back into
+/// the noise or up past a real detection.
+#[test]
+fn marginal_carrier_near_noise_floor_is_not_video() {
+    use rand::RngExt;
+    let detector = AnalogFpvDetector::default();
+    let sample_rate = 1_000_000u32;
+    let n = 65536;
+    let mut rng = rand::rng();
+
+    // Noise with a weak tone a few times the floor — the shape the live
+    // false positives had. No video structure whatsoever.
+    let tone_hz = 15_625.0f32;
+    let iq: Vec<Complex<f32>> = (0..n)
+        .map(|i| {
+            let t = i as f32 / sample_rate as f32;
+            let phase = std::f32::consts::TAU * tone_hz * t;
+            let amp = 0.02f32;
+            Complex::new(
+                amp * phase.cos() + rng.random_range(-0.01..0.01),
+                amp * phase.sin() + rng.random_range(-0.01..0.01),
+            )
+        })
+        .collect();
+
+    let (sig_type, conf) = detector.detect_sync_pulses(&iq, sample_rate);
+    assert_eq!(
+        sig_type,
+        SignalType::Unknown,
+        "a bare tone near the noise floor classified as {sig_type:?} at {conf} —          thresh_strong has drifted back into the noise tail"
+    );
+}
+
+/// Bursty OFDM — what 2.4 GHz actually contains — must not classify as
+/// Bursty OFDM — what 2.4 GHz actually contains — must not classify as
+/// analog video.
+///
+/// `detect_sync_pulses_noise_only_returns_unknown` above uses AWGN, which
+/// is too easy: it has no periodic structure at all. Real 2.4 GHz is
+/// dominated by Wi-Fi, whose packets are ~µs-scale OFDM bursts separated by
+/// idle gaps. FM-demodulating that produces sharp envelope transitions at
+/// every burst edge, and a burst train has a harmonic comb of its own —
+/// which is exactly what the line-rate harmonic test looks for.
+///
+/// Note this shape did *not* reproduce the field false positives — those
+/// turned out to be marginal carriers a few times the noise floor, covered
+/// by `marginal_carrier_near_noise_floor_is_not_video` above. Kept because
+/// burst-edge structure is still a plausible way to fake a comb, and AWGN
+/// alone does not exercise it.
+#[test]
+fn bursty_ofdm_is_not_analog_video() {
+    use rand::RngExt;
+    let detector = AnalogFpvDetector::default();
+    let sample_rate = 1_000_000u32;
+    let n = 65536;
+    let mut rng = rand::rng();
+
+    // Wi-Fi-ish duty cycle: bursts of a few hundred µs separated by idle,
+    // with the burst itself noise-like (OFDM is Gaussian to first order).
+    // The burst *edges* are what manufacture the comb.
+    let burst_len = 300usize;
+    let gap_len = 700usize;
+    let period = burst_len + gap_len;
+    let iq: Vec<Complex<f32>> = (0..n)
+        .map(|i| {
+            let on = (i % period) < burst_len;
+            let a = if on { 0.5 } else { 0.002 };
+            Complex::new(rng.random_range(-a..a), rng.random_range(-a..a))
+        })
+        .collect();
+
+    let (sig_type, conf) = detector.detect_sync_pulses(&iq, sample_rate);
+    assert_eq!(
+        sig_type,
+        SignalType::Unknown,
+        "bursty OFDM classified as {sig_type:?} at confidence {conf} — the \
+         line-rate harmonic test is being satisfied by burst-edge structure, \
+         not by video"
+    );
+}
