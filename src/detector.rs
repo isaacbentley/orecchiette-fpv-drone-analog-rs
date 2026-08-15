@@ -165,8 +165,10 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     let scan_len = smoothed.len();
     let mut sync_positions: Vec<usize> = Vec::with_capacity(128);
     let mut i = 0;
+    let mut run_widths: Vec<usize> = Vec::with_capacity(128);
     while i < scan_len {
         if smoothed[i] < threshold {
+            let run_start = i;
             let mut local_min_idx = i;
             let mut local_min_val = smoothed[i];
             while i < scan_len && smoothed[i] < threshold {
@@ -176,11 +178,32 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
                 }
                 i += 1;
             }
+            run_widths.push(i - run_start);
             sync_positions.push(local_min_idx);
             i = local_min_idx + min_gap;
         } else {
             i += 1;
         }
+    }
+    // Pulse-shape gate: interval regularity alone cannot tell a sync
+    // train from a plain tone AT the line rate — a 15,734 Hz sinusoid
+    // produces intervals every bit as consistent as real NTSC, and the
+    // consensus test below would pass it. What a tone cannot fake is the
+    // duty cycle. An H-sync tip holds the signal below threshold for
+    // ~4.7 µs of a 64 µs line; a sinusoid dipping under this same
+    // threshold (p2 + 0.25·(p50 − p2), i.e. three quarters of the way
+    // down its swing) stays below it for ~2·acos⁻¹ spans ≈ 14.6 µs per
+    // cycle. The median width is robust to the VBI's outliers in both
+    // directions — equalizing pulses run ~2.4 µs and broad pulses
+    // ~27 µs, but both are a small minority of a record's runs — so an
+    // 8 µs cut sits in clean air between sync (≈4.7) and tone (≈14.6).
+    let max_sync_run = (sample_rate as f32 * 8e-6) as usize;
+    if run_widths.is_empty() {
+        return None;
+    }
+    run_widths.sort_unstable();
+    if run_widths[run_widths.len() / 2] > max_sync_run {
+        return None;
     }
     // Need at least 8 inter-tip intervals to land the median on a
     // PAL/NTSC decision. Anything less and crystal jitter dominates.
@@ -195,19 +218,6 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
         return None;
     }
     intervals.sort_unstable();
-    if std::env::var("FPV_DIAG").is_ok() {
-        let mut hist = std::collections::BTreeMap::new();
-        for &g in &intervals {
-            *hist.entry(g).or_insert(0usize) += 1;
-        }
-        let h: Vec<String> = hist.iter().map(|(g, c)| format!("{g}x{c}")).collect();
-        eprintln!(
-            "  TDHIST fs={sample_rate} n={} tips={} [{}]",
-            intervals.len(),
-            sync_positions.len(),
-            h.join(" ")
-        );
-    }
     let median = intervals[intervals.len() / 2] as f64;
     if median <= 0.0 {
         return None;
@@ -1315,9 +1325,6 @@ impl AnalogFpvDetector {
                     }
                     None => self.detect_sync_pulses(isolated_iq, *isolated_rate),
                 };
-                if std::env::var("FPV_DIAG").is_ok() {
-                    eprintln!("  PROBE off={:+.1} MHz e={energy:.2e} -> {sig_type:?} conf {conf:.2}", *offset_hz/1e6);
-                }
                 if sig_type != SignalType::Unknown {
                     let freq_hz = center_freq as f64 + offset_hz;
                     sweep_hits.push((freq_hz, *energy, sig_type, conf));
@@ -1344,11 +1351,32 @@ impl AnalogFpvDetector {
                 if let Some(last) = clusters.last_mut()
                     && (hit.0 - last.0).abs() < CLUSTER_BW_HZ
                 {
-                    // Same cluster — update the strongest-member fields
-                    // only; the anchor (last.0) stays fixed.
+                    // Same cluster — the anchor (last.0) stays fixed, and
+                    // the remaining fields split by what each is *for*.
+                    //
+                    // Frequency and energy follow the strongest member:
+                    // the probe with the most energy is looking straight
+                    // at the carrier, so its centre is the best position
+                    // estimate.
+                    //
+                    // Classification follows the most CONFIDENT member.
+                    // These can genuinely differ: with a ±5 MHz FM
+                    // deviation, sync tips swing to the passband edge of
+                    // the carrier-centred probe, whose time-domain
+                    // disambiguation then fails consensus and returns
+                    // AnalogVideoUnknown at 0.6 — while the probe one
+                    // step off-centre sees the tips mid-passband and
+                    // resolves PAL at 0.8 from twenty-seven identical
+                    // intervals. Letting energy pick the classification
+                    // too meant the strongest probe's Unknown shadowed
+                    // its siblings' confident answer, and the cluster
+                    // then died at the min-confidence filter: a clean,
+                    // strong signal reported as nothing at all.
                     if hit.1 > last.2 {
                         last.1 = hit.0;
                         last.2 = hit.1;
+                    }
+                    if hit.3 > last.4 {
                         last.3 = hit.2;
                         last.4 = hit.3;
                     }
@@ -2248,5 +2276,68 @@ mod dead_zone_tests {
                 "NTSC signal reported as PAL at len={len}"
             );
         }
+    }
+
+    /// A short clean PAL record must come back as PAL — the case that
+    /// once came back as NTSC, then as nothing, for three stacked
+    /// reasons, each fixed separately:
+    ///
+    /// 1. The time-domain disambiguator admitted the ~32 µs HALF-line
+    ///    spacing of VBI equalizing/broad pulses (its interval floor was
+    ///    30 µs), and took a bare median over whatever survived. On this
+    ///    record an off-centre probe's smear medianed to 627 samples =
+    ///    15,943 Hz — inside the plausible-rate gate and closer to NTSC.
+    ///    Intervals are now bounded to full lines (55–75 µs), two thirds
+    ///    of them must agree within ±1% before the classifier will
+    ///    answer, and the rate comes from the consensus cluster's mean
+    ///    rather than a whole-sample median (at a 10 MHz probe rate the
+    ///    two standards are 4.4 samples apart, so integer quantisation
+    ///    alone is a ±25 Hz error against a 109 Hz decision).
+    /// 2. With a ±5 MHz deviation, sync tips swing to the passband edge
+    ///    of the carrier-centred probe — the strongest one — whose
+    ///    disambiguation therefore fails consensus and returns
+    ///    `AnalogVideoUnknown` at 0.6, while its off-centre siblings
+    ///    read the tips cleanly and answer PAL at 0.8.
+    /// 3. Sweep clustering let the strongest member decide the
+    ///    classification, so that Unknown shadowed the siblings' PAL and
+    ///    the cluster died at the min-confidence filter. Classification
+    ///    now follows the most confident member; frequency still follows
+    ///    the strongest.
+    #[test]
+    fn short_pal_record_resolves_as_pal_not_ntsc() {
+        let sample_rate = 40_000_000u32;
+        let cfg = SyntheticVideoConfig {
+            sample_rate,
+            is_pal: true,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let full = generate_iq(&cfg, 6, 0.0);
+        let det = AnalogFpvDetector::default();
+        let found = det.detect_from_iq(&full[..131_072], 5_800_000_000, sample_rate);
+        assert!(
+            !found
+                .iter()
+                .any(|d| d.signal_type == SignalType::AnalogVideoNtsc),
+            "3.3 ms of clean PAL classified as NTSC: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|d| d.signal_type == SignalType::AnalogVideoPal),
+            "3.3 ms of clean PAL not resolved as PAL: {found:?}"
+        );
+        let hit = found
+            .iter()
+            .find(|d| d.signal_type == SignalType::AnalogVideoPal)
+            .unwrap();
+        assert!(
+            (hit.frequency_hz as f64 - 5_800e6).abs() < 3e6,
+            "PAL hit localised to {} Hz, expected ~5.8 GHz",
+            hit.frequency_hz
+        );
     }
 }
