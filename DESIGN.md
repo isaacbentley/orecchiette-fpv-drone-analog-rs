@@ -129,10 +129,28 @@ sidebands let a probe on a signal's skirt classify it confidently far
 outside the tight window, and that is the signal's skirt, not another
 transmitter.
 
-This is the deterministic half of a two-part plan. The other half —
-dithering the probe grid per sweep by a low-discrepancy sequence so any
-residual bias averages out — requires the integrator to accumulate in
-absolute frequency rather than per probe, and is deferred until it does.
+Confirmation had to move with it. The VBI confirm stage — the step that
+turns a plausible line-rate comb into a confirmed periodic field
+structure, §4's 0.95 tier — ran on the same narrow probe, and measured
+against a synthetic NTSC carrier it confirmed only with a probe within
+about −0.8…+1.8 MHz of the carrier: a ~2.6 MHz window on a 5 MHz grid,
+so roughly half of all carrier positions could never reach the confirmed
+tier however strong, because the probe's passband clipped the
+vertical-sync swing it was looking for. At 61.44 MSPS the grid sits at
+−0.72 + 5k MHz; carriers at +5.5, +6.0 and +6.5 MHz confirmed 0% of the
+time at 17 dB while +5.0 confirmed 100%. The same stage on the
+whole-swing localization cut confirmed at every offset from −3 to +3 MHz
+(100% at 17 dB, ≥90% at 11 dB), so `confirm_on_wide_cut` re-runs it there
+for any cluster the probe left unconfirmed. The cut is already computed
+for localization; the extra cost is one pulse scan per cluster and no
+second DDC.
+
+Together these make the sweep's answer independent of where the 5 MHz
+grid happens to fall, in frequency (localization) and in confidence
+(wide-cut confirmation). Dithering the probe grid per sweep by a
+low-discrepancy sequence was the planned alternative for the residual
+bias; with both readings taken off a cut centred on the signal there is
+no residual left for it to average away, so it is not pursued.
 
 ## 4. Confidence Scoring Model
 
@@ -155,7 +173,7 @@ The harmonic-comb + cepstrum checks (items 6–7 above) only ever see one FFT's 
 
 - **Sample Rate**: Minimum 1 MSPS for sync pulse detection at baseband. ≥ 20 MSPS recommended for wideband scanning. The B210 over USB 3.0 runs clean at 25 MSPS; at 50 MSPS the USB transport saturates (~400 MB/s), producing intermittent hardware FIFO overflows. 25 MSPS is the recommended maximum for the B210.
 - **Packet Size**: 262,144 samples per packet (at 100 MSPS = 2.6 ms). Larger packets improve PAL/NTSC discrimination.
-- **Bands**: `bands.rs` carries channel tables (used for display/labeling and `--channel` resolution, not detection) for 1.2 GHz, 3.3 GHz, and the 5.3–5.9 GHz bands — A/B/E/F/R plus Lowband L (5333 + 40 MHz grid) and Boscam D (5362 + 37 MHz grid).
+- **Bands**: `bands.rs` carries channel tables (used for display/labeling and `--channel` resolution, not detection) for 1.2 GHz (both the 8-channel amateur / SM1370R set at 1240–1300 MHz and the 9-channel "1.2G/1.3G" long-range VTX grid at 1080–1360 MHz), 3.3 GHz (64 channels, 3300–4875 MHz on a 25 MHz grid), and the 5.3–5.9 GHz bands — A/B/E/F/R plus Lowband L (5333 + 40 MHz grid) and Boscam D (5362 + 37 MHz grid).
 - **Scan Dwell**: 10 ms per hop in the auto-scanner, which sweeps the 5.8 GHz FPV band (5.645–5.945 GHz; ~16 hops at 25 MSPS, ~160 ms per sweep) — sized for USRP PLL settle (~2 ms) + one full 65536-sample chunk (~2.6 ms at 25 MSPS). The detector only needs a single chunk per hop. All remaining duplicate-frequency packets are skipped to prevent queue buildup.
 
 ## 6. Known Follow-ups & Historical Notes

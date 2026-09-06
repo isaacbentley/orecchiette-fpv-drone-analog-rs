@@ -13,8 +13,11 @@ pub enum FpvBand {
     Raceband, // Band R
     Lowband,  // Band L (5333-5613 MHz, 40 MHz grid)
     BandD,    // Boscam D / "5.3G" (5362-5621 MHz, 37 MHz grid)
-    Band1200, // 1.2GHz - 1.3GHz
+    Band1200, // 1.2 GHz amateur / SM1370R 8-channel set (1240-1300 MHz)
     Band3300, // 3.3GHz - 4.875GHz
+    /// The 9-channel "1.2G/1.3G" long-range VTX grid (1080-1360 MHz,
+    /// 40 MHz spacing plus CH9 at 1258). See [`BAND_1200_WIDE_FREQS`].
+    Band1200Wide,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +119,14 @@ pub const BAND_D_FREQS: [u64; 8] = [
     5_621_000_000,
 ];
 
+/// 1.2 GHz, the narrow amateur set: the 8 channels a SM1370R / VM1373R
+/// receiver module steps through (1240–1300 MHz in 6 / 12 MHz steps —
+/// the 23 cm ATV allocation). This is the table the cheap ESP32
+/// "multi-band detector" builds use for their 1.2 GHz stage.
+///
+/// It is *not* the grid most long-range 1.2 GHz FPV VTXs transmit on —
+/// that is [`BAND_1200_WIDE_FREQS`]. Both are scanned; they overlap at
+/// 1240 and 1258 MHz and the orchestrator dedups by kHz.
 pub const BAND_1200_FREQS: [u64; 8] = [
     1_240_000_000,
     1_246_000_000,
@@ -125,6 +136,26 @@ pub const BAND_1200_FREQS: [u64; 8] = [
     1_282_000_000,
     1_294_000_000,
     1_300_000_000,
+];
+
+/// 1.2 GHz, the wide grid: the 9-channel "1.2G/1.3G" table the common
+/// long-range analog VTX / RX modules (the 1.2G 9CH / 12CH units) use —
+/// CH1–CH8 at 40 MHz spacing from 1080 MHz, plus CH9 at 1258 MHz.
+/// Indexed in that CH order so `channel` matches the VTX's own menu;
+/// the frequencies are therefore *not* monotonic. fpv-viewer-rs labels
+/// CH1–CH5 "1.2G" and CH6–CH9 "1.3G" in `get_fpv_channel_name`; keep
+/// its `FPV_CHANNELS_MHZ` and this array in lockstep when editing
+/// either.
+pub const BAND_1200_WIDE_FREQS: [u64; 9] = [
+    1_080_000_000,
+    1_120_000_000,
+    1_160_000_000,
+    1_200_000_000,
+    1_240_000_000,
+    1_280_000_000,
+    1_320_000_000,
+    1_360_000_000,
+    1_258_000_000,
 ];
 
 /// 3.3 GHz band: 64 channels at 25 MHz spacing, 3300–4875 MHz.
@@ -191,6 +222,13 @@ pub fn get_all_channels() -> Vec<FpvChannel> {
     for (i, &f) in BAND_1200_FREQS.iter().enumerate() {
         channels.push(FpvChannel {
             band: FpvBand::Band1200,
+            channel: (i + 1) as u8,
+            frequency_hz: f,
+        });
+    }
+    for (i, &f) in BAND_1200_WIDE_FREQS.iter().enumerate() {
+        channels.push(FpvChannel {
+            band: FpvBand::Band1200Wide,
             channel: (i + 1) as u8,
             frequency_hz: f,
         });
@@ -285,6 +323,27 @@ mod tests {
     fn lookup_whitespace_tolerance() {
         assert_eq!(lookup_channel_by_name(" A1 "), Some(5_865_000_000));
         assert_eq!(lookup_channel_by_name("  r4  "), Some(5_769_000_000));
+    }
+
+    #[test]
+    fn wide_1200_grid_matches_the_vtx_menu() {
+        // CH1-CH8 step 40 MHz from 1080; CH9 is the odd 1258 slot.
+        for (i, w) in BAND_1200_WIDE_FREQS[..8].windows(2).enumerate() {
+            assert_eq!(w[1] - w[0], 40_000_000, "CH{} -> CH{}", i + 1, i + 2);
+        }
+        assert_eq!(BAND_1200_WIDE_FREQS[0], 1_080_000_000);
+        assert_eq!(BAND_1200_WIDE_FREQS[7], 1_360_000_000);
+        assert_eq!(BAND_1200_WIDE_FREQS[8], 1_258_000_000);
+        let all = get_all_channels();
+        let wide: Vec<_> = all
+            .iter()
+            .filter(|c| c.band == FpvBand::Band1200Wide)
+            .collect();
+        assert_eq!(wide.len(), 9);
+        assert_eq!(wide[8].channel, 9);
+        assert_eq!(wide[8].frequency_hz, 1_258_000_000);
+        // The scan plan now reaches the low end of the long-range band.
+        assert!(all.iter().any(|c| c.frequency_hz == 1_080_000_000));
     }
 
     #[test]
