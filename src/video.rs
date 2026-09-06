@@ -145,17 +145,24 @@ pub fn detect_video_standard(demod_data: &[f32], sample_rate: u32) -> SignalType
 
     while i < scan_len {
         if smoothed[i] < threshold {
-            let mut local_min_idx = i;
-            let mut local_min_val = smoothed[i];
+            let run_start = i;
             while i < scan_len && smoothed[i] < threshold {
-                if smoothed[i] < local_min_val {
-                    local_min_val = smoothed[i];
-                    local_min_idx = i;
-                }
                 i += 1;
             }
-            sync_positions.push(local_min_idx);
-            i = local_min_idx + min_gap;
+            // The tip is the middle of the below-threshold run, not its
+            // lowest sample — the same construction as
+            // `detector::classify_pal_ntsc_time_domain`, and for the
+            // same reason: a sync tip is flat for ~4.7 µs, so its argmin
+            // is decided by noise or float rounding and wanders up to the
+            // full tip width from line to line, while the threshold
+            // crossings are the pulse's steep edges and their midpoint
+            // is stable to a fraction of a sample. A run cut off by
+            // either end of the scan window has no known midpoint.
+            if run_start > 0 && i < scan_len {
+                sync_positions.push((run_start + i) / 2);
+            }
+            // Never back into the run just measured.
+            i = run_start + min_gap.max(i - run_start);
         } else {
             i += 1;
         }

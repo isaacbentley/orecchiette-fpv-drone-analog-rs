@@ -180,7 +180,13 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     // and left only clicks detectable — exactly the regime this
     // disambiguator exists for. Percentiles are also DC-invariant, so a
     // demod offset from a tuning error no longer breaks classification.
-    let threshold = crate::levels::robust_sync_threshold(&smoothed)?;
+    let trace = analog_probe_trace();
+    let Some(threshold) = crate::levels::robust_sync_threshold(&smoothed) else {
+        if trace {
+            eprintln!("TD: no sync threshold (record too short or too flat) — rejected");
+        }
+        return None;
+    };
     // The scan skip after each accepted tip. 30 µs clears the pulse
     // comfortably without being able to skip past the *next* line's tip.
     let min_gap = (sample_rate as f32 * 30e-6) as usize;
@@ -243,10 +249,17 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     // 8 µs cut sits in clean air between sync (≈4.7) and tone (≈14.6).
     let max_sync_run = (sample_rate as f32 * 8e-6) as usize;
     if run_widths.is_empty() {
+        if trace {
+            eprintln!("TD: no sub-threshold runs");
+        }
         return None;
     }
     run_widths.sort_unstable();
-    if run_widths[run_widths.len() / 2] > max_sync_run {
+    let median_run = run_widths[run_widths.len() / 2];
+    if median_run > max_sync_run {
+        if trace {
+            eprintln!("TD: median run {median_run} > {max_sync_run} samples (tone-shaped)");
+        }
         return None;
     }
     // Need at least 8 inter-tip intervals to land the median on a
@@ -259,6 +272,13 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
         }
     }
     if intervals.len() < 8 {
+        if trace {
+            eprintln!(
+                "TD: {} tips, {} line-length intervals (< 8)",
+                sync_positions.len(),
+                intervals.len()
+            );
+        }
         return None;
     }
     intervals.sort_unstable();
@@ -288,11 +308,28 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
         .map(|&g| g as f64)
         .filter(|g| (g - median).abs() <= tol)
         .collect();
+    if trace {
+        eprintln!(
+            "TD: tips={} intervals={} median={median} consensus={}/{} interval_range={}..{} median_run={median_run}",
+            sync_positions.len(),
+            intervals.len(),
+            cluster.len(),
+            intervals.len(),
+            intervals[0],
+            intervals[intervals.len() - 1]
+        );
+    }
     if cluster.len() * 3 < intervals.len() * 2 {
+        if trace {
+            eprintln!("TD: consensus below two-thirds — rejected");
+        }
         return None;
     }
     let period = cluster.iter().sum::<f64>() / cluster.len() as f64;
     let line_hz = sample_rate as f64 / period;
+    if trace {
+        eprintln!("TD: period={period:.2} samples, line_hz={line_hz:.1}");
+    }
     // PAL = 15625, NTSC = 15734, midpoint = 15679.5. Reject if we're
     // within ±30 Hz of the midpoint — that's the "we genuinely
     // can't tell" zone given typical jitter.
@@ -308,9 +345,15 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     // noise got reported as a video signal on live captures. Real
     // crystal error on a VTX is a few Hz; ±~250 Hz is already generous.
     if !(15_400.0..=16_000.0).contains(&line_hz) {
+        if trace {
+            eprintln!("TD: line_hz={line_hz:.1} outside 15400..16000 — rejected");
+        }
         return None;
     }
     if (line_hz - MIDPOINT_HZ).abs() < 30.0 {
+        if trace {
+            eprintln!("TD: line_hz={line_hz:.1} inside the ±30 Hz PAL/NTSC dead-band — rejected");
+        }
         return None;
     }
     if (line_hz - PAL_HZ).abs() < (line_hz - NTSC_HZ).abs() {
@@ -318,6 +361,16 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     } else {
         Some(SignalType::AnalogVideoNtsc)
     }
+}
+
+/// `ANALOG_PROBE=1` in the environment turns on the classifier trace
+/// lines (`PROBE` in the spectral stage, `TD:` in the time-domain one).
+/// Read once: the classifiers run per probe per batch on a worker
+/// pool, and an environment lookup there is an allocation and a
+/// process-wide lock each time.
+fn analog_probe_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("ANALOG_PROBE").is_some())
 }
 
 impl AnalogFpvDetector {
@@ -723,9 +776,7 @@ impl AnalogFpvDetector {
             }
         }
         let collide_harmonics = pal_harmonics.max(ntsc_harmonics);
-        if std::env::var_os("ANALOG_PROBE").is_some()
-            && (pal_energy.max(ntsc_energy) > thresh_strong)
-        {
+        if analog_probe_trace() && (pal_energy.max(ntsc_energy) > thresh_strong) {
             eprintln!(
                 "PROBE floor={:.3e} pal={:.3e}({:.1}x) ntsc={:.3e}({:.1}x) pal_h={} ntsc_h={}",
                 noise_floor,
@@ -2956,5 +3007,19 @@ mod dead_zone_tests {
             det.confirm_on_wide_cut(sample_rate, SignalType::AnalogVideoNtsc, 0.95),
             0.95
         );
+    }
+
+    /// The 30 µs post-tip skip truncates to zero below ~33 kHz, and the
+    /// scan must still terminate: the skip advances by at least the run
+    /// it just measured. Before that, this looped forever on the first
+    /// sub-threshold sample.
+    #[test]
+    fn time_domain_classifier_terminates_at_absurd_sample_rates() {
+        let mut demod = vec![0.5f32; 300];
+        for chunk in demod.chunks_mut(20) {
+            chunk[0] = -0.4;
+            chunk[1] = -0.4;
+        }
+        assert!(classify_pal_ntsc_time_domain(&demod, 20_000).is_none());
     }
 }
