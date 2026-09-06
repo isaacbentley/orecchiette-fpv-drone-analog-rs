@@ -1203,7 +1203,7 @@ impl AnalogFpvDetector {
         mut integration: Option<&mut SpectralIntegrator>,
         mut probes_out: Option<&mut Vec<ProbeEnergy>>,
     ) -> Vec<DetectionResult> {
-        if let Some(out) = probes_out.as_deref_mut() {
+        if let Some(out) = probes_out.as_mut() {
             out.clear();
         }
         let n = iq_data.len();
@@ -1446,7 +1446,7 @@ impl AnalogFpvDetector {
                 max_energy * 0.5
             };
 
-            if let Some(out) = probes_out.as_deref_mut() {
+            if let Some(out) = probes_out.as_mut() {
                 out.extend(probes.iter().map(|(offset_hz, energy, _, _)| ProbeEnergy {
                     offset_hz: *offset_hz,
                     energy: *energy,
