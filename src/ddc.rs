@@ -267,6 +267,11 @@ impl StreamingDDC {
     }
 
     /// Same as [`Self::process_decimated`] but appends into a caller-supplied `Vec`.
+    // `chunks_exact(8)` over `as_chunks::<8>()`: the latter is a 1.88+
+    // API and this crate pins no MSRV beyond edition 2024's 1.85, while
+    // the iterator form is what the SIMD lane split below is written
+    // against. Same generated code either way.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_into_decimated(
         &mut self,
         iq: &[Complex<f32>],
