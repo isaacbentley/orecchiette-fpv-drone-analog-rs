@@ -202,18 +202,29 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     while i < scan_len {
         if smoothed[i] < threshold {
             let run_start = i;
-            let mut local_min_idx = i;
-            let mut local_min_val = smoothed[i];
             while i < scan_len && smoothed[i] < threshold {
-                if smoothed[i] < local_min_val {
-                    local_min_val = smoothed[i];
-                    local_min_idx = i;
-                }
                 i += 1;
             }
-            run_widths.push(i - run_start);
-            sync_positions.push(local_min_idx);
-            i = local_min_idx + min_gap;
+            // The tip is the middle of the below-threshold run, not its
+            // sample-level minimum. A sync tip is flat for ~4.7 µs, so
+            // which sample reads lowest is decided by noise (on a clean
+            // synthetic it is decided by float rounding), and the
+            // argmin wandered up to the full tip width from line to
+            // line: an NTSC period of 635.6 samples at the 10 MHz probe
+            // rate drifts across the sample grid, the argmin landed
+            // anywhere on the plateau, and the consensus test below
+            // rejected a perfectly clean signal — while PAL's integer
+            // 640-sample period sampled every line identically and
+            // passed by luck. The threshold crossings are the pulse's
+            // steep edges, so their midpoint is stable to a fraction of
+            // a sample.
+            // A run cut off by either end of the scan window has no
+            // known midpoint; recording one would corrupt an interval.
+            if run_start > 0 && i < scan_len {
+                run_widths.push(i - run_start);
+                sync_positions.push((run_start + i) / 2);
+            }
+            i = run_start + min_gap.max(i - run_start);
         } else {
             i += 1;
         }
@@ -1987,6 +1998,80 @@ mod tests {
             }
         }
         bb
+    }
+
+    /// A bare FM sync train: −0.4·deviation for the first 7 % of every
+    /// line, +0.5·deviation for the rest, at `carrier_offset` from the
+    /// capture centre. Mirrors the generator the GPU/CPU equivalence
+    /// tests use, so the sweep sees the same waveform here.
+    fn fm_sync_iq(
+        sample_rate: u32,
+        n: usize,
+        line_hz: f32,
+        deviation_hz: f32,
+        carrier_offset_hz: f32,
+    ) -> Vec<Complex<f32>> {
+        let fs = sample_rate as f32;
+        let mut phase = 0.0f32;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / fs;
+                let baseband = if (t * line_hz).fract() < 0.07 {
+                    -0.4
+                } else {
+                    0.5
+                };
+                phase +=
+                    2.0 * std::f32::consts::PI * (baseband * deviation_hz + carrier_offset_hz) / fs;
+                if phase > std::f32::consts::PI {
+                    phase -= std::f32::consts::TAU;
+                }
+                if phase < -std::f32::consts::PI {
+                    phase += std::f32::consts::TAU;
+                }
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect()
+    }
+
+    /// The GPU/CPU equivalence capture, on the CPU path alone: PAL at
+    /// −20 MHz and NTSC at +20 MHz in one 80 MSPS record. The probes run
+    /// at 10 MHz, where NTSC's line is 635.6 samples and PAL's is
+    /// exactly 640. The time-domain fallback used to place each tip at
+    /// the lowest sample of its below-threshold run. On a flat tip that
+    /// sample is picked by the ripple the other transmitter's leakage
+    /// (40 MHz off, deep in the probe's stopband) leaves on the
+    /// plateau, and that ripple drifts with the sample phase: NTSC's
+    /// tips wandered the whole tip width from line to line, the ±1 %
+    /// consensus threw the intervals out, the cluster stayed
+    /// `AnalogVideoUnknown` at 0.6 and died at `min_confidence`. PAL
+    /// sampled every line identically and passed by luck. Whether one
+    /// of NTSC's skirt probes squeaked through was float noise — the
+    /// GPU's did, the CPU's did not. Tips now sit at the run midpoint,
+    /// which the pulse edges fix to a fraction of a sample.
+    #[test]
+    fn a_second_transmitter_does_not_unclassify_an_ntsc_line_of_non_integer_probe_samples() {
+        let sample_rate = 80_000_000u32;
+        let n = 524_288;
+        let mut iq = fm_sync_iq(sample_rate, n, 15625.0, 4e6, -20e6);
+        for (a, b) in iq
+            .iter_mut()
+            .zip(fm_sync_iq(sample_rate, n, 15734.0, 4e6, 20e6))
+        {
+            *a += b;
+        }
+        let found = AnalogFpvDetector::default().detect_from_iq(&iq, 5_800_000_000, sample_rate);
+        for (off_hz, want) in [
+            (-20e6f64, SignalType::AnalogVideoPal),
+            (20e6, SignalType::AnalogVideoNtsc),
+        ] {
+            let carrier = 5_800e6 + off_hz;
+            let hit = found
+                .iter()
+                .find(|d| (d.frequency_hz as f64 - carrier).abs() < 3e6)
+                .unwrap_or_else(|| panic!("{want:?} at {off_hz:+e} Hz not reported: {found:?}"));
+            assert_eq!(hit.signal_type, want, "at {off_hz:+e} Hz: {hit:?}");
+        }
     }
 
     #[test]
