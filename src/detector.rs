@@ -50,6 +50,12 @@ pub struct AnalogFpvDetector {
     /// justifies trusting VBI absence as disqualifying, not just VBI
     /// presence as reassuring.
     pub demote_unconfirmed_video: bool,
+    /// Peak FM deviation assumed by [`Self::localize_carrier`] when it
+    /// converts a sync-tip level into a carrier offset. Nothing else
+    /// depends on it: a 20% error here is a ~0.4 MHz error in a reported
+    /// frequency, against the ±2.5 MHz the probe grid alone gives. 5 MHz
+    /// is the common analog FPV figure.
+    pub assumed_deviation_hz: f32,
     planner: RefCell<FftPlanner<f32>>,
     /// Cached Hann window, keyed by length. `detect_sync_pulses` runs on
     /// every capture block at one steady length, so a single slot hits
@@ -59,6 +65,8 @@ pub struct AnalogFpvDetector {
     /// Reused demodulation buffer for `detect_sync_pulses` — a fresh
     /// ~256 KB `Vec` per probe per batch was pure allocator churn.
     demod_scratch: RefCell<Vec<f32>>,
+    /// Scratch for [`Self::localize_carrier`], reused across calls.
+    localize_scratch: RefCell<LocalizeScratch>,
     /// Cached sweep FIR design, keyed by `(sample_rate, cutoff_hz)`.
     /// Every probe in a sweep shares one design; only the mixing
     /// offset differs.
@@ -82,14 +90,25 @@ impl Default for AnalogFpvDetector {
             max_bandwidth: 30_000_000, // 30 MHz (FM video can be ~20 MHz wide)
             min_confidence: 0.7,
             demote_unconfirmed_video: false,
+            assumed_deviation_hz: 5_000_000.0,
             planner: RefCell::new(FftPlanner::new()),
             hann: RefCell::new(None),
             demod_scratch: RefCell::new(Vec::new()),
+            localize_scratch: RefCell::new(LocalizeScratch::default()),
             sweep_taps: RefCell::new(None),
             #[cfg(feature = "gpu")]
             gpu: None,
         }
     }
+}
+
+/// Buffers [`AnalogFpvDetector::localize_carrier`] reuses: a wide-passband
+/// copy of the capture around one hit, its demod, and the smoothed demod.
+#[derive(Default)]
+struct LocalizeScratch {
+    wide_iq: Vec<Complex<f32>>,
+    demod: Vec<f32>,
+    smooth: Vec<f32>,
 }
 
 #[cfg(feature = "gpu")]
@@ -282,6 +301,79 @@ impl AnalogFpvDetector {
             energy_threshold_db,
             ..Default::default()
         }
+    }
+
+    /// Where the carrier of a detected signal sits relative to
+    /// `probe_offset_hz`, in Hz, measured from the demodulated sync-tip
+    /// level. `None` when no tip level can be read.
+    ///
+    /// This is what turns a probe-grid position into a frequency. The
+    /// sweep classifies probes 5 MHz apart and reported a hit *at the
+    /// probe centre*: up to 2.5 MHz off for a carrier between probes,
+    /// and — being fixed by where the grid falls relative to the signal
+    /// — the same amount off on every sweep, so integration never
+    /// averaged it away. A synthetic carrier read a constant −0.7 MHz.
+    ///
+    /// The demod already holds the answer: an FM discriminator outputs
+    /// instantaneous frequency, so the sync-tip level *is* the carrier
+    /// offset less the known `SYNC_TO_BLANK_FRACTION · deviation` that
+    /// puts the tip below blanking. What it must NOT be read from is the
+    /// detection probe itself. That probe is band-limited to
+    /// `target_rate / 3` ≈ 3.3 MHz for sensitivity, and a 5 MHz swing
+    /// sitting mostly outside it turns the bright-video excursions into
+    /// discriminator clicks that drag the 2nd-percentile tip estimate
+    /// megahertz too low — measured: carriers between probes localized
+    /// to 0.00 MHz, carriers near a probe centre came back 3 MHz off.
+    /// So this cuts its own copy from the raw capture, wide enough for
+    /// the whole swing plus the probe's reach, and reads the tip there.
+    fn localize_carrier(
+        &self,
+        iq_data: &[Complex<f32>],
+        sample_rate: u32,
+        probe_offset_hz: f32,
+        reach_hz: f32,
+    ) -> Option<f32> {
+        let fs = sample_rate as f32;
+        let dev = self.assumed_deviation_hz;
+        // A public field: a non-positive or non-finite deviation would
+        // make the cutoff and the acceptance window meaningless.
+        if !(dev.is_finite() && dev > 0.0 && fs > 0.0) {
+            return None;
+        }
+        // Whole FM swing (blanking −0.4·dev … white +1.0·dev, with
+        // margin) plus wherever inside the probe the carrier may be.
+        let cutoff = (reach_hz + 1.3 * dev).min(0.45 * fs);
+        let mut scratch = self.localize_scratch.borrow_mut();
+        let LocalizeScratch {
+            wide_iq,
+            demod,
+            smooth,
+        } = &mut *scratch;
+        let mut ddc = crate::ddc::StreamingDDC::new(probe_offset_hz, sample_rate, cutoff);
+        // `process_into` appends; without this the scratch grew by one
+        // block per hit and every estimate after the first was read off
+        // a concatenation of unrelated probe cuts.
+        wide_iq.clear();
+        ddc.process_into(iq_data, wide_iq);
+        crate::demod::fm_demod_into(wide_iq, demod);
+        let ma_win = ((fs * 0.5e-6) as usize).max(1);
+        crate::levels::moving_average_into(demod, ma_win, smooth);
+        let (tip, _) = crate::levels::robust_sync_levels(smooth)?;
+        let radians_per_volt = 2.0 * std::f32::consts::PI * dev / fs;
+        let carrier_rad = tip + crate::levels::SYNC_TO_BLANK_FRACTION * radians_per_volt;
+        let hz = carrier_rad * fs / (2.0 * std::f32::consts::PI);
+        // Trusted only where the whole swing sat inside the passband:
+        // the tip (0.4·dev below the carrier) above the lower edge and
+        // white (1.0·dev above it) below the upper. Outside that, part
+        // of the swing was clipped into clicks and the tip level is not
+        // to be believed. This is deliberately wider than the probe's
+        // grid reach — the cluster's strongest-energy probe is biased
+        // toward the bright side of the swing and can sit a full step
+        // from the carrier while still reading it cleanly.
+        let ok = hz.is_finite()
+            && hz >= -(cutoff - crate::levels::SYNC_TO_BLANK_FRACTION * dev)
+            && hz <= cutoff - dev;
+        ok.then_some(hz)
     }
 
     /// Classify one capture block: harmonic-comb line-rate detection,
@@ -1136,9 +1228,13 @@ impl AnalogFpvDetector {
                     .map(|s| s.re * s.re + s.im * s.im)
                     .sum::<f32>()
                     / iq_data.len() as f32;
+                let refined = self
+                    .localize_carrier(iq_data, sample_rate, 0.0, sample_rate as f32 / 2.0)
+                    .map(f64::from)
+                    .unwrap_or(0.0);
                 final_results.push(DetectionResult {
                     channel: None,
-                    frequency_hz: center_freq,
+                    frequency_hz: (center_freq as f64 + refined).round().max(0.0) as u64,
                     confidence: conf,
                     rssi_dbm: 10.0 * (energy + 1e-12).log10(),
                     bandwidth_hz: sample_rate,
@@ -1199,11 +1295,15 @@ impl AnalogFpvDetector {
                         .map(|s| s.re * s.re + s.im * s.im)
                         .sum::<f32>()
                         / iq_data.len() as f32;
+                    let refined = self
+                        .localize_carrier(iq_data, sample_rate, 0.0, sample_rate as f32 / 2.0)
+                        .map(f64::from)
+                        .unwrap_or(0.0);
                     final_results.push(DetectionResult {
                         channel: None,
-                        frequency_hz: center_freq,
+                        frequency_hz: (center_freq as f64 + refined).round().max(0.0) as u64,
                         confidence: conf,
-                        rssi_dbm: 10.0 * energy.log10(),
+                        rssi_dbm: 10.0 * (energy + 1e-12).log10(),
                         bandwidth_hz: sample_rate,
                         signal_type: sig_type,
                     });
@@ -1326,74 +1426,136 @@ impl AnalogFpvDetector {
                     None => self.detect_sync_pulses(isolated_iq, *isolated_rate),
                 };
                 if sig_type != SignalType::Unknown {
+                    // Probe centre. Localization to the carrier happens
+                    // once per cluster below, on the strongest member —
+                    // doing it here ran a full-rate FIR and demod for
+                    // every hit, up to eleven per packet in integrated
+                    // mode, most of them noise-floor probes.
                     let freq_hz = center_freq as f64 + offset_hz;
                     sweep_hits.push((freq_hz, *energy, sig_type, conf));
                 }
             }
 
-            // Cluster hits: group detections within 25 MHz (FM video BW),
-            // keep the strongest member. Each cluster tracks an immutable
-            // `anchor_freq` (the first hit's centre) separately from the
-            // strongest member's `(freq, energy, sig, conf)`. The earlier
-            // shape compared each new hit against the previous cluster's
-            // *strongest member* and then overwrote the anchor when the
-            // member updated — for evenly-spaced hits at 0/20/40/60/80
-            // MHz that chained the whole sweep into one 80-MHz-wide
-            // cluster, because every 20-MHz step landed inside the
-            // 25-MHz window relative to the *previous* anchor.
-            sweep_hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            // Cluster hits: group detections within 25 MHz (FM video BW).
+            //
+            // Strongest first. Hits used to be sorted by frequency and a
+            // cluster anchored on whichever came first, which let a
+            // noise-floor probe at the band edge — energy ~1e-6,
+            // classified at all only because integrated mode classifies
+            // every probe — decide where a 25 MHz window fell. On a
+            // synthetic carrier at the tuned centre that window ran from
+            // −20.7 to +4.3 MHz: it held the signal's own probes (which
+            // localized to 0.00 MHz but classified AnalogVideoUnknown at
+            // 0.6, their narrow passband clipping the sync swing) and
+            // excluded the 300× weaker sibling at +9.3 MHz that had
+            // classified NTSC at 0.8. The strong half died at
+            // min_confidence; the weak half was reported alone, at its
+            // own probe centre. Anchoring on the strongest hit puts the
+            // window where the energy is, so a signal's probes and the
+            // sibling that classified it land in one cluster.
+            //
+            // The anchor is immutable and the window is measured from it
+            // rather than from whichever member joined last: chaining
+            // relative to the previous member once merged evenly spaced
+            // hits at 0/20/40/60/80 MHz into a single 80 MHz cluster.
+            //
+            // Within a cluster the fields split by what each is *for*:
+            // frequency and energy are the strongest member's, since the
+            // probe with the most energy is looking straight at the
+            // carrier; classification is the most CONFIDENT member's,
+            // because the carrier-centred probe's clipped passband can
+            // leave it unable to tell PAL from NTSC while a sibling one
+            // step off-centre resolves it cleanly. Letting energy pick the
+            // classification too meant a strong signal was reported as
+            // nothing at all.
+            sweep_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Total window width. The membership test below uses half of
+            // it as a radius around the anchor: with hits sorted by
+            // frequency the old `abs() < 25 MHz` test was one-sided in
+            // practice (every later hit lay above the anchor), and
+            // keeping that expression with a strongest-first anchor in
+            // the middle would quietly have made the window 50 MHz wide
+            // — three transmitters 24 MHz apart would collapse into one
+            // report. ±12.5 MHz still spans a signal's own probes and
+            // the sibling one or two grid steps out that may be the one
+            // to classify it.
             const CLUSTER_BW_HZ: f64 = 25e6;
-            // Tuple element 0 is the immutable anchor frequency used for
-            // grouping; elements 1..=4 are the strongest member's
-            // (freq, energy, sig_type, conf).
+            // Tuple element 0 is the immutable anchor frequency (the
+            // strongest member's); elements 1..=4 are (freq, energy,
+            // sig_type, conf), with 1..=2 fixed at creation and 3..=4
+            // following the most confident member.
             let mut clusters: Vec<(f64, f64, f32, SignalType, f32)> = Vec::new();
             for hit in &sweep_hits {
-                if let Some(last) = clusters.last_mut()
-                    && (hit.0 - last.0).abs() < CLUSTER_BW_HZ
+                if let Some(c) = clusters
+                    .iter_mut()
+                    .find(|c| (hit.0 - c.0).abs() < CLUSTER_BW_HZ / 2.0)
                 {
-                    // Same cluster — the anchor (last.0) stays fixed, and
-                    // the remaining fields split by what each is *for*.
-                    //
-                    // Frequency and energy follow the strongest member:
-                    // the probe with the most energy is looking straight
-                    // at the carrier, so its centre is the best position
-                    // estimate.
-                    //
-                    // Classification follows the most CONFIDENT member.
-                    // These can genuinely differ: with a ±5 MHz FM
-                    // deviation, sync tips swing to the passband edge of
-                    // the carrier-centred probe, whose time-domain
-                    // disambiguation then fails consensus and returns
-                    // AnalogVideoUnknown at 0.6 — while the probe one
-                    // step off-centre sees the tips mid-passband and
-                    // resolves PAL at 0.8 from twenty-seven identical
-                    // intervals. Letting energy pick the classification
-                    // too meant the strongest probe's Unknown shadowed
-                    // its siblings' confident answer, and the cluster
-                    // then died at the min-confidence filter: a clean,
-                    // strong signal reported as nothing at all.
-                    if hit.1 > last.2 {
-                        last.1 = hit.0;
-                        last.2 = hit.1;
-                    }
-                    if hit.3 > last.4 {
-                        last.3 = hit.2;
-                        last.4 = hit.3;
+                    if hit.3 > c.4 {
+                        c.3 = hit.2;
+                        c.4 = hit.3;
                     }
                     continue;
                 }
                 clusters.push((hit.0, hit.0, hit.1, hit.2, hit.3));
             }
 
+            // Skirt absorption. An FM video signal's sync-edge sidebands
+            // extend well past its ±12.5 MHz cluster, and a probe sitting
+            // on that skirt can classify the signal confidently at
+            // 20–25 dB below the main lobe — measured: a carrier at
+            // +7.5 MHz produced an NTSC 0.8 hit at −5.72 MHz, 25 dB down,
+            // which survived as its own cluster and was reported as a
+            // second transmitter. Anything that much weaker than a
+            // cluster within the video bandwidth of it is that signal's
+            // skirt, not another signal: fold it in. Its classification
+            // still counts (skirts are often where the sync structure
+            // survives cleanest), its position does not. Real second
+            // transmitters this close and this much weaker are given up
+            // — they could not be decoded beside the strong one anyway.
+            const SKIRT_REACH_HZ: f64 = 25e6;
+            const SKIRT_RATIO: f32 = 100.0; // 20 dB
+            let mut i = 0;
+            while i < clusters.len() {
+                let (anchor, energy) = (clusters[i].0, clusters[i].2);
+                let mut j = i + 1;
+                while j < clusters.len() {
+                    let d = clusters[j];
+                    if (d.0 - anchor).abs() < SKIRT_REACH_HZ && d.2 * SKIRT_RATIO < energy {
+                        if d.4 > clusters[i].4 {
+                            clusters[i].3 = d.3;
+                            clusters[i].4 = d.4;
+                        }
+                        clusters.remove(j);
+                    } else {
+                        j += 1;
+                    }
+                }
+                i += 1;
+            }
+
             for (_anchor, freq_hz, energy, sig_type, conf) in clusters {
-                // Sweep clusters are already deduped within 25 MHz, and
-                // the final pass below merges anything that still
-                // overlaps, so we can push each cluster directly.
+                // The cluster's frequency is its strongest probe's
+                // centre; refine that one probe to the carrier. See
+                // `localize_carrier` — this is where the ±2.5 MHz grid
+                // quantization comes off, and one call per cluster is
+                // all it costs.
+                let probe_offset = freq_hz - center_freq as f64;
+                let refined = self
+                    .localize_carrier(
+                        iq_data,
+                        sample_rate,
+                        probe_offset as f32,
+                        (step_hz / 2.0) as f32,
+                    )
+                    .map(f64::from)
+                    .unwrap_or(0.0);
+                // The final pass below merges anything that still
+                // overlaps, so each cluster is pushed directly.
                 final_results.push(DetectionResult {
                     channel: None,
-                    frequency_hz: freq_hz as u64,
+                    frequency_hz: (freq_hz + refined).round().max(0.0) as u64,
                     confidence: conf,
-                    rssi_dbm: 10.0 * energy.log10(),
+                    rssi_dbm: 10.0 * (energy + 1e-12).log10(),
                     bandwidth_hz: target_rate,
                     signal_type: sig_type,
                 });
@@ -1525,12 +1687,20 @@ mod tests {
         let sync_tip = (sample_rate as f32 * 4.7e-6) as usize;
         let total = spl * num_lines + 1;
 
-        // Baseband: sync tip at −1.0, blanking at +1.0.
-        let mut bb = vec![1.0f32; total];
+        // The crate's level convention (see `levels`): blanking is the
+        // carrier at 0 rad/sample, and the sync tip sits
+        // SYNC_TO_BLANK_FRACTION of a 5 MHz deviation below it. An
+        // earlier shape put blanking at +1.0 and the tip at −1.0, which
+        // detects fine but places the carrier 1 rad/sample above the
+        // tuned centre — and once results were localized from the tip
+        // level, that fixture reported itself ~0.45 MHz off.
+        let radians_per_volt = 2.0 * std::f32::consts::PI * 5.0e6 / sample_rate as f32;
+        let tip = -crate::levels::SYNC_TO_BLANK_FRACTION * radians_per_volt;
+        let mut bb = vec![0.0f32; total];
         for line in 0..num_lines {
             let s = line * spl;
             for i in 0..sync_tip.min(total.saturating_sub(s)) {
-                bb[s + i] = -1.0;
+                bb[s + i] = tip;
             }
         }
 
@@ -1920,7 +2090,15 @@ mod tests {
         let det = AnalogFpvDetector::new(3.0);
         let results = det.detect_from_iq(&iq, 5_800_000_000, sr);
         assert_eq!(results.len(), 1, "expected exactly one detection");
-        assert_eq!(results[0].frequency_hz, 5_800_000_000);
+        // The centre is *measured* from the carrier rather than echoed,
+        // so allow the estimator's residual — but only that. The fixture
+        // follows the crate's level convention, so anything beyond a
+        // hundred kHz means the tip level was misread.
+        assert!(
+            (results[0].frequency_hz as i64 - 5_800_000_000).abs() < 100_000,
+            "reported {} Hz, expected within 100 kHz of 5.8 GHz",
+            results[0].frequency_hz
+        );
         assert_eq!(results[0].signal_type, SignalType::AnalogVideoPal);
     }
 
@@ -2338,6 +2516,93 @@ mod dead_zone_tests {
             (hit.frequency_hz as f64 - 5_800e6).abs() < 3e6,
             "PAL hit localised to {} Hz, expected ~5.8 GHz",
             hit.frequency_hz
+        );
+    }
+    fn first_hit(sample_rate: u32, deviation_hz: f32, off_mhz: f32) -> Option<DetectionResult> {
+        let cfg = SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let iq = generate_iq(&cfg, 6, off_mhz * 1e6);
+        let det = AnalogFpvDetector::default();
+        let mut integ = SpectralIntegrator::new(4);
+        // 65,536-sample packets through the integrated path, as the
+        // viewer's scan feeds it. Up to eight: a carrier at the tuned
+        // centre of a 25 MSPS capture needs seven on the committed
+        // baseline too, so this is testing localization, not detection
+        // latency — the scan revisits every hop each sweep regardless.
+        for k in 0..8 {
+            let a = k * 65_536;
+            let found = det.detect_from_iq_integrated(
+                &iq[a..a + 65_536],
+                5_800_000_000,
+                sample_rate,
+                &mut integ,
+            );
+            // The strongest result, as the viewer's scan chooses.
+            if let Some(hit) = found
+                .into_iter()
+                .max_by(|a, b| a.rssi_dbm.partial_cmp(&b.rssi_dbm).unwrap())
+            {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    /// A hit is reported at the carrier, not at the nearest probe.
+    ///
+    /// The sweep classifies probes on a 5 MHz grid and used to report a
+    /// hit at the probe centre — up to 2.5 MHz off for a carrier between
+    /// probes, and the *same* amount off on every sweep, so integration
+    /// never averaged it away. Offsets here deliberately mix carriers
+    /// near a probe centre (the 61.44 MSPS grid is at −0.72 + 5k MHz)
+    /// with carriers between probes: the first version of this
+    /// localizer read the tip inside the narrow detection probe and got
+    /// the between-probe cases exact while the near-centre ones came
+    /// back 3 MHz off, because a swing outside the probe's passband
+    /// turns bright video into clicks that swamp the tip estimate.
+    #[test]
+    fn sweep_hits_are_localized_to_the_carrier_not_the_probe() {
+        for (sample_rate, offsets_mhz) in [
+            (
+                61_440_000u32,
+                &[0.0f32, 3.0, 5.0, 7.5, 10.0, 12.0, 15.0, 18.0][..],
+            ),
+            (25_000_000u32, &[0.0f32, 2.0, 6.0][..]),
+        ] {
+            for &off in offsets_mhz {
+                let hit = first_hit(sample_rate, 5e6, off).unwrap_or_else(|| {
+                    panic!("no detection at {sample_rate} Hz, offset {off:+.1} MHz")
+                });
+                let reported = (hit.frequency_hz as f64 - 5_800e6) / 1e6;
+                let err = reported - off as f64;
+                assert!(
+                    err.abs() < 0.4,
+                    "{sample_rate} Hz, carrier at {off:+.1} MHz: reported {reported:+.2} MHz, \
+                     error {err:+.2} MHz — an error this large means the hit is back on the \
+                     probe grid, or the tip was read through a clipping passband"
+                );
+            }
+        }
+    }
+
+    /// The tip→carrier conversion scales with the assumed deviation, so a
+    /// wrong assumption degrades gracefully instead of snapping back to
+    /// the grid: a 20% deviation error is a ~0.4 MHz frequency error.
+    #[test]
+    fn carrier_localization_degrades_gracefully_with_wrong_deviation() {
+        // Transmitter deviates 4 MHz; the detector assumes 5.
+        let hit = first_hit(61_440_000, 4e6, 12.0).expect("no detection at 4 MHz deviation");
+        let err = (hit.frequency_hz as f64 - 5_800e6) / 1e6 - 12.0;
+        assert!(
+            err.abs() < 0.8,
+            "20% deviation mismatch should cost ~0.4 MHz, got {err:+.2} MHz"
         );
     }
 }

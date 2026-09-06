@@ -86,6 +86,54 @@ Additionally, all finalized detection events are filtered to only return results
 ### Why FM Demodulation?
 Previous iterations used **magnitude envelope** analysis (`|I + jQ|`), which works for AM signals but fails for FM video — FM is a constant-envelope modulation where sync pulses modulate the *instantaneous frequency*, not the amplitude. The FM demod approach correctly recovers the baseband video waveform where H-sync pulses produce clean spectral peaks.
 
+### 3.1 Localizing the carrier within a probe
+
+The sliding sweep classifies probes on a 5 MHz grid, and a hit used to be
+reported *at the probe centre*. That is a uniform ±2.5 MHz error — and,
+because it depends only on where the grid falls relative to the signal,
+it is the same error on every sweep, so `SpectralIntegrator` could never
+average it away. A synthetic carrier measured a constant −0.7 MHz across
+every sweep.
+
+The demodulated waveform already carries the answer. Instantaneous
+frequency is what an FM discriminator outputs, so the sync-tip level of
+the demod *is* the carrier's offset from the probe centre, less the
+known `SYNC_TO_BLANK_FRACTION · deviation` that puts the tip below
+blanking. `detect_sync_pulses_inner` reads the tip as the 2nd percentile
+of a ~0.5 µs-smoothed demod — the same robust construction the rest of
+the crate uses — and every result site adds that offset to the probe (or
+tuned) centre. The estimate is trusted only within the probe's own reach;
+a wilder value means the "tip" was not one, and the centre is reported
+unrefined.
+
+The one input this needs is a deviation figure, since the tip-to-carrier
+distance scales with it. `AnalogFpvDetector::assumed_deviation_hz`
+(default 5 MHz) supplies it; a 20% error there is a ~0.4 MHz error in a
+reported frequency, six times better than the grid alone. The 50-pulse
+deviation estimator is not used here because a 1 ms probe block holds
+only ~16 lines.
+
+Clustering had to change with it. Sweep hits are grouped within 25 MHz,
+and the group used to be anchored on the lowest-frequency hit — which in
+integrated mode (every probe classified, §11) can be a noise-floor probe
+at the band edge. That window could hold a signal's own probes while
+excluding the weaker sibling that had classified it, and the two halves
+then failed separately. Clusters now anchor on the strongest hit and
+admit members within ±12.5 MHz of it — half the 25 MHz window, so a
+symmetric window around a mid-band anchor stays as wide as the old
+one-sided one. The strongest member's probe is the one localized to the
+carrier (once per cluster, not once per hit), and the most confident
+member supplies the classification. A second pass folds in any cluster
+more than 20 dB weaker than a neighbour within 25 MHz: sync-edge
+sidebands let a probe on a signal's skirt classify it confidently far
+outside the tight window, and that is the signal's skirt, not another
+transmitter.
+
+This is the deterministic half of a two-part plan. The other half —
+dithering the probe grid per sweep by a low-discrepancy sequence so any
+residual bias averages out — requires the integrator to accumulate in
+absolute frequency rather than per probe, and is deferred until it does.
+
 ## 4. Confidence Scoring Model
 
 | Score | SignalType | Meaning |

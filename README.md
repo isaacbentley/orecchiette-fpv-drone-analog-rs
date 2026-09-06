@@ -33,6 +33,10 @@ math. Section references below point into it.
   spectra across batches for additional sensitivity. A calibrated test
   holds detection at a noise level where four independent single batches
   all fail (§11).
+- **Carrier localization.** A hit is reported at the carrier, not at the
+  nearest probe: the demodulated sync-tip level gives the carrier's
+  offset within a probe, which removes the ±2.5 MHz grid quantization
+  that cross-sweep integration could never average away (§3.1).
 - **Clustering and scoring.** Detections within 25 MHz are merged into a
   single event, scored from 0.0 to 1.0.
 
