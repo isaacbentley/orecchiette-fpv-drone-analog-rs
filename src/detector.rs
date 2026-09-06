@@ -102,6 +102,20 @@ impl Default for AnalogFpvDetector {
     }
 }
 
+/// One sliding-sweep probe: where it sat relative to the tuned centre and
+/// the mean power it saw. Returned by
+/// [`AnalogFpvDetector::detect_from_iq_integrated_with_probes`] so a caller
+/// can show the band the detector actually looked at — the same numbers the
+/// energy gate and the cluster ranking run on, not a separate estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProbeEnergy {
+    pub offset_hz: f64,
+    /// Mean |IQ|² over the probe's decimated block — linear power in the
+    /// capture's own units; `10·log10` gives the dBm-relative figure the
+    /// results report.
+    pub energy: f32,
+}
+
 /// Buffers [`AnalogFpvDetector::localize_carrier`] reuses: a wide-passband
 /// copy of the capture around one hit, its demod, and the smoothed demod.
 #[derive(Default)]
@@ -1155,7 +1169,30 @@ impl AnalogFpvDetector {
         sample_rate: u32,
         integrator: &mut SpectralIntegrator,
     ) -> Vec<DetectionResult> {
-        self.detect_from_iq_impl(iq_data, center_freq, sample_rate, Some(integrator))
+        self.detect_from_iq_impl(iq_data, center_freq, sample_rate, Some(integrator), None)
+    }
+
+    /// [`Self::detect_from_iq_integrated`], additionally handing back every
+    /// probe the sweep measured in `probes_out` (cleared first), in
+    /// ascending `offset_hz` order. Left empty for captures the detector
+    /// treats as a single slice (below the ~25 MSPS boundary described in
+    /// the crate docs), where there is no probe grid. Costs nothing the
+    /// sweep did not already do.
+    pub fn detect_from_iq_integrated_with_probes(
+        &self,
+        iq_data: &[Complex<f32>],
+        center_freq: u64,
+        sample_rate: u32,
+        integrator: &mut SpectralIntegrator,
+        probes_out: &mut Vec<ProbeEnergy>,
+    ) -> Vec<DetectionResult> {
+        self.detect_from_iq_impl(
+            iq_data,
+            center_freq,
+            sample_rate,
+            Some(integrator),
+            Some(probes_out),
+        )
     }
 
     fn detect_from_iq_impl(
@@ -1164,7 +1201,11 @@ impl AnalogFpvDetector {
         center_freq: u64,
         sample_rate: u32,
         mut integration: Option<&mut SpectralIntegrator>,
+        mut probes_out: Option<&mut Vec<ProbeEnergy>>,
     ) -> Vec<DetectionResult> {
+        if let Some(out) = probes_out.as_deref_mut() {
+            out.clear();
+        }
         let n = iq_data.len();
         if n < 2048 {
             return vec![];
@@ -1405,6 +1446,13 @@ impl AnalogFpvDetector {
                 max_energy * 0.5
             };
 
+            if let Some(out) = probes_out.as_deref_mut() {
+                out.extend(probes.iter().map(|(offset_hz, energy, _, _)| ProbeEnergy {
+                    offset_hz: *offset_hz,
+                    energy: *energy,
+                }));
+            }
+
             // Collect all positive detections from the sweep
             let mut sweep_hits: Vec<(f64, f32, SignalType, f32)> = Vec::new(); // (freq_hz, energy, type, conf)
             for (offset_hz, energy, isolated_iq, isolated_rate) in &probes {
@@ -1586,7 +1634,7 @@ impl FpvDetector for AnalogFpvDetector {
         center_freq: u64,
         sample_rate: u32,
     ) -> Vec<DetectionResult> {
-        self.detect_from_iq_impl(iq_data, center_freq, sample_rate, None)
+        self.detect_from_iq_impl(iq_data, center_freq, sample_rate, None, None)
     }
 }
 
