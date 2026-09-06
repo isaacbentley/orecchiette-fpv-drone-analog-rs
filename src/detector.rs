@@ -328,30 +328,19 @@ impl AnalogFpvDetector {
         }
     }
 
-    /// Where the carrier of a detected signal sits relative to
-    /// `probe_offset_hz`, in Hz, measured from the demodulated sync-tip
-    /// level. `None` when no tip level can be read.
+    /// Cut a whole-swing copy of the capture around `probe_offset_hz`
+    /// into the localization scratch and demodulate it. Returns the
+    /// cutoff used, or `None` when the assumed deviation cannot define
+    /// one — the scratch is then stale and must not be read.
     ///
-    /// This is what turns a probe-grid position into a frequency. The
-    /// sweep classifies probes 5 MHz apart and reported a hit *at the
-    /// probe centre*: up to 2.5 MHz off for a carrier between probes,
-    /// and — being fixed by where the grid falls relative to the signal
-    /// — the same amount off on every sweep, so integration never
-    /// averaged it away. A synthetic carrier read a constant −0.7 MHz.
-    ///
-    /// The demod already holds the answer: an FM discriminator outputs
-    /// instantaneous frequency, so the sync-tip level *is* the carrier
-    /// offset less the known `SYNC_TO_BLANK_FRACTION · deviation` that
-    /// puts the tip below blanking. What it must NOT be read from is the
-    /// detection probe itself. That probe is band-limited to
-    /// `target_rate / 3` ≈ 3.3 MHz for sensitivity, and a 5 MHz swing
-    /// sitting mostly outside it turns the bright-video excursions into
-    /// discriminator clicks that drag the 2nd-percentile tip estimate
-    /// megahertz too low — measured: carriers between probes localized
-    /// to 0.00 MHz, carriers near a probe centre came back 3 MHz off.
-    /// So this cuts its own copy from the raw capture, wide enough for
-    /// the whole swing plus the probe's reach, and reads the tip there.
-    fn localize_carrier(
+    /// The detection probe is band-limited to `target_rate / 3`
+    /// ≈ 3.3 MHz for sensitivity, and a 5 MHz FM swing sitting mostly
+    /// outside it turns the bright-video excursions into discriminator
+    /// clicks. Two readings want the swing intact and are taken off
+    /// this wider cut instead: the sync-tip level that localizes the
+    /// carrier ([`Self::carrier_from_wide_cut`]) and the vertical-sync
+    /// structure that confirms it ([`Self::confirm_on_wide_cut`]).
+    fn wide_cut(
         &self,
         iq_data: &[Complex<f32>],
         sample_rate: u32,
@@ -383,7 +372,34 @@ impl AnalogFpvDetector {
         crate::demod::fm_demod_into(wide_iq, demod);
         let ma_win = ((fs * 0.5e-6) as usize).max(1);
         crate::levels::moving_average_into(demod, ma_win, smooth);
-        let (tip, _) = crate::levels::robust_sync_levels(smooth)?;
+        Some(cutoff)
+    }
+
+    /// Where the carrier of a detected signal sits relative to the probe
+    /// the current [`Self::wide_cut`] was centred on, in Hz, measured
+    /// from the demodulated sync-tip level. `None` when no tip level can
+    /// be read, or the estimate falls outside the cut's trusted window.
+    ///
+    /// This is what turns a probe-grid position into a frequency. The
+    /// sweep classifies probes 5 MHz apart and reported a hit *at the
+    /// probe centre*: up to 2.5 MHz off for a carrier between probes,
+    /// and — being fixed by where the grid falls relative to the signal
+    /// — the same amount off on every sweep, so integration never
+    /// averaged it away. A synthetic carrier read a constant −0.7 MHz.
+    ///
+    /// The demod already holds the answer: an FM discriminator outputs
+    /// instantaneous frequency, so the sync-tip level *is* the carrier
+    /// offset less the known `SYNC_TO_BLANK_FRACTION · deviation` that
+    /// puts the tip below blanking. Read off the narrow detection probe
+    /// it was wrong by megahertz — measured: carriers between probes
+    /// localized to 0.00 MHz, carriers near a probe centre came back
+    /// 3 MHz off — because the clipped bright-video clicks drag the
+    /// 2nd-percentile tip estimate down. Hence the wide cut.
+    fn carrier_from_wide_cut(&self, sample_rate: u32, cutoff: f32) -> Option<f32> {
+        let fs = sample_rate as f32;
+        let dev = self.assumed_deviation_hz;
+        let scratch = self.localize_scratch.borrow();
+        let (tip, _) = crate::levels::robust_sync_levels(&scratch.smooth)?;
         let radians_per_volt = 2.0 * std::f32::consts::PI * dev / fs;
         let carrier_rad = tip + crate::levels::SYNC_TO_BLANK_FRACTION * radians_per_volt;
         let hz = carrier_rad * fs / (2.0 * std::f32::consts::PI);
@@ -399,6 +415,84 @@ impl AnalogFpvDetector {
             && hz >= -(cutoff - crate::levels::SYNC_TO_BLANK_FRACTION * dev)
             && hz <= cutoff - dev;
         ok.then_some(hz)
+    }
+
+    /// [`Self::wide_cut`] followed by [`Self::carrier_from_wide_cut`]:
+    /// the carrier's offset from `probe_offset_hz`, for the result sites
+    /// that only need the frequency.
+    fn localize_carrier(
+        &self,
+        iq_data: &[Complex<f32>],
+        sample_rate: u32,
+        probe_offset_hz: f32,
+        reach_hz: f32,
+    ) -> Option<f32> {
+        let cutoff = self.wide_cut(iq_data, sample_rate, probe_offset_hz, reach_hz)?;
+        self.carrier_from_wide_cut(sample_rate, cutoff)
+    }
+
+    /// Re-run the VBI confirm stage for a sweep cluster on the current
+    /// [`Self::wide_cut`], returning the cluster's confidence after
+    /// [`apply_vbi_confidence_tier`].
+    ///
+    /// The confirm stage inside `detect_sync_pulses` sees only the
+    /// narrow detection probe. Measured against a synthetic NTSC
+    /// carrier, it reached 0.95 only with a probe within about
+    /// −0.8…+1.8 MHz of the carrier — a ~2.6 MHz window on a 5 MHz
+    /// grid, so roughly half of all carrier positions could never reach
+    /// the confirmed tier however strong, because the probe's passband
+    /// clipped the vertical-sync swing it was looking for. The same
+    /// stage on the whole-swing cut confirmed at every offset from −3 to
+    /// +3 MHz (100% at 17 dB, ≥90% at 11 dB), and the cut is already
+    /// computed for localization, so this costs one pulse scan per
+    /// cluster and no second DDC.
+    ///
+    /// Only clusters the probe left unconfirmed are re-examined; one
+    /// that already confirmed keeps its answer. The wide cut's verdict
+    /// supersedes the probe's on the way down as well: a PAL/NTSC hit
+    /// below 0.8 can only have got there through
+    /// `demote_unconfirmed_video` inside the narrow probe, whose "no
+    /// vertical sync" is exactly the passband artifact this stage
+    /// exists to overrule, so it is re-judged from the classifier's
+    /// undemoted 0.8 — confirmed here → 0.95, absent here over a long
+    /// enough slice → demoted again, now on evidence that saw the whole
+    /// swing.
+    ///
+    /// It runs whether or not [`Self::carrier_from_wide_cut`] trusted
+    /// its tip estimate. That window guards the *level* reading; this
+    /// stage looks for broad-pulse groups at field spacing, which
+    /// clipping can hide but cannot fabricate — a clipped cut can only
+    /// fail to confirm, and gating on the level window would reintroduce
+    /// dead phases whenever the tip read fails for unrelated reasons.
+    ///
+    /// `estimate_sync_levels` and `confirm_field_sync` each smooth the
+    /// full-rate demod again (~30 MFLOP per cluster against the cut's
+    /// ~1.9 GFLOP FIR); the calls are kept identical to the probe
+    /// path's, which is what the measurement above was made with.
+    /// Decimating the wide cut (9 MHz cutoff → ×3 is Nyquist-safe) would
+    /// cut both this and localization by the same factor, if it is ever
+    /// worth re-measuring for.
+    fn confirm_on_wide_cut(&self, sample_rate: u32, sig_type: SignalType, conf: f32) -> f32 {
+        if !sig_type.is_analog_video() || conf >= 0.95 {
+            return conf;
+        }
+        let base = if conf < 0.8 && sig_type != SignalType::AnalogVideoUnknown {
+            0.8
+        } else {
+            conf
+        };
+        let scratch = self.localize_scratch.borrow();
+        let demod: &[f32] = &scratch.demod;
+        let Some(levels) = crate::levels::estimate_sync_levels(demod, sample_rate) else {
+            return conf;
+        };
+        let is_pal_hint = match sig_type {
+            SignalType::AnalogVideoPal => Some(true),
+            SignalType::AnalogVideoNtsc => Some(false),
+            _ => None,
+        };
+        let evidence = crate::vbi::confirm_field_sync(demod, sample_rate, &levels, is_pal_hint);
+        apply_vbi_confidence_tier(sig_type, base, &evidence, self.demote_unconfirmed_video)
     }
 
     /// Classify one capture block: harmonic-comb line-rate detection,
@@ -1594,20 +1688,25 @@ impl AnalogFpvDetector {
 
             for (_anchor, freq_hz, energy, sig_type, conf) in clusters {
                 // The cluster's frequency is its strongest probe's
-                // centre; refine that one probe to the carrier. See
-                // `localize_carrier` — this is where the ±2.5 MHz grid
-                // quantization comes off, and one call per cluster is
-                // all it costs.
-                let probe_offset = freq_hz - center_freq as f64;
-                let refined = self
-                    .localize_carrier(
-                        iq_data,
-                        sample_rate,
-                        probe_offset as f32,
-                        (step_hz / 2.0) as f32,
-                    )
-                    .map(f64::from)
-                    .unwrap_or(0.0);
+                // centre. One wide cut around that probe serves two
+                // refinements: the sync-tip level localizes the carrier
+                // (`carrier_from_wide_cut` — this is where the ±2.5 MHz
+                // grid quantization comes off) and the vertical-sync
+                // structure re-runs the confirm stage the narrow probe's
+                // passband could not see (`confirm_on_wide_cut`). One
+                // DDC per cluster is all either costs.
+                let probe_offset = (freq_hz - center_freq as f64) as f32;
+                let reach = (step_hz / 2.0) as f32;
+                let (refined, conf) = match self.wide_cut(iq_data, sample_rate, probe_offset, reach)
+                {
+                    Some(cutoff) => (
+                        self.carrier_from_wide_cut(sample_rate, cutoff)
+                            .map(f64::from)
+                            .unwrap_or(0.0),
+                        self.confirm_on_wide_cut(sample_rate, sig_type, conf),
+                    ),
+                    None => (0.0, conf),
+                };
                 // The final pass below merges anything that still
                 // overlaps, so each cluster is pushed directly.
                 final_results.push(DetectionResult {
@@ -2736,6 +2835,126 @@ mod dead_zone_tests {
         assert!(
             err.abs() < 0.8,
             "20% deviation mismatch should cost ~0.4 MHz, got {err:+.2} MHz"
+        );
+    }
+
+    /// A carrier at a "dead" grid phase — no probe inside the narrow
+    /// passband's confirm window — still reaches the confirmed tier.
+    ///
+    /// Measured before `confirm_on_wide_cut`, the confirm stage on the
+    /// sweep's 3.3 MHz probe reached 0.95 only with a probe within about
+    /// −0.8…+1.8 MHz of the carrier. At 61.44 MSPS the grid sits at
+    /// −0.72 + 5k MHz, so carriers from +5.5 to +6.5 MHz confirmed 0% of
+    /// the time at 17 dB while +5.0 confirmed 100%. Re-running the stage
+    /// on the localization cut lifts them.
+    ///
+    /// Checked at 30.72 MSPS, where the probe's decimated rate (10.24
+    /// MHz) and passband are identical so the window transfers exactly,
+    /// at a quarter of the debug-build cost. Its grid sits at
+    /// −0.36 + 5k MHz, so +7.0 MHz has its nearest probes at −2.36 and
+    /// +2.64 MHz — both outside the window. (+6.5 MHz, the band's other
+    /// extreme, was verified in the measurement behind this test; one
+    /// carrier keeps the debug-build run to ~10 s.)
+    #[test]
+    fn wideband_sweep_confirms_at_dead_grid_phases() {
+        let sample_rate = 30_720_000u32;
+        let cfg = SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 4e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let det = AnalogFpvDetector::default();
+        // Two fields (~33 ms): under 2.2 field periods one confirmed
+        // vertical-sync group is enough for the tier. Unit-variance
+        // complex AWGN against a 4× unit-power carrier is ~17 dB in the
+        // 10 MHz probe.
+        let n_fields = 2;
+        let off_mhz = 7.0f32;
+        let clean = generate_iq(&cfg, n_fields, off_mhz * 1e6);
+        let mut state: u64 = 0x5eed_0000;
+        let iq: Vec<num_complex::Complex<f32>> = clean
+            .iter()
+            .map(|c| {
+                num_complex::Complex::new(
+                    4.0 * c.re + crate::synthetic::gaussian_noise(&mut state),
+                    4.0 * c.im + crate::synthetic::gaussian_noise(&mut state),
+                )
+            })
+            .collect();
+        let hits = det.detect_from_iq(&iq, 5_800_000_000, sample_rate);
+        let true_hz = 5_800e6 + off_mhz as f64 * 1e6;
+        let hit = hits
+            .iter()
+            .filter(|h| (h.frequency_hz as f64 - true_hz).abs() < 2.5e6)
+            .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+            .unwrap_or_else(|| panic!("no detection at +{off_mhz} MHz"));
+        assert_eq!(
+            hit.signal_type,
+            SignalType::AnalogVideoNtsc,
+            "at +{off_mhz} MHz"
+        );
+        assert!(
+            hit.confidence >= 0.95,
+            "carrier at +{off_mhz} MHz stuck at {:.2}: the confirm stage is back on the \
+             narrow probe",
+            hit.confidence
+        );
+    }
+
+    /// The wide cut's verdict supersedes a narrow-probe demotion: a
+    /// PAL/NTSC hit that `demote_unconfirmed_video` dropped to 0.6 is
+    /// re-judged from the undemoted 0.8, so clean field sync on the cut
+    /// lifts it to 0.95 instead of leaving it below `min_confidence`.
+    /// Exercises `confirm_on_wide_cut` directly on one wide cut — no
+    /// sweep — so it stays cheap.
+    #[test]
+    fn wide_cut_confirmation_overrules_a_narrow_probe_demotion() {
+        let sample_rate = 30_720_000u32;
+        let cfg = SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 4e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let clean = generate_iq(&cfg, 2, 7.0e6);
+        let det = AnalogFpvDetector {
+            demote_unconfirmed_video: true,
+            ..Default::default()
+        };
+        // The cluster's strongest probe sat 2.64 MHz above the carrier
+        // (the 30.72 MSPS grid's +9.64 MHz probe), well outside the
+        // narrow probe's confirm window.
+        let cutoff = det
+            .wide_cut(&clean, sample_rate, 9.64e6, 2.5e6)
+            .expect("a valid deviation defines a cut");
+        assert!(
+            det.carrier_from_wide_cut(sample_rate, cutoff).is_some(),
+            "the tip should be readable on the wide cut"
+        );
+        // Demoted (0.6) and merely unconfirmed (0.8) both lift.
+        assert_eq!(
+            det.confirm_on_wide_cut(sample_rate, SignalType::AnalogVideoNtsc, 0.6),
+            0.95
+        );
+        assert_eq!(
+            det.confirm_on_wide_cut(sample_rate, SignalType::AnalogVideoNtsc, 0.8),
+            0.95
+        );
+        // Non-video and already-confirmed inputs pass straight through.
+        assert_eq!(
+            det.confirm_on_wide_cut(sample_rate, SignalType::Unknown, 0.0),
+            0.0
+        );
+        assert_eq!(
+            det.confirm_on_wide_cut(sample_rate, SignalType::AnalogVideoNtsc, 0.95),
+            0.95
         );
     }
 }

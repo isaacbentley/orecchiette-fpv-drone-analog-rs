@@ -36,7 +36,10 @@ math. Section references below point into it.
 - **Carrier localization.** A hit is reported at the carrier, not at the
   nearest probe: the demodulated sync-tip level gives the carrier's
   offset within a probe, which removes the ±2.5 MHz grid quantization
-  that cross-sweep integration could never average away (§3.1).
+  that cross-sweep integration could never average away — and the
+  vertical-sync confirm stage re-runs on that same whole-swing cut, so
+  reaching the confirmed tier no longer depends on where the probe grid
+  happened to fall relative to the carrier (§3.1).
 - **Clustering and scoring.** Detections within 25 MHz are merged into a
   single event, scored from 0.0 to 1.0.
 
