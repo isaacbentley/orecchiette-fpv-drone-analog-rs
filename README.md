@@ -90,14 +90,14 @@ math. Section references below point into it.
 
 ```toml
 [dependencies]
-orecchiette-fpv-drone-analog-rs = "0.7.0"
+orecchiette-fpv-drone-analog-rs = "0.8.0"
 num-complex = "0.4"
 ```
 
 To enable the GPU sweep:
 
 ```toml
-orecchiette-fpv-drone-analog-rs = { version = "0.7.0", features = ["gpu"] }
+orecchiette-fpv-drone-analog-rs = { version = "0.8.0", features = ["gpu"] }
 ```
 
 Construct one `GpuAnalog` and share it across detectors.
