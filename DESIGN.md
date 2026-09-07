@@ -393,8 +393,8 @@ once, which is far harder to diagnose than a gradual degradation.
 reject were fixed offsets from zero (`-0.3·rad_per_volt`, and `×0.8` of
 it). That is only correct if the carrier is centred, nothing changed the
 gain between the discriminator and here, and `fm_deviation` was
-estimated right. Deemphasis breaks it: at the default 0.75 µs — a
-~210 kHz single pole — the 4.7 µs sync pulse is attenuated enough that
+estimated right. Deemphasis breaks it: at 0.75 µs — a ~210 kHz single
+pole, and what this defaulted to — the 4.7 µs sync pulse is attenuated enough that
 its tip no longer clears a threshold pinned to the un-deemphasised
 scale. Sync quality went from 0.98 to **0.00**. Both thresholds now come
 from the demod's own p2/p50 spread (`levels::robust_sync_threshold_at`,

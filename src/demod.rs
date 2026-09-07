@@ -61,13 +61,42 @@ pub fn fm_demod_simd(iq_data: &[Complex<f32>]) -> Vec<f32> {
     fm_demod(iq_data)
 }
 
-/// Default deemphasis time constant: 0.75 µs. Common in analog FPV
-/// VTXs and camcorder-derived FM video links (a faster time constant
-/// than broadcast CCIR 405-1's 50 µs audio deemphasis — video
-/// deemphasis targets the much wider luma bandwidth, not audio).
+/// Default deemphasis time constant: 0.15 µs, cornering at ~1.06 MHz.
+///
+/// Far faster than the 50 or 75 µs of broadcast FM *audio* deemphasis,
+/// because video deemphasis targets the much wider luma bandwidth —
+/// and faster than the 0.75 µs this defaulted to, which was measured
+/// against a live transmitter and found to be taking most of the
+/// picture with it.
+///
+/// [`Deemphasis`] is a single pole, so its attenuation grows without
+/// limit. At 0.75 µs it cornered at 212 kHz and cost 13.6 dB at 1 MHz
+/// and 24.8 dB at 4.2 MHz; NTSC luma runs to about 4.2 MHz and the
+/// detail an eye reads as sharpness sits above 1 MHz, so that is most
+/// of what the picture is made of. Measured on an A1 link, mean
+/// adjacent-pixel step over the active area fell from 38.6 with
+/// deemphasis off to 11.3 at 0.1 µs, 5.6 at 0.2 µs and 1.6 at 0.75 µs.
+///
+/// The mismatch is one of shape rather than of constant. Real video
+/// pre-emphasis is a shelf — a bounded boost that then flattens — and
+/// inverting a shelf with a bare pole over-corrects at the top of the
+/// band however the constant is chosen. 0.15 µs costs 2.7 dB at 1 MHz
+/// and 11.1 dB at 4.2 MHz, which keeps the detail while still rolling
+/// off where the noise deemphasis exists to suppress is worst.
+///
+/// What a shorter constant lets back through is not only detail. The
+/// colour subcarrier (3.58 MHz NTSC, 4.43 MHz PAL) sat about 25 dB down
+/// at 0.75 µs and sits about 11 dB down here, so the burst-gated notch
+/// in [`crate::video`] is doing more of the work than it used to; and
+/// the discriminator's output noise, which rises with frequency, keeps
+/// correspondingly more of its power. That trade was not measured — the
+/// figures above are detail and computed response, not a
+/// detail-versus-noise optimum — so a link noisy enough to want the old
+/// behaviour should ask for it.
+///
 /// Tune per-VTX via [`Deemphasis::new`]'s `tau_seconds` if a specific
 /// transmitter's pre-emphasis curve is known.
-pub const DEFAULT_DEEMPHASIS_TAU_S: f32 = 0.75e-6;
+pub const DEFAULT_DEEMPHASIS_TAU_S: f32 = 0.15e-6;
 
 /// Single-pole IIR deemphasis filter (a digital approximation of the
 /// analog RC low-pass a receiver would use to undo a VTX's pre-

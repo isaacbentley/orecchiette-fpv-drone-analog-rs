@@ -2464,7 +2464,20 @@ mod tests {
                 "clean synthetic {std_name} should lock solidly, got {baseline}"
             );
 
-            for tau in [0.25e-6f32, 0.5e-6, crate::demod::DEFAULT_DEEMPHASIS_TAU_S] {
+            // 0.75 µs is named outright, not taken from
+            // `DEFAULT_DEEMPHASIS_TAU_S`. It is the case that originally
+            // broke this — a ~210 kHz pole pulling the sync tip below a
+            // threshold pinned to the un-deemphasised scale, sync
+            // quality 0.98 to 0.00 — and the default has since moved
+            // shorter, which would have quietly dropped the harshest
+            // gain change out of the sweep. The default rides along too,
+            // wherever it goes next.
+            for tau in [
+                0.25e-6f32,
+                0.5e-6,
+                0.75e-6,
+                crate::demod::DEFAULT_DEEMPHASIS_TAU_S,
+            ] {
                 let mut demod = baseline_demod.clone();
                 Deemphasis::new(sample_rate, tau).process_in_place(&mut demod);
                 let q = sync_quality_of(&demod);

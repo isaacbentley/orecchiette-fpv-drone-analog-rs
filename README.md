@@ -209,8 +209,8 @@ not, the fault lies in the capture.
 
 The reference files carry no transmitter pre-emphasis, so
 `--deemphasis-tau 0` reproduces the generated waveform exactly. The
-viewer's default of 0.75 µs also decodes them correctly, though with
-softer edges, as there is no pre-emphasis to invert. Both settings are
+default of 0.15 µs also decodes them correctly, slightly softer, as
+there is no pre-emphasis to invert. Both settings are
 worth exercising: that gain change between demodulator and reconstructor
 is the condition covered by `sync_survives_deemphasis_gain_change`
 (§9.1).
