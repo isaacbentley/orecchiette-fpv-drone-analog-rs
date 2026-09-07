@@ -186,9 +186,11 @@ The harmonic-comb + cepstrum checks (items 6–7 above) only ever see one FFT's 
    leaked through and synthesised spurious harmonic content in the
    discriminator output. Replaced with a proper 63-tap Blackman-
    windowed-sinc FIR (> 50 dB stopband) — closes that gap at the cost
-   of one extra allocation per probe. A polyphase decimating FIR would
-   avoid computing FIR output for samples the decimation stride
-   discards anyway (~5× per-probe speedup); not yet done.
+   of one extra allocation per probe. An earlier version of this note
+   claimed a pending ~5× polyphase win; that is already banked.
+   `process_into_decimated` runs the convolution only on
+   decimation-aligned samples, and the mixer and delay-line writes that
+   remain are per-sample and irreducible in this structure.
 2. §7's sweep decimation must track the *actual* rate a probe was
    decimated to, not assume it always lands on the nominal
    `WIDEBAND_TARGET_RATE_HZ` — integer division of `sample_rate /

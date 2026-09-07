@@ -2478,4 +2478,110 @@ mod tests {
             }
         }
     }
+
+    /// The chain a live viewer actually runs: capture wide, down-convert
+    /// the channel to baseband while decimating, then demodulate and
+    /// reconstruct at the lower rate.
+    ///
+    /// Nothing in this crate covered that path before. The pieces were
+    /// each tested alone, but a decoder fed from a decimating DDC has
+    /// two ways to break that a decoder fed synthetic baseband cannot.
+    ///
+    /// The first is the rate: the reconstructor must be built with the
+    /// *decimated* rate, since it derives `samples_per_line` and
+    /// `radians_per_volt` from it.
+    ///
+    /// The second only appears with company in the band. Decimating by
+    /// N folds everything above the new Nyquist back onto the signal,
+    /// and the frequency landing exactly on the passband edge is
+    /// `work_rate - cutoff` — 8.36 MHz out, for the 61.44 MSPS capture
+    /// and 7 MHz cutoff a live viewer uses at 4x. That is squarely
+    /// where a neighbouring VTX sits. The 63-tap default attenuates it
+    /// by only 24 dB (computed against the Blackman design in
+    /// `design_fir_taps`); 127 taps give 75 dB. A clean synthetic
+    /// carrier cannot tell those apart, having no out-of-band energy to
+    /// fold, so the crowded case puts a transmitter 20 dB stronger at
+    /// that offset — which drops sync quality to 0.01 on the default
+    /// filter and leaves it above 0.9 on the longer one.
+    ///
+    /// Kept to three passes: this runs in debug builds, and a pass is a
+    /// couple of million samples through a full decode.
+    #[test]
+    fn a_decimated_down_conversion_still_decodes() {
+        use crate::demod::fm_demod;
+        use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+        use crate::vbi::FieldParity;
+
+        // The Aaronia default capture, and the cutoff a 5 MHz-deviation
+        // channel asks for.
+        let capture_rate = 61_440_000u32;
+        let deviation = 5.0e6f32;
+        let cutoff = deviation + 2.0e6;
+        let taps = 127;
+
+        // (decimation, PAL?, a neighbour at the folding offset?)
+        for (decim, is_pal, crowded) in [(4usize, true, true), (4, false, false), (2, true, false)]
+        {
+            let work_rate = capture_rate / decim as u32;
+            let std_name = if is_pal { "PAL" } else { "NTSC" };
+            let height = if is_pal { 576 } else { 480 };
+            let what = if crowded {
+                "with a neighbour 20 dB up at the fold"
+            } else {
+                "alone"
+            };
+            let cfg = SyntheticVideoConfig {
+                sample_rate: capture_rate,
+                is_pal,
+                deviation_hz: deviation,
+                pattern: TestPattern::Bars,
+                start_field: FieldParity::First,
+                noise_sigma: 0.0,
+                dc_offset: 0.0,
+            };
+            // Two fields is comfortably more than the one field plus
+            // blanking the reconstructor needs.
+            let mut iq = generate_iq(&cfg, 2, 0.0);
+            if crowded {
+                let neighbour = generate_iq(&cfg, 2, work_rate as f32 - cutoff);
+                for (a, b) in iq.iter_mut().zip(&neighbour) {
+                    *a += b * 10.0;
+                }
+            }
+
+            // Fed in packets, as the live path does, and at a size that
+            // is deliberately not a multiple of the stride, so the
+            // decimation phase carries a real remainder across
+            // boundaries.
+            let mut ddc = crate::ddc::StreamingDDC::with_taps(0.0, capture_rate, cutoff, taps);
+            let mut baseband = Vec::new();
+            for packet in iq.chunks(65_535) {
+                ddc.process_into_decimated(packet, &mut baseband, decim);
+            }
+            assert_eq!(
+                baseband.len(),
+                iq.len().div_ceil(decim),
+                "{std_name} /{decim} {what}: wrong number of samples out"
+            );
+
+            let demod = fm_demod(&baseband);
+            let mut rec = FrameReconstructor::new(work_rate, is_pal, deviation, false);
+            let mut frame = vec![0u32; 720 * height];
+            assert!(
+                rec.reconstruct_frame_into(&demod, &mut frame).is_some(),
+                "{std_name} /{decim} ({:.2} MSPS) {what}: reconstruction failed",
+                work_rate as f64 / 1e6
+            );
+            let q = rec.latest_sync_quality();
+            assert!(
+                q > 0.9,
+                "{std_name} /{decim} ({:.2} MSPS) {what}: sync quality {q} — the \
+                 reconstructor is being built with the wrong rate, or the \
+                 anti-alias filter is too soft for this stride",
+                work_rate as f64 / 1e6
+            );
+            assert_eq!(rec.width, 720, "{std_name} /{decim} {what}: geometry");
+            assert_eq!(rec.height, height, "{std_name} /{decim} {what}: geometry");
+        }
+    }
 }

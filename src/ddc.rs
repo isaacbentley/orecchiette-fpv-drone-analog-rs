@@ -479,6 +479,64 @@ mod tests {
         }
     }
 
+    /// Decimation phase must survive chunk boundaries.
+    ///
+    /// `decimation_counter` is struct state, so a stream fed in chunks
+    /// has to produce exactly what the same stream fed in one call
+    /// produces. If the counter reset per call, every chunk would
+    /// restart the stride at phase 0 and the output would carry a
+    /// timing discontinuity at each boundary — inaudible in a length
+    /// check but fatal to a decoder downstream, which is exactly how
+    /// the viewer consumes this (65,536-sample packets, one call each).
+    ///
+    /// Chunk sizes here are deliberately NOT multiples of the factor,
+    /// so the phase genuinely carries a non-zero remainder across most
+    /// boundaries.
+    #[test]
+    fn decimation_phase_survives_chunk_boundaries() {
+        let sample_rate = 4_000_000;
+        // A tone off DC, so both the mixer phase and the FIR history
+        // have to line up for the outputs to match. Chunk sizes below
+        // are deliberately not multiples of the factors.
+        let iq: Vec<Complex<f32>> = (0..8_192)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                let ph = 2.0 * PI * 250_000.0 * t;
+                Complex::new(ph.cos(), ph.sin())
+            })
+            .collect();
+
+        // A non-zero LO, so the mixer phasor has to carry across calls
+        // too — with the LO at DC the mixer is the identity and this
+        // would only exercise the FIR history and the stride.
+        let lo = 137_000.0;
+        for factor in [2usize, 3, 4, 5] {
+            let mut whole = StreamingDDC::new(lo, sample_rate, 400_000.0);
+            let mut one_shot = Vec::new();
+            whole.process_into_decimated(&iq, &mut one_shot, factor);
+
+            for chunk in [100usize, 333, 1024, 4096] {
+                let mut streamed_ddc = StreamingDDC::new(lo, sample_rate, 400_000.0);
+                let mut streamed = Vec::new();
+                for part in iq.chunks(chunk) {
+                    streamed_ddc.process_into_decimated(part, &mut streamed, factor);
+                }
+                assert_eq!(
+                    streamed.len(),
+                    one_shot.len(),
+                    "factor {factor}, chunk {chunk}: sample count diverged"
+                );
+                for (i, (a, b)) in one_shot.iter().zip(&streamed).enumerate() {
+                    assert!(
+                        (a - b).norm() < 1e-6,
+                        "factor {factor}, chunk {chunk}: sample {i} diverged, \
+                         {a:?} one-shot vs {b:?} streamed"
+                    );
+                }
+            }
+        }
+    }
+
     /// A `decimation_factor` of 0 is a caller error but must not panic
     /// (it divides the capacity estimate). It is normalised to 1, so the
     /// output length equals the input length.
