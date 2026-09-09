@@ -1,0 +1,549 @@
+//! FM Demodulation Module
+//!
+//! This module handles the conversion of raw complex IQ samples into a baseband
+//! signal (the video stream). For 5.8 GHz analog FPV, the video is frequency
+//! modulated (FM).
+
+use num_complex::Complex;
+
+// ELI5: Imagine the drone is a singer who changes the pitch of their voice
+// to send a message. This module is like an ear that listens to those
+// changes in pitch and writes them down as numbers.
+
+/// Quadrature FM demodulation: instantaneous frequency from
+/// `arg(iq[n] · conj(iq[n-1]))`.
+///
+/// The phase extraction uses the exact scalar `f32::atan2` (via
+/// `Complex::arg`) rather than a polynomial approximation. We tried
+/// `fast_math::atan2` for edge-device throughput, but image quality
+/// wins here: approximate atan2 kernels lose precision near ±π —
+/// exactly the regime a high-deviation FM video signal lives in —
+/// and the resulting quadrant errors surface as click-noise sparkles
+/// in the reconstructed picture. The complex multiply + `conj` ahead
+/// of the atan2 is the bulk of the per-sample work and auto-vectorises
+/// cleanly under `-O3` (both NEON and AVX2), so the exact path costs
+/// little over the approximation while keeping the discriminator
+/// output clean. The downstream temporal-denoise median in `video.rs`
+/// is for channel noise, not for papering over demodulator error.
+pub fn fm_demod(iq_data: &[Complex<f32>]) -> Vec<f32> {
+    let mut output = Vec::new();
+    fm_demod_into(iq_data, &mut output);
+    output
+}
+
+/// Same as [`fm_demod`], but clears and refills a caller-supplied `Vec`
+/// so hot loops (the live decode worker demodulates a ~65 k-sample
+/// chunk hundreds of times per second; the detector demodulates every
+/// probe) can reuse one allocation instead of paying a fresh ~256 KB
+/// `Vec` per call.
+pub fn fm_demod_into(iq_data: &[Complex<f32>], output: &mut Vec<f32>) {
+    output.clear();
+    let n = iq_data.len();
+    if n < 2 {
+        return;
+    }
+    output.reserve(n - 1);
+    for i in 1..n {
+        let prod = iq_data[i] * iq_data[i - 1].conj();
+        output.push(prod.arg());
+    }
+}
+
+/// Deprecated alias for [`fm_demod`]. The `_simd` suffix was
+/// historical and misleading — the function never used explicit
+/// SIMD intrinsics. Kept around so external callers don't break;
+/// new code should call [`fm_demod`] directly.
+#[deprecated(
+    since = "0.1.0",
+    note = "renamed to `fm_demod` — the `_simd` suffix was misleading; see fn docs"
+)]
+pub fn fm_demod_simd(iq_data: &[Complex<f32>]) -> Vec<f32> {
+    fm_demod(iq_data)
+}
+
+/// Default deemphasis time constant: 0.15 µs, cornering at ~1.06 MHz.
+///
+/// Far faster than the 50 or 75 µs of broadcast FM *audio* deemphasis,
+/// because video deemphasis targets the much wider luma bandwidth —
+/// and faster than the 0.75 µs this defaulted to, which was measured
+/// against a live transmitter and found to be taking most of the
+/// picture with it.
+///
+/// [`Deemphasis`] is a single pole, so its attenuation grows without
+/// limit. At 0.75 µs it cornered at 212 kHz and cost 13.6 dB at 1 MHz
+/// and 24.8 dB at 4.2 MHz; NTSC luma runs to about 4.2 MHz and the
+/// detail an eye reads as sharpness sits above 1 MHz, so that is most
+/// of what the picture is made of. Measured on an A1 link, mean
+/// adjacent-pixel step over the active area fell from 38.6 with
+/// deemphasis off to 11.3 at 0.1 µs, 5.6 at 0.2 µs and 1.6 at 0.75 µs.
+///
+/// The mismatch is one of shape rather than of constant. Real video
+/// pre-emphasis is a shelf — a bounded boost that then flattens — and
+/// inverting a shelf with a bare pole over-corrects at the top of the
+/// band however the constant is chosen. 0.15 µs costs 2.7 dB at 1 MHz
+/// and 11.1 dB at 4.2 MHz, which keeps the detail while still rolling
+/// off where the noise deemphasis exists to suppress is worst.
+///
+/// What a shorter constant lets back through is not only detail. The
+/// colour subcarrier (3.58 MHz NTSC, 4.43 MHz PAL) sits about 11 dB
+/// down at 0.15 µs against about 25 dB at 0.75 µs, so the burst-gated
+/// notch in [`crate::video`] carries more of that load here; and the
+/// discriminator's output noise, which rises with frequency, keeps
+/// correspondingly more of its power.
+///
+/// UNRESOLVED: that trade is not measured. The figures above are detail
+/// and computed response, not a detail-versus-noise optimum, so a link
+/// noisy enough to prefer a longer constant should ask for one.
+///
+/// Tune per-VTX via [`Deemphasis::new`]'s `tau_seconds` if a specific
+/// transmitter's pre-emphasis curve is known.
+pub const DEFAULT_DEEMPHASIS_TAU_S: f32 = 0.15e-6;
+
+/// Single-pole IIR deemphasis filter (a digital approximation of the
+/// analog RC low-pass a receiver would use to undo a VTX's pre-
+/// emphasis), applied to [`fm_demod`]'s output.
+///
+/// Deliberately **not** a method on `FrameReconstructor`: the
+/// reconstructor is called repeatedly on the *unconsumed tail* of a
+/// persistent demod buffer (each call re-reads samples the previous
+/// call already saw, advancing by `consumed`), so a stateful filter
+/// living there would re-filter already-filtered samples every call.
+/// The correct place is stream-side — once, right after [`fm_demod`],
+/// before samples ever enter that persistent buffer.
+///
+/// `y[n] = α·x[n] + (1−α)·y[n−1]`, with
+/// `α = 1 − exp(−1 / (sample_rate · τ))` — the impulse-invariant
+/// discretization of a continuous first-order RC low-pass with time
+/// constant `τ`. Unity DC gain by construction (steady state on a
+/// constant input is `y = x`), so sync-tip/blanking levels — and
+/// therefore [`crate::levels::estimate_fm_deviation`]'s swing
+/// measurement and the reconstructor's AGC — are unaffected by
+/// whether this filter is enabled.
+pub struct Deemphasis {
+    alpha: f32,
+    y: f32,
+    primed: bool,
+}
+
+impl Deemphasis {
+    /// `tau_seconds` is the RC time constant; see
+    /// [`DEFAULT_DEEMPHASIS_TAU_S`] for a reasonable default. Panics if
+    /// `sample_rate` is 0 or `tau_seconds` isn't positive and finite —
+    /// both make `alpha` undefined, and a filter silently doing
+    /// nothing (or blowing up) is worse than a loud failure at
+    /// construction, far from the hot path.
+    pub fn new(sample_rate: u32, tau_seconds: f32) -> Self {
+        assert!(sample_rate > 0, "Deemphasis: sample_rate must be > 0");
+        assert!(
+            tau_seconds.is_finite() && tau_seconds > 0.0,
+            "Deemphasis: tau_seconds must be finite and > 0"
+        );
+        let alpha = 1.0 - (-1.0 / (sample_rate as f32 * tau_seconds)).exp();
+        Self {
+            alpha,
+            y: 0.0,
+            primed: false,
+        }
+    }
+
+    /// Filter `data` in place, continuing the running state from any
+    /// previous call (or from [`Self::reset`]/construction).
+    pub fn process_in_place(&mut self, data: &mut [f32]) {
+        for x in data.iter_mut() {
+            if !self.primed {
+                // Seed the state with the first sample rather than 0.0
+                // so a call starting on a non-zero DC level doesn't
+                // spend the first ~few/α samples settling from zero —
+                // audible/visible as a brief fade-in on every rebuild.
+                self.y = *x;
+                self.primed = true;
+            } else {
+                self.y = self.alpha * *x + (1.0 - self.alpha) * self.y;
+            }
+            *x = self.y;
+        }
+    }
+
+    /// Clear the running state (e.g. after a DDC/reconstructor rebuild
+    /// on a target change, so the filter doesn't blend samples across
+    /// an unrelated discontinuity).
+    pub fn reset(&mut self) {
+        self.y = 0.0;
+        self.primed = false;
+    }
+}
+
+/// Streaming PLL FM demodulator — the coherent-tracking alternative to
+/// [`fm_demod`]'s per-sample discriminator, for **threshold extension**
+/// on weak signals.
+///
+/// A discriminator demodulates every sample pair independently, so each
+/// noise-induced origin encirclement of the composite phasor lands in
+/// the output as a full ±2π "click" — the impulsive noise that defines
+/// the FM threshold cliff. A PLL instead tracks the carrier phase
+/// through a second-order (PI) loop; the loop's inertia rides through
+/// noise events whose energy lies outside the closed-loop bandwidth,
+/// which is what buys the classic couple of dB of threshold extension
+/// (satellite receivers used exactly this for weak FM video).
+///
+/// The output convention matches [`fm_demod`] exactly — instantaneous
+/// frequency in radians/sample (`freq + kp·e`, the loop's tracked
+/// frequency plus the proportional correction) — so it is a drop-in
+/// upstream of [`Deemphasis`] and the reconstructor.
+///
+/// ## Tuning and honest limits
+///
+/// `loop_bw_hz` (the loop natural frequency) trades threshold
+/// extension (narrower = more) against modulation-tracking error
+/// (narrower = the phase error `e` grows on fast video edges, and past
+/// ±π the loop cycle-slips — the very artifact we're avoiding). A
+/// discrete PI loop also needs a healthy sample-rate-to-loop-bandwidth
+/// ratio: the constructor clamps the normalised natural frequency to
+/// ≤ 0.5 rad/sample for stability, so at low decode rates the
+/// requested bandwidth may be reduced. Whether the PLL beats the
+/// discriminator for a given `(sample_rate, deviation, CNR)` is an
+/// empirical question — `examples/weak_signal_sweep.rs` measures
+/// exactly that, and the viewer keeps the discriminator as its default
+/// until the numbers say otherwise for your configuration.
+///
+/// [`Self::phase_error_rms`] exposes an EMA of the phase-detector
+/// error as a free lock-quality/CNR telemetry signal.
+pub struct PllFmDemod {
+    /// NCO phasor (cos, sin of current phase), Newton-renormalised.
+    nco: Complex<f32>,
+    /// PI integrator state: tracked frequency, radians/sample.
+    freq: f32,
+    kp: f32,
+    ki: f32,
+    /// Clamp on `|freq|` (radians/sample) — 1.25× the stated peak
+    /// deviation, so noise can't run the integrator away during deep
+    /// fades.
+    freq_max: f32,
+    /// EMA of the squared phase-detector error (lock telemetry).
+    err_sq_ema: f32,
+}
+
+impl PllFmDemod {
+    /// `loop_bw_hz` is the loop natural frequency (see the struct doc
+    /// for the trade); `max_deviation_hz` bounds the frequency
+    /// integrator. Panics on zero/non-finite parameters, matching
+    /// [`Deemphasis::new`]'s rationale.
+    pub fn new(sample_rate: u32, loop_bw_hz: f32, max_deviation_hz: f32) -> Self {
+        assert!(sample_rate > 0, "PllFmDemod: sample_rate must be > 0");
+        assert!(
+            loop_bw_hz.is_finite() && loop_bw_hz > 0.0,
+            "PllFmDemod: loop_bw_hz must be finite and > 0"
+        );
+        assert!(
+            max_deviation_hz.is_finite() && max_deviation_hz > 0.0,
+            "PllFmDemod: max_deviation_hz must be finite and > 0"
+        );
+        let fs = sample_rate as f32;
+        // Normalised natural frequency, clamped for discrete-loop
+        // stability (see struct doc).
+        let wn = (2.0 * std::f32::consts::PI * loop_bw_hz / fs).min(0.5);
+        let zeta = std::f32::consts::FRAC_1_SQRT_2;
+        Self {
+            nco: Complex::new(1.0, 0.0),
+            freq: 0.0,
+            kp: 2.0 * zeta * wn,
+            ki: wn * wn,
+            freq_max: 2.0 * std::f32::consts::PI * max_deviation_hz / fs * 1.25,
+            err_sq_ema: 0.0,
+        }
+    }
+
+    /// Demodulate a chunk, appending instantaneous-frequency samples
+    /// (radians/sample) into `out` after clearing it. Output length
+    /// equals input length (the loop is stateful across calls, so no
+    /// carry sample is needed — chunk boundaries are seamless).
+    pub fn process_into(&mut self, iq: &[Complex<f32>], out: &mut Vec<f32>) {
+        out.clear();
+        out.reserve(iq.len());
+        for &z in iq {
+            // Phase detector: full atan2 (not a small-angle shortcut) so
+            // large transient errors still steer the loop the right way.
+            let e = (z * self.nco.conj()).arg();
+            self.freq = (self.freq + self.ki * e).clamp(-self.freq_max, self.freq_max);
+            let inst = self.freq + self.kp * e;
+            out.push(inst);
+            // Advance the NCO by the instantaneous estimate.
+            let (s, c) = inst.sin_cos();
+            self.nco *= Complex::new(c, s);
+            let mag_sq = self.nco.re * self.nco.re + self.nco.im * self.nco.im;
+            let inv = 0.5 * (3.0 - mag_sq);
+            self.nco.re *= inv;
+            self.nco.im *= inv;
+            // Lock telemetry (~256-sample time constant).
+            self.err_sq_ema += (e * e - self.err_sq_ema) / 256.0;
+        }
+    }
+
+    /// RMS phase-detector error (radians) over the last ~256 samples —
+    /// a free lock-quality / CNR proxy (small when locked and clean,
+    /// approaching the ~1.8 rad RMS of uniform noise when unlocked).
+    pub fn phase_error_rms(&self) -> f32 {
+        self.err_sq_ema.max(0.0).sqrt()
+    }
+
+    /// Clear all loop state (retune / rebuild).
+    pub fn reset(&mut self) {
+        self.nco = Complex::new(1.0, 0.0);
+        self.freq = 0.0;
+        self.err_sq_ema = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    /// Regression guard: the demodulator must produce the same phase differences as a
+    /// straightforward scalar reference, ensuring correctness near ±π.
+    #[test]
+    fn fm_demod_matches_scalar_reference() {
+        // Mix of in-band rotation, near-π wraps, and a quadratic chirp to cover quadrants.
+        let n = 4096;
+        let mut iq = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32;
+            let phase = 0.0123 * t + 0.000_001 * t * t;
+            iq.push(Complex::from_polar(1.0, phase));
+        }
+        let out = fm_demod(&iq);
+        assert_eq!(out.len(), n - 1);
+        for i in 0..(n - 1) {
+            let prod = iq[i + 1] * iq[i].conj();
+            let expected = prod.im.atan2(prod.re);
+            assert!(
+                (out[i] - expected).abs() < 1e-5,
+                "mismatch at i={i}: got {}, expected {}",
+                out[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fm_demod_handles_pi_boundary() {
+        // Two samples whose product points to almost exactly -π (atan2(-ε, -1) → -π+ε),
+        // verifying correctness in the wraparound region.
+        let iq = vec![
+            Complex::from_polar(1.0, 0.0),
+            Complex::from_polar(1.0, PI - 0.001), // step of ≈ +π
+        ];
+        let out = fm_demod(&iq);
+        assert_eq!(out.len(), 1);
+        // Expected: phase wrap close to ±π.
+        assert!((out[0].abs() - (PI - 0.001)).abs() < 1e-4, "got {}", out[0]);
+    }
+
+    #[test]
+    fn fm_demod_short_input() {
+        assert!(fm_demod(&[]).is_empty());
+        assert!(fm_demod(&[Complex::new(1.0, 0.0)]).is_empty());
+    }
+
+    /// The deprecated `fm_demod_simd` alias should still work
+    /// bit-for-bit so external callers aren't silently broken until
+    /// they migrate.
+    #[test]
+    #[allow(deprecated)]
+    fn fm_demod_simd_alias_matches() {
+        let iq: Vec<Complex<f32>> = (0..128)
+            .map(|i| Complex::from_polar(1.0, 0.013 * i as f32))
+            .collect();
+        assert_eq!(fm_demod(&iq), fm_demod_simd(&iq));
+    }
+
+    // ── Deemphasis ──────────────────────────────────────────────────
+
+    #[test]
+    fn deemphasis_has_unity_dc_gain() {
+        let mut d = Deemphasis::new(10_000_000, DEFAULT_DEEMPHASIS_TAU_S);
+        let mut data = vec![0.37f32; 1000];
+        d.process_in_place(&mut data);
+        // Steady state (well past the settling transient) must equal
+        // the input exactly -- this is what keeps sync/blanking levels,
+        // and therefore the deviation estimator's swing measurement,
+        // unaffected by whether deemphasis is enabled.
+        for &v in &data[500..] {
+            assert!(
+                (v - 0.37).abs() < 1e-6,
+                "expected steady state 0.37, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn deemphasis_minus_3db_point_matches_raw_time_constant() {
+        // Sweep a range of tones through the filter and find where the
+        // output amplitude drops to 1/sqrt(2) of a very-low-frequency
+        // reference -- that should land near f_c = 1 / (2*pi*tau).
+        let sample_rate = 20_000_000u32;
+        let tau = 0.75e-6f32;
+        let f_c = 1.0 / (2.0 * PI * tau);
+
+        let measure_gain = |freq: f32| -> f32 {
+            let n = 20_000;
+            let mut d = Deemphasis::new(sample_rate, tau);
+            let mut data: Vec<f32> = (0..n)
+                .map(|i| (2.0 * PI * freq * i as f32 / sample_rate as f32).sin())
+                .collect();
+            d.process_in_place(&mut data);
+            // RMS over the settled tail as an amplitude proxy.
+            let tail = &data[n / 2..];
+            (tail.iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt()
+        };
+
+        let low_freq_gain = measure_gain(1_000.0); // near-DC reference, ~unity
+        let at_fc_gain = measure_gain(f_c);
+        let ratio = at_fc_gain / low_freq_gain;
+        assert!(
+            (ratio - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.05,
+            "gain ratio at f_c={f_c:.0} Hz was {ratio}, expected ~{:.4} (-3 dB)",
+            std::f32::consts::FRAC_1_SQRT_2
+        );
+    }
+
+    #[test]
+    fn deemphasis_streaming_matches_one_shot() {
+        let sample_rate = 15_360_000u32;
+        let signal: Vec<f32> = (0..2000).map(|i| (0.01 * i as f32).sin() * 0.5).collect();
+
+        let mut one_shot = signal.clone();
+        Deemphasis::new(sample_rate, DEFAULT_DEEMPHASIS_TAU_S).process_in_place(&mut one_shot);
+
+        let mut streamed = signal.clone();
+        let mut d = Deemphasis::new(sample_rate, DEFAULT_DEEMPHASIS_TAU_S);
+        let (a, b) = streamed.split_at_mut(700);
+        d.process_in_place(a);
+        d.process_in_place(b);
+
+        for i in 0..signal.len() {
+            assert!(
+                (one_shot[i] - streamed[i]).abs() < 1e-6,
+                "mismatch at i={i}: one_shot={} streamed={}",
+                one_shot[i],
+                streamed[i]
+            );
+        }
+    }
+
+    #[test]
+    fn deemphasis_reset_clears_state_like_a_fresh_instance() {
+        let sample_rate = 15_360_000u32;
+        let mut d = Deemphasis::new(sample_rate, DEFAULT_DEEMPHASIS_TAU_S);
+        let mut warm_up = vec![0.9f32; 200];
+        d.process_in_place(&mut warm_up);
+
+        d.reset();
+        let mut after_reset = vec![0.2f32; 50];
+        d.process_in_place(&mut after_reset);
+
+        let mut fresh = Deemphasis::new(sample_rate, DEFAULT_DEEMPHASIS_TAU_S);
+        let mut fresh_data = vec![0.2f32; 50];
+        fresh.process_in_place(&mut fresh_data);
+
+        assert_eq!(
+            after_reset, fresh_data,
+            "reset should behave like a fresh instance"
+        );
+    }
+
+    // ── PllFmDemod ─────────────────────────────────────────────────
+
+    /// On a clean, modest-deviation FM tone the PLL must agree with the
+    /// discriminator after settling — same output convention, same
+    /// scale.
+    #[test]
+    fn pll_matches_discriminator_on_clean_signal() {
+        let fs = 15_360_000u32;
+        let n = 60_000;
+        // 1 MHz deviation, 100 kHz sinusoidal modulation.
+        let dev = 2.0 * PI * 1.0e6 / fs as f32;
+        let fm = 100_000.0 / fs as f32;
+        let mut phase = 0.0f32;
+        let iq: Vec<Complex<f32>> = (0..n)
+            .map(|i| {
+                let inst = dev * (2.0 * PI * fm * i as f32).sin();
+                phase += inst;
+                Complex::from_polar(1.0, phase)
+            })
+            .collect();
+
+        let disc = fm_demod(&iq);
+        let mut pll = PllFmDemod::new(fs, 2.5e6, 5.0e6);
+        let mut out = Vec::new();
+        pll.process_into(&iq, &mut out);
+
+        // Compare over the settled tail (PLL output[i] estimates the
+        // frequency advancing INTO sample i; disc[i-1] measures the
+        // same transition).
+        let skip = 10_000;
+        let mut err = 0.0f64;
+        let mut sig = 0.0f64;
+        for i in skip..n {
+            let d = (out[i] - disc[i - 1]) as f64;
+            err += d * d;
+            sig += (disc[i - 1] as f64).powi(2);
+        }
+        let rel = (err / sig.max(1e-12)).sqrt();
+        assert!(
+            rel < 0.05,
+            "PLL diverges from discriminator on clean signal: {:.3} relative RMS",
+            rel
+        );
+        assert!(
+            pll.phase_error_rms() < 0.2,
+            "lock telemetry should read near zero on a clean signal, got {}",
+            pll.phase_error_rms()
+        );
+    }
+
+    /// Chunked processing must equal one-shot processing bit-for-bit —
+    /// the loop state carries across chunk boundaries with no seams.
+    #[test]
+    fn pll_streaming_matches_one_shot() {
+        let fs = 15_360_000u32;
+        let iq: Vec<Complex<f32>> = (0..4000)
+            .map(|i| Complex::from_polar(1.0, 0.3 * i as f32 + 0.05 * (i as f32 * 0.01).sin()))
+            .collect();
+        let mut one_shot = Vec::new();
+        PllFmDemod::new(fs, 2.5e6, 5.0e6).process_into(&iq, &mut one_shot);
+
+        let mut streamed = Vec::new();
+        let mut pll = PllFmDemod::new(fs, 2.5e6, 5.0e6);
+        let mut part = Vec::new();
+        for chunk in iq.chunks(700) {
+            pll.process_into(chunk, &mut part);
+            streamed.extend_from_slice(&part);
+        }
+        assert_eq!(one_shot, streamed);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample_rate")]
+    fn pll_rejects_zero_sample_rate() {
+        PllFmDemod::new(0, 2.5e6, 5.0e6);
+    }
+
+    #[test]
+    #[should_panic(expected = "loop_bw_hz")]
+    fn pll_rejects_bad_loop_bw() {
+        PllFmDemod::new(15_360_000, 0.0, 5.0e6);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample_rate")]
+    fn deemphasis_rejects_zero_sample_rate() {
+        Deemphasis::new(0, DEFAULT_DEEMPHASIS_TAU_S);
+    }
+
+    #[test]
+    #[should_panic(expected = "tau_seconds")]
+    fn deemphasis_rejects_non_positive_tau() {
+        Deemphasis::new(15_360_000, 0.0);
+    }
+}

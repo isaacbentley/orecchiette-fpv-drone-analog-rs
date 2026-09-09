@@ -1,0 +1,55 @@
+[package]
+name = "orecchiette-fpv-drone-analog-rs"
+license = "GPL-3.0-or-later"
+version = "0.8.0"
+edition = "2024"
+# Set by `wide`/`safe_arch` in the dependency tree, which need 1.89.
+# Declared so a consumer's MSRV-aware resolution sees the real floor
+# rather than inheriting it silently.
+rust-version = "1.89"
+description = "Analog FPV drone video signal detection via FM demodulation and spectral sync-pulse analysis."
+repository = "https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs"
+readme = "README.md"
+keywords = ["fpv", "drone", "detection", "sdr", "fm"]
+categories = ["science", "algorithms"]
+
+[dependencies]
+rustfft = "6.2"
+num-complex = { version = "0.4", features = ["bytemuck"] }
+serde = { version = "1.0", features = ["derive"] }
+rand = "0.10"
+rayon = "1"
+log = "0.4"
+# Portable SIMD for the DDC's FIR kernel (see `ddc::StreamingDDC`): a
+# float dot-product reduction can't be auto-vectorised (LLVM may not
+# reassociate FP adds), so the lanes are written explicitly.
+wide = "1.5"
+bytemuck = { version = "1.0", features = ["derive"] }
+# Optional GPU compute back-end (`gpu` feature) for the wideband sweep's
+# per-probe DDC. Kept optional so the default published crate stays pure
+# CPU + rayon with no GPU-driver dependency for callers who don't need it.
+wgpu = { version = "30.0", optional = true }
+pollster = { version = "1.0", optional = true }
+
+# Optional neural-restoration back-end (`neural-vsr` feature): ONNX
+# Runtime via `ort`. The CoreML execution provider is Apple-only (no
+# Linux/Windows prebuilt), so it's requested only on macOS; every other
+# target gets `ort`'s default CPU provider. `neural-vsr = ["dep:ort"]`
+# enables whichever of these two the build target selects.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.13", optional = true, features = ["coreml"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ort = { version = "2.0.0-rc.13", optional = true }
+
+[features]
+gpu = ["dep:wgpu", "dep:pollster"]
+neural-vsr = ["dep:ort"]
+
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "dsp"
+harness = false

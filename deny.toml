@@ -1,0 +1,27 @@
+# cargo-deny configuration. CI runs `cargo deny check` (advisories,
+# licenses, bans, sources) — see `.github/workflows/ci.yml`'s `deny` job.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# The crate itself is GPL-3.0-or-later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Zlib",
+]
+
+[sources]
+# No git dependencies in this crate.
+unknown-git = "deny"
