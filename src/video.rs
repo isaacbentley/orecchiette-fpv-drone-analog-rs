@@ -22,6 +22,26 @@ use crate::vbi::{FieldParity, find_vertical_sync};
 use rayon::prelude::*;
 use std::io::Write;
 
+/// Median of `v`, sorting it in place. Empty slices give 0.0.
+///
+/// Insertion sort: `v` is at most [`MAX_TEMPORAL_WINDOW`] long and lives
+/// on the stack in the per-pixel denoise loop, where it beats anything
+/// with a heap or a branchy pivot.
+#[inline]
+fn median_in_place(v: &mut [f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && v[j - 1] > v[j] {
+            v.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    v[v.len() / 2]
+}
+
 /// Default number of fields retained in the temporal history
 /// buffer used by the denoise + dropout-repair stages. Five fields
 /// = ~83 ms at NTSC's 60-field rate; gives √5 ≈ 2.24× noise drop
@@ -1737,26 +1757,36 @@ impl FrameReconstructor {
                 for col in 0..line_width {
                     let cur = y_line[col];
                     let mut samples = [0.0f32; MAX_HISTORY + 1];
+                    let mut diffs = [0.0f32; MAX_HISTORY];
                     let mut n_samples = 1usize;
                     samples[0] = cur;
-                    let mut max_motion = 0.0f32;
                     for row_slice in history_rows.iter().take(history_count).flatten() {
                         let prev = row_slice[col];
                         samples[n_samples] = prev;
+                        diffs[n_samples - 1] = (cur - prev).abs();
                         n_samples += 1;
-                        let d = (cur - prev).abs();
-                        if d > max_motion {
-                            max_motion = d;
-                        }
                     }
                     if n_samples == 1 {
                         // No history yet — pass through unchanged.
                         continue;
                     }
+                    // Motion is the *median* difference from history,
+                    // not the largest.
+                    //
+                    // Taking the max let a single bad field decide: one
+                    // FM click, dropout or noisy field anywhere in the
+                    // window drove the weight to 1.0, the pixel kept its
+                    // current value, and the denoise switched itself off
+                    // exactly on the frames that needed it. The median
+                    // tolerates a minority of corrupt fields, which is
+                    // the case worth surviving — with one history field
+                    // there is no redundancy to exploit and this reduces
+                    // to the difference it always was.
+                    let motion = median_in_place(&mut diffs[..n_samples - 1]);
                     let motion_weight = if force_static {
                         0.0
                     } else {
-                        (max_motion / motion_threshold).clamp(0.0, 1.0)
+                        (motion / motion_threshold).clamp(0.0, 1.0)
                     };
                     // Median via insertion sort on the tiny stack array
                     // (n ≤ MAX_HISTORY + 1): branchless, register-resident.
@@ -2624,5 +2654,50 @@ mod tests {
             assert_eq!(rec.width, 720, "{std_name} /{decim} {what}: geometry");
             assert_eq!(rec.height, height, "{std_name} /{decim} {what}: geometry");
         }
+    }
+
+    /// The defect this replaced: motion was the *largest* difference
+    /// across history, so a single corrupt field — one FM click, one
+    /// dropout — drove the weight to 1.0, the pixel kept its noisy
+    /// current value, and the temporal denoise switched itself off on
+    /// exactly the frames that needed it.
+    #[test]
+    fn one_bad_history_field_no_longer_decides_motion() {
+        // A static pixel: four good fields agree, one is corrupt.
+        let cur = 0.50_f32;
+        let history = [0.50_f32, 0.51, 0.49, 9.00];
+        let mut diffs: Vec<f32> = history.iter().map(|h| (cur - h).abs()).collect();
+
+        let worst = diffs.iter().copied().fold(0.0_f32, f32::max);
+        assert!(worst > 8.0, "the corrupt field dominates the max");
+
+        let motion = median_in_place(&mut diffs);
+        assert!(
+            motion < 0.02,
+            "median motion {motion} should still read this pixel as static"
+        );
+    }
+
+    /// Genuine motion must still register, or the denoise smears
+    /// moving edges.
+    #[test]
+    fn a_moving_pixel_still_reads_as_motion() {
+        let cur = 1.0_f32;
+        let history = [0.0_f32, 0.0, 0.0, 0.0];
+        let mut diffs: Vec<f32> = history.iter().map(|h| (cur - h).abs()).collect();
+        assert!((median_in_place(&mut diffs) - 1.0).abs() < 1e-6);
+    }
+
+    /// With one history field there is no redundancy to exploit, so
+    /// this must reduce to the plain difference it always was.
+    #[test]
+    fn a_single_history_field_reduces_to_the_plain_difference() {
+        let mut diffs = [0.25_f32];
+        assert!((median_in_place(&mut diffs) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn median_of_nothing_is_zero() {
+        assert_eq!(median_in_place(&mut []), 0.0);
     }
 }
