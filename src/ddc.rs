@@ -231,6 +231,27 @@ impl StreamingDDC {
 
     /// Number of FIR taps; used by callers that need to allocate a
     /// matching scratch buffer.
+    /// Clear the filter state after a break in the signal.
+    ///
+    /// The delay line holds the last `num_taps` samples and convolves
+    /// them with whatever arrives next. Across a dropped chunk those
+    /// samples are no longer adjacent to the new ones, so the filter
+    /// would blend two moments that never touched — a transient the
+    /// discriminator turns into a frequency spike, which reads
+    /// downstream as a sync edge that was never transmitted.
+    ///
+    /// The phasor is deliberately *not* reset: it tracks the mixer's
+    /// own phase, which is a function of elapsed samples rather than of
+    /// signal continuity, and restarting it would put a step in the
+    /// down-conversion where there was none.
+    pub fn reset(&mut self) {
+        self.delay_line
+            .iter_mut()
+            .for_each(|s| *s = Complex::new(0.0, 0.0));
+        self.idx = 0;
+        self.decimation_counter = 0;
+    }
+
     pub fn num_taps(&self) -> usize {
         self.taps.len()
     }
@@ -603,6 +624,34 @@ mod tests {
             (mag - 1.0).abs() < 1e-3,
             "phasor magnitude drifted: {}",
             mag,
+        );
+    }
+
+    /// After a gap the delay line holds samples that are no longer
+    /// adjacent to what arrives next; convolving the two blends moments
+    /// that never touched. Reset must leave nothing of the old signal.
+    #[test]
+    fn reset_leaves_no_tail_of_the_previous_signal() {
+        let mut ddc = StreamingDDC::new(0.0, 1_000_000, 200_000.0);
+        let loud: Vec<Complex<f32>> = (0..512).map(|_| Complex::new(10.0, -10.0)).collect();
+        let mut out = Vec::new();
+        ddc.process_into(&loud, &mut out);
+
+        // Silence straight after the burst still rings: that is the
+        // filter's tail, which is correct when the signal is continuous.
+        let mut ringing = Vec::new();
+        ddc.process_into(&vec![Complex::new(0.0, 0.0); 128], &mut ringing);
+        let rung: f32 = ringing.iter().map(|c| c.norm()).sum();
+        assert!(rung > 0.0, "a continuous stream should carry its tail");
+
+        // After a reset it must not.
+        ddc.reset();
+        let mut clean = Vec::new();
+        ddc.process_into(&vec![Complex::new(0.0, 0.0); 128], &mut clean);
+        let leaked: f32 = clean.iter().map(|c| c.norm()).sum();
+        assert!(
+            leaked < 1e-6,
+            "reset still leaked {leaked} of the previous signal"
         );
     }
 }

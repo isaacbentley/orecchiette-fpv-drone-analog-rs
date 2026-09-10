@@ -637,6 +637,34 @@ impl FrameReconstructor {
     /// latency and memory; 8 is a reasonable upper bound for live
     /// surveillance / recon use.
     ///
+    /// Forget everything that assumes the last field and the next one
+    /// are consecutive.
+    ///
+    /// Call this after a break in the signal — a source overrun, or a
+    /// chunk the pipeline dropped. Three pieces of state span fields
+    /// and all three are wrong across a gap:
+    ///
+    /// - the temporal history, whose denoise and dropout repair blend
+    ///   fields on the assumption they are views of the same moving
+    ///   scene;
+    /// - `prev_frame_tbc`, the previous field the time-base corrector
+    ///   compares against;
+    /// - `period_history`, the cross-frame line-period median.
+    ///
+    /// The period median is the mildest of the three — the line period
+    /// is crystal-driven and barely moves — but it is also the cheapest
+    /// to rebuild, and keeping it would mean trusting a measurement
+    /// taken before whatever interrupted the signal.
+    ///
+    /// Sync phase and line period themselves are left alone: they are
+    /// re-derived from the next field's own sync, and zeroing them
+    /// would throw away a good starting estimate for no gain.
+    pub fn forget_history(&mut self) {
+        self.history.clear();
+        self.period_history.clear();
+        self.prev_frame_tbc.fill(0.0);
+    }
+
     /// Builder-style: returns `self` so callers can chain with
     /// `FrameReconstructor::new(...).with_temporal_window(2)`.
     pub fn with_temporal_window(mut self, window: usize) -> Self {

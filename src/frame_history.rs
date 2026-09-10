@@ -127,6 +127,19 @@ impl FrameHistory {
 
     /// Number of fields currently held. Ranges from 0 (just
     /// constructed) up to `capacity()`.
+    /// Drop every retained field.
+    ///
+    /// Temporal denoise and dropout repair both assume the retained
+    /// fields are consecutive views of the same scene. After a gap in
+    /// the signal that no longer holds: the newest field may be from a
+    /// different moment entirely, and blending it in smears whatever
+    /// the receiver missed across the picture that follows. Capacity is
+    /// kept so the buffer refills without reallocating.
+    pub fn clear(&mut self) {
+        self.y_fields.clear();
+        self.meta.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.y_fields.len()
     }
@@ -243,5 +256,28 @@ mod tests {
         assert!(h.current_field().is_none());
         assert!(h.prev_field(0).is_none());
         assert!(h.current_meta().is_none());
+    }
+
+    /// A gap makes the retained fields lies: they are no longer
+    /// consecutive views of the same scene, and blending them smears
+    /// whatever the receiver missed across the picture that follows.
+    #[test]
+    fn clear_drops_every_retained_field_but_keeps_capacity() {
+        let mut h = FrameHistory::new(4, 3);
+        for _ in 0..3 {
+            h.push(vec![1.0, 2.0, 3.0], FieldMeta::default());
+        }
+        assert_eq!(h.len(), 3);
+        h.clear();
+        assert!(h.is_empty());
+        assert!(h.current_field().is_none());
+        assert_eq!(
+            h.capacity(),
+            4,
+            "capacity survives so refill does not reallocate"
+        );
+        // and it still works afterwards
+        h.push(vec![4.0, 5.0, 6.0], FieldMeta::default());
+        assert_eq!(h.current_field(), Some(&[4.0, 5.0, 6.0][..]));
     }
 }
