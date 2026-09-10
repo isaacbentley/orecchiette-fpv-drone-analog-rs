@@ -114,6 +114,21 @@ pub struct ProbeEnergy {
     /// capture's own units; `10·log10` gives the dBm-relative figure the
     /// results report.
     pub energy: f32,
+    /// Confidence the sync classifier reached on this probe, whether or
+    /// not it survived `min_confidence`.
+    ///
+    /// This is the *sub-threshold* evidence, and it is the only thing
+    /// that distinguishes "nothing here" from "something here that one
+    /// packet could not confirm". Without it a caller deciding whether
+    /// to spend more samples has to guess from energy alone, and energy
+    /// alone cannot: a weak signal's margin over its own noise floor
+    /// falls at the same rate as its detectability, so any energy
+    /// threshold stops firing exactly when integration would have
+    /// started paying.
+    ///
+    /// 0.0 means the probe was never classified (single-shot mode gates
+    /// on energy first) or classified as [`SignalType::Unknown`].
+    pub confidence: f32,
 }
 
 /// Buffers [`AnalogFpvDetector::localize_carrier`] reuses: a wide-passband
@@ -1485,6 +1500,29 @@ impl AnalogFpvDetector {
                     ),
                     None => self.detect_sync_pulses(iq_data, sample_rate),
                 };
+                // This path used to return without touching
+                // `probes_out`, so at 15.36 MSPS — where `n_steps` is 2
+                // — a caller saw *no probes at all* and could not tell
+                // a quiet channel from an unconfirmed one. The capture
+                // is one baseband slice here, so it reports exactly one
+                // probe, at the tuned centre, carrying whatever the
+                // classifier reached.
+                if let Some(out) = probes_out.as_mut() {
+                    let energy: f32 = iq_data
+                        .iter()
+                        .map(|s| s.re * s.re + s.im * s.im)
+                        .sum::<f32>()
+                        / iq_data.len().max(1) as f32;
+                    out.push(ProbeEnergy {
+                        offset_hz: 0.0,
+                        energy,
+                        confidence: if sig_type == SignalType::Unknown {
+                            0.0
+                        } else {
+                            conf
+                        },
+                    });
+                }
                 if sig_type != SignalType::Unknown {
                     let energy: f32 = iq_data
                         .iter()
@@ -1599,16 +1637,15 @@ impl AnalogFpvDetector {
                 max_energy * 0.5
             };
 
-            if let Some(out) = probes_out.as_mut() {
-                out.extend(probes.iter().map(|(offset_hz, energy, _, _)| ProbeEnergy {
-                    offset_hz: *offset_hz,
-                    energy: *energy,
-                }));
-            }
-
             // Collect all positive detections from the sweep
             let mut sweep_hits: Vec<(f64, f32, SignalType, f32)> = Vec::new(); // (freq_hz, energy, type, conf)
-            for (offset_hz, energy, isolated_iq, isolated_rate) in &probes {
+            // Per-probe confidence, including probes whose class or
+            // confidence keeps them out of `sweep_hits`. Emitted through
+            // `probes_out` below so a caller can see the evidence that
+            // did not make the cut.
+            let mut probe_conf: Vec<f32> = vec![0.0; probes.len()];
+            for (idx, (offset_hz, energy, isolated_iq, isolated_rate)) in probes.iter().enumerate()
+            {
                 // Single-shot mode: the energy gate limits classification
                 // cost to probes that plausibly hold a signal. Integrated
                 // mode classifies (and accumulates) EVERY probe — a
@@ -1627,6 +1664,7 @@ impl AnalogFpvDetector {
                     None => self.detect_sync_pulses(isolated_iq, *isolated_rate),
                 };
                 if sig_type != SignalType::Unknown {
+                    probe_conf[idx] = conf;
                     // Probe centre. Localization to the carrier happens
                     // once per cluster below, on the strongest member —
                     // doing it here ran a full-rate FIR and demod for
@@ -1635,6 +1673,16 @@ impl AnalogFpvDetector {
                     let freq_hz = center_freq as f64 + offset_hz;
                     sweep_hits.push((freq_hz, *energy, sig_type, conf));
                 }
+            }
+
+            if let Some(out) = probes_out.as_mut() {
+                out.extend(probes.iter().zip(&probe_conf).map(
+                    |((offset_hz, energy, _, _), conf)| ProbeEnergy {
+                        offset_hz: *offset_hz,
+                        energy: *energy,
+                        confidence: *conf,
+                    },
+                ));
             }
 
             // Cluster hits: group detections within 25 MHz (FM video BW).
