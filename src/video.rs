@@ -82,6 +82,38 @@ fn median_in_place(v: &mut [f32]) -> f32 {
     }
 }
 
+/// Taps in the anti-alias filter ahead of the TBC's point sampling.
+///
+/// This used to be a boxcar the width of the decimation ratio, skipped
+/// entirely below a 1.5x ratio on the grounds that "nothing folds".
+/// Things fold well below that. Evaluating the real operator — boxcar
+/// then Catmull-Rom cubic at a fractional stride:
+///
+/// ```text
+///                          folds to    boxcar     31-tap FIR
+///   15.36 -> 13.5 MSPS      6.3 MHz     4.95 dB      51.6 dB
+///   25.00 -> 13.5 MSPS      5.5 MHz     6.77 dB      52.3 dB
+/// ```
+///
+/// A boxcar's first null sits at 1/width and its sidelobes never beat
+/// -13 dB, so it was never going to reject much; below 1.5x it was not
+/// applied at all and the cubic alone gave 5 dB.
+///
+/// 31 is where the Blackman design reaches its stopband. It is also the
+/// *best* passband of the counts tried — 0.75 dB and 0.15 dB of loss at
+/// 4.2 MHz luma against 1.6 dB and 2.2 dB at 11 taps — because a
+/// sharper transition leaves the passband flatter. There is no
+/// detail-versus-aliasing trade to make here; fewer taps is worse at
+/// both.
+const RESAMPLE_AA_TAPS: usize = 31;
+
+/// Passband edge of that filter, as a fraction of the *output* rate.
+///
+/// 0.45 leaves a transition band inside the output Nyquist rather than
+/// putting the cutoff on it, which is what buys the stopband above
+/// while keeping 4.2 MHz luma intact.
+const RESAMPLE_AA_CUTOFF_FRAC: f32 = 0.45;
+
 /// Unsharp (CTI) strength on a clean picture.
 ///
 /// Unsharp masking amplifies the second difference, which is what an
@@ -373,6 +405,11 @@ pub struct FrameReconstructor {
     /// sync-threshold measurement, so the ~5 ms window it needs isn't
     /// reallocated 50×/second.
     sync_level_scratch: Vec<f32>,
+    /// Anti-alias taps for the TBC resampler, with the decimation ratio
+    /// they were designed for. Redesigned only when the ratio moves
+    /// meaningfully: it varies by a fraction of a percent per line with
+    /// sync jitter, which does not change where the cutoff belongs.
+    resample_aa: Option<(f32, Vec<f32>)>,
     /// Whether any stage may combine this field with another. False
     /// when the temporal window is 1, which the CLI documents as
     /// disabling temporal processing: no denoise blending, and no
@@ -715,6 +752,7 @@ impl FrameReconstructor {
             field_parity: 0,
             prev_frame_tbc: vec![0.0; field_pixels],
             has_prev: false,
+            resample_aa: None,
             temporal_enabled: DEFAULT_TEMPORAL_WINDOW > 1,
             interlace_reacquiring: false,
             sync_phase: 0.0,
@@ -1520,6 +1558,35 @@ impl FrameReconstructor {
         let mut doc_mask = vec![false; self.line_width];
         let mut dilated_doc = vec![false; self.line_width];
         let mut aa_line: Vec<f32> = Vec::new();
+        // Design the anti-alias filter once per field, from the nominal
+        // decimation ratio. The per-line ratio wobbles by a fraction of
+        // a percent with sync jitter, which does not move where the
+        // cutoff belongs, and designing 31 taps per line would be 240
+        // designs a field for the same answer.
+        let aa_taps: Option<&[f32]> = {
+            let nominal = self.line_period / self.line_width as f32;
+            if nominal > 1.01 {
+                let stale = self
+                    .resample_aa
+                    .as_ref()
+                    .is_none_or(|(r, _)| (r - nominal).abs() > 0.01 * nominal);
+                if stale {
+                    // Cutoff sits below the *output* Nyquist, expressed
+                    // in input-sample cycles: dividing by the ratio maps
+                    // output-rate fractions onto the input grid.
+                    let cutoff = RESAMPLE_AA_CUTOFF_FRAC / nominal;
+                    let taps = crate::ddc::design_fir_taps(
+                        cutoff * 1_000_000.0,
+                        1_000_000,
+                        RESAMPLE_AA_TAPS,
+                    );
+                    self.resample_aa = Some((nominal, taps));
+                }
+                self.resample_aa.as_ref().map(|(_, t)| t.as_slice())
+            } else {
+                None
+            }
+        };
 
         let nominal_swing = 0.4 * radians_per_volt;
 
@@ -1569,26 +1636,27 @@ impl FrameReconstructor {
             // exact regardless of which sample `start_int` rounds to.
             let raw_len_f = end_pos - start_pos;
 
-            // Anti-alias ahead of the TBC's point-sampling. When the
-            // resample is decimating (high capture rates: 61.44 MSPS →
-            // ~3,900 samples/line swept onto 864 outputs), evaluating
+            // Anti-alias ahead of the TBC's point-sampling. Evaluating
             // the cubic at a >1-sample stride folds demod content and
-            // noise above the output Nyquist (~6.75 MHz) back into the
-            // picture. A boxcar the width of the decimation ratio ahead
-            // of the sampling (CIC-1) suppresses the fold; its
-            // (win−1)/2 group delay is compensated in `idx_float` so
-            // the image doesn't shift. At ≤1.5× ratios (low capture
-            // rates) the pass is skipped — nothing folds.
+            // noise above the output Nyquist back into the picture, so
+            // it has to be filtered out first — see
+            // `RESAMPLE_AA_TAPS` for what the boxcar this replaced
+            // actually rejected, which was about 5 dB.
+            //
+            // The filter's (taps−1)/2 group delay is compensated in
+            // `idx_float` so the image doesn't shift.
             let ratio = raw_len_f / self.line_width as f32;
-            let aa_win = if ratio >= 1.5 {
-                ratio.round() as usize
+            let (line_src, aa_shift): (&[f32], f32) = if ratio > 1.01 {
+                let taps = aa_taps.unwrap_or(&[]);
+                if taps.len() > 1 {
+                    crate::levels::fir_into(raw_line, taps, &mut aa_line);
+                    (&aa_line, (taps.len() - 1) as f32 / 2.0)
+                } else {
+                    (raw_line, 0.0)
+                }
             } else {
-                1
-            };
-            let (line_src, aa_shift): (&[f32], f32) = if aa_win >= 2 {
-                crate::levels::moving_average_into(raw_line, aa_win, &mut aa_line);
-                (&aa_line, (aa_win - 1) as f32 / 2.0)
-            } else {
+                // Interpolating, not decimating: nothing above the
+                // output Nyquist to fold.
                 (raw_line, 0.0)
             };
 
@@ -3037,5 +3105,88 @@ mod tests {
                 .with_temporal_window(1)
                 .temporal_enabled
         );
+    }
+
+    /// The anti-alias filter must actually reject what folds.
+    ///
+    /// The boxcar this replaced gave 4.95 dB at a 1.14x ratio (where it
+    /// was skipped entirely) and 6.77 dB at 1.85x. Both let content
+    /// above the output Nyquist into the picture at nearly full
+    /// amplitude. Measured through the same helpers production uses, so
+    /// a change to the tap count or cutoff has to face this.
+    #[test]
+    fn the_resampler_rejects_what_folds_into_the_picture() {
+        use std::f32::consts::PI;
+
+        // (input rate, output rate, a tone above the output Nyquist)
+        for (in_rate, out_rate, tone) in
+            [(15.36e6f32, 13.5e6f32, 7.2e6f32), (25.0e6, 13.5e6, 8.0e6)]
+        {
+            let ratio = in_rate / out_rate;
+            let cutoff = RESAMPLE_AA_CUTOFF_FRAC / ratio;
+            let taps =
+                crate::ddc::design_fir_taps(cutoff * 1_000_000.0, 1_000_000, RESAMPLE_AA_TAPS);
+
+            let n = 4096usize;
+            let f_in = tone / in_rate;
+            let tone_line: Vec<f32> = (0..n).map(|i| (2.0 * PI * f_in * i as f32).sin()).collect();
+            let mut filtered = Vec::new();
+            crate::levels::fir_into(&tone_line, &taps, &mut filtered);
+
+            // Amplitude still present at the tone, after filtering.
+            let skip = n / 8;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in filtered.iter().enumerate().skip(skip).take(n - 2 * skip) {
+                let ph = 2.0 * std::f64::consts::PI * f_in as f64 * i as f64;
+                re += v as f64 * ph.cos();
+                im += v as f64 * ph.sin();
+            }
+            let m = (n - 2 * skip) as f64;
+            let amp = (2.0 * (re * re + im * im).sqrt() / m) as f32;
+            let atten_db = -20.0 * amp.max(1e-9).log10();
+            assert!(
+                atten_db > 40.0,
+                "{:.2} MHz into a {:.2}->{:.2} MSPS resample kept {atten_db:.2} dB \
+                 of rejection; the boxcar managed ~5 dB and 40 is the bar",
+                tone / 1e6,
+                in_rate / 1e6,
+                out_rate / 1e6
+            );
+        }
+    }
+
+    /// ...and must not do it by eating the luma it is there to carry.
+    #[test]
+    fn the_resampler_keeps_luma_in_the_passband() {
+        use std::f32::consts::PI;
+        for (in_rate, out_rate) in [(15.36e6f32, 13.5e6f32), (25.0e6, 13.5e6)] {
+            let ratio = in_rate / out_rate;
+            let cutoff = RESAMPLE_AA_CUTOFF_FRAC / ratio;
+            let taps =
+                crate::ddc::design_fir_taps(cutoff * 1_000_000.0, 1_000_000, RESAMPLE_AA_TAPS);
+
+            let n = 4096usize;
+            let f_in = 4.2e6 / in_rate; // NTSC luma bandwidth
+            let line: Vec<f32> = (0..n).map(|i| (2.0 * PI * f_in * i as f32).sin()).collect();
+            let mut filtered = Vec::new();
+            crate::levels::fir_into(&line, &taps, &mut filtered);
+
+            let skip = n / 8;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in filtered.iter().enumerate().skip(skip).take(n - 2 * skip) {
+                let ph = 2.0 * std::f64::consts::PI * f_in as f64 * i as f64;
+                re += v as f64 * ph.cos();
+                im += v as f64 * ph.sin();
+            }
+            let m = (n - 2 * skip) as f64;
+            let amp = (2.0 * (re * re + im * im).sqrt() / m) as f32;
+            let loss_db = -20.0 * amp.max(1e-9).log10();
+            assert!(
+                loss_db < 1.5,
+                "4.2 MHz luma lost {loss_db:.2} dB at {:.2}->{:.2} MSPS",
+                in_rate / 1e6,
+                out_rate / 1e6
+            );
+        }
     }
 }

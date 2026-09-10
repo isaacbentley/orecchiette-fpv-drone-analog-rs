@@ -79,6 +79,31 @@ pub(crate) fn moving_average(data: &[f32], win: usize) -> Vec<f32> {
 /// [`moving_average`] into a caller-owned buffer, for per-row hot loops
 /// (the reconstructor's anti-alias pass runs once per rendered line).
 #[inline]
+/// Apply a real FIR to `data`, writing `data.len()` samples into `out`.
+///
+/// Causal, so the output carries the filter's `(taps-1)/2` group delay —
+/// callers compensate it when they sample, exactly as they did for the
+/// boxcar this replaced. The first `taps-1` outputs are the filter
+/// filling up and are attenuated; every caller crops further into the
+/// line than that, so they never reach the picture.
+pub(crate) fn fir_into(data: &[f32], taps: &[f32], out: &mut Vec<f32>) {
+    out.clear();
+    if taps.len() <= 1 || data.len() < taps.len() {
+        out.extend_from_slice(data);
+        return;
+    }
+    out.reserve(data.len());
+    for i in 0..data.len() {
+        let mut acc = 0.0f32;
+        // Walk only the taps that have data behind them.
+        let k_max = taps.len().min(i + 1);
+        for k in 0..k_max {
+            acc += taps[k] * data[i - k];
+        }
+        out.push(acc);
+    }
+}
+
 pub(crate) fn moving_average_into(data: &[f32], win: usize, out: &mut Vec<f32>) {
     out.clear();
     if win <= 1 || data.len() < win {
