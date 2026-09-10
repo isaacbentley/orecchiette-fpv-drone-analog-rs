@@ -39,16 +39,24 @@ fn cti_strength(y_clean: &[f32], radians_per_volt: f32, scratch: &mut Vec<f32>) 
         let d2 = y_clean[col - 1] - 2.0 * y_clean[col] + y_clean[col + 1];
         scratch.push((d2 / radians_per_volt).abs());
     }
-    let noise = median_in_place(scratch);
+    // `levels::median` (select_nth_unstable, O(n)) rather than the
+    // insertion sort below: this slice is a third of a line — ~286
+    // values — where quadratic behaviour is real. Measured in
+    // isolation, 60 fields' worth of rows took 103.8 ms by insertion
+    // sort against 5.1 ms by selection, same medians.
+    let noise = crate::levels::median(scratch);
     let excess = (noise - CTI_NOISE_FLOOR).max(0.0);
     CTI_STRENGTH / (1.0 + excess / CTI_NOISE_KNEE)
 }
 
 /// Median of `v`, sorting it in place. Empty slices give 0.0.
 ///
-/// Insertion sort: `v` is at most [`MAX_TEMPORAL_WINDOW`] long and lives
-/// on the stack in the per-pixel denoise loop, where it beats anything
-/// with a heap or a branchy pivot.
+/// Insertion sort, which is only the right choice for *tiny* slices:
+/// `v` here is at most [`MAX_TEMPORAL_WINDOW`] long and lives on the
+/// stack in the per-pixel denoise loop, where it beats anything with a
+/// heap or a branchy pivot. Anything longer than a handful of values
+/// wants [`crate::levels::median`] instead — quadratic cost stops being
+/// theoretical quickly.
 #[inline]
 fn median_in_place(v: &mut [f32]) -> f32 {
     if v.is_empty() {
@@ -61,7 +69,17 @@ fn median_in_place(v: &mut [f32]) -> f32 {
             j -= 1;
         }
     }
-    v[v.len() / 2]
+    // Even counts average the two middle values. Taking `v[len/2]`
+    // alone is the *upper* of the two, which biases every blended pixel
+    // upward — brightest at two samples, where it is the maximum. The
+    // denoise blends toward this value, so the bias lands directly in
+    // the picture.
+    let mid = v.len() / 2;
+    if v.len().is_multiple_of(2) {
+        0.5 * (v[mid - 1] + v[mid])
+    } else {
+        v[mid]
+    }
 }
 
 /// Unsharp (CTI) strength on a clean picture.
@@ -355,6 +373,18 @@ pub struct FrameReconstructor {
     /// sync-threshold measurement, so the ~5 ms window it needs isn't
     /// reallocated 50×/second.
     sync_level_scratch: Vec<f32>,
+    /// Whether any stage may combine this field with another. False
+    /// when the temporal window is 1, which the CLI documents as
+    /// disabling temporal processing: no denoise blending, and no
+    /// dropout substitution from the previous field.
+    temporal_enabled: bool,
+    /// Set by [`Self::forget_history`]: the interlace store was just
+    /// emptied, so the next field has no complementary rows to merge
+    /// with. While true, that field is line-doubled into both parities
+    /// — half the vertical detail for one field, rather than black bars
+    /// or rows from before the gap. Cleared once a field has been
+    /// emitted.
+    interlace_reacquiring: bool,
     /// Which output row parity the next captured field renders into.
     /// Toggles 0 ↔ 1 on every successful `reconstruct_frame_into`
     /// call. NTSC's field-1-vs-field-2 distinction isn't explicitly
@@ -685,6 +715,8 @@ impl FrameReconstructor {
             field_parity: 0,
             prev_frame_tbc: vec![0.0; field_pixels],
             has_prev: false,
+            temporal_enabled: DEFAULT_TEMPORAL_WINDOW > 1,
+            interlace_reacquiring: false,
             sync_phase: 0.0,
             line_period: samples_per_line as f32,
             period_history: Vec::with_capacity(8),
@@ -740,16 +772,38 @@ impl FrameReconstructor {
         self.history.clear();
         self.period_history.clear();
         self.prev_frame_tbc.fill(0.0);
+        // Zeroing `prev_frame_tbc` without clearing this left dropout
+        // compensation enabled against an all-zero reference: it went
+        // on "repairing" dropout pixels by replacing them with black,
+        // which is worse than leaving them alone.
+        self.has_prev = false;
+        // The complementary parity rows of the next output frame come
+        // from here. Across a gap they are from before it, so the first
+        // post-gap image interlaced new rows with pre-gap ones — a white
+        // field then a black field of the other parity left white rows
+        // standing in the black one.
+        self.field_buf.fill(0);
+        // Line-double the next field into both parities instead of
+        // pulling half the rows from a store we just emptied, so
+        // reacquisition costs vertical detail for one field rather than
+        // showing black bars.
+        self.interlace_reacquiring = true;
     }
 
     /// Builder-style: returns `self` so callers can chain with
     /// `FrameReconstructor::new(...).with_temporal_window(2)`.
     pub fn with_temporal_window(mut self, window: usize) -> Self {
         let field_pixels = self.field_lines * self.line_width;
-        // Clamp to [1, MAX_TEMPORAL_WINDOW]: 0 would disable history
-        // entirely (we keep at least the current field), and anything
-        // above the cap allocates fields the denoise loop never reads.
+        // Clamp to [1, MAX_TEMPORAL_WINDOW]: anything above the cap
+        // allocates fields the denoise loop never reads.
         let window = window.clamp(1, MAX_TEMPORAL_WINDOW);
+        // `1` means the current field and nothing else — the CLI that
+        // drives this documents it as "1 disables temporal processing",
+        // and it did not: a window of 1 still retained one field and
+        // still blended the current pixel against it. Both the denoise
+        // and the previous-field dropout substitution are off here, so
+        // the promise covers everything the flag names.
+        self.temporal_enabled = window > 1;
         self.history = FrameHistory::new(window, field_pixels);
         self
     }
@@ -1727,10 +1781,17 @@ impl FrameReconstructor {
         // the weight is forced to 0 so even moving pixels take history.
         const MAX_HISTORY: usize = MAX_TEMPORAL_WINDOW;
         let line_width = self.line_width;
-        let has_prev = self.has_prev;
+        // Both of these are temporal: dropout substitution reads the
+        // previous field, and the denoise reads the history. A window
+        // of 1 turns them off together.
+        let has_prev = self.has_prev && self.temporal_enabled;
         let prev_frame_tbc = &self.prev_frame_tbc;
         let history = &self.history;
-        let hist_len = history.len().min(MAX_HISTORY);
+        let hist_len = if self.temporal_enabled {
+            history.len().min(MAX_HISTORY)
+        } else {
+            0
+        };
         let (nb0, nb1, nb2, na1, na2) = (
             self.notch_b0,
             self.notch_b1,
@@ -1940,11 +2001,22 @@ impl FrameReconstructor {
                     frame[cur_off + col] = 0;
                     frame[comp_off + col] = 0;
                 }
+            } else if self.interlace_reacquiring {
+                // No complementary field to merge with — the store was
+                // emptied by `forget_history`. Line-double this field's
+                // own row rather than pulling from it: half the
+                // vertical detail for one field, against black bars or
+                // rows from before the gap.
+                let cur_off = (row * 2 + cur_parity) * self.width;
+                frame.copy_within(cur_off..cur_off + self.width, comp_off);
             } else {
                 frame[comp_off..comp_off + self.width]
                     .copy_from_slice(&self.field_buf[comp_off..comp_off + self.width]);
             }
         }
+        // One field of line-doubling is enough; the next call has a real
+        // complementary field to merge with.
+        self.interlace_reacquiring = false;
         // Persist this fully-merged frame so the next call has access
         // to *both* parities (current and complementary) when it
         // pulls the complementary parity in.
@@ -2837,6 +2909,133 @@ mod tests {
         assert_eq!(
             cti_strength(&[0.1, 0.2, 0.3], f32::NAN, &mut scratch),
             CTI_STRENGTH
+        );
+    }
+
+    /// The review's reproduction: a white field, `forget_history`, then
+    /// a black field of the complementary parity left white rows
+    /// standing in the black image. The interlace store supplies those
+    /// rows, and across a gap they are from before it.
+    #[test]
+    fn a_gap_reset_leaves_no_rows_from_before_the_gap() {
+        use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_fields};
+        use crate::vbi::FieldParity;
+
+        let sample_rate = 15_360_000u32;
+        let cfg = |ire: f32| SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Flat(ire),
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+
+        let mut r = FrameReconstructor::new(sample_rate, false, 5e6, false);
+        let mut frame = vec![0u32; r.width * r.height];
+
+        // A bright field, then another so both parities are populated.
+        let white = generate_fields(&cfg(100.0), 3);
+        let _ = r.reconstruct_frame_into(&white, &mut frame);
+        let _ = r.reconstruct_frame_into(&white, &mut frame);
+        let bright_rows = frame.iter().filter(|p| (**p & 0xFF) > 128).count();
+        assert!(bright_rows > 0, "expected a bright picture to start from");
+
+        // The stream breaks.
+        r.forget_history();
+
+        // A dark field. Nothing from the bright one may survive.
+        let black = generate_fields(&cfg(0.0), 3);
+        let used = r.reconstruct_frame_into(&black, &mut frame);
+        assert!(used.is_some(), "the dark field should still decode");
+        let survivors = frame.iter().filter(|p| (**p & 0xFF) > 128).count();
+        assert_eq!(
+            survivors, 0,
+            "{survivors} bright pixels survived the reset — rows from before the gap"
+        );
+    }
+
+    /// `forget_history` must also stop dropout compensation, or it
+    /// keeps "repairing" pixels from the buffer it just zeroed, i.e.
+    /// painting them black.
+    #[test]
+    fn a_gap_reset_disables_dropout_repair() {
+        let mut r = FrameReconstructor::new(15_360_000, false, 5e6, false);
+        r.has_prev = true;
+        r.forget_history();
+        assert!(
+            !r.has_prev,
+            "DOC would replace dropout pixels from an all-zero reference"
+        );
+    }
+
+    /// The review's reproduction: with `--temporal-window 1` the CLI
+    /// promises no temporal processing, but one field was retained and
+    /// blended, and the two-sample median took the *upper* value — so a
+    /// 50 -> 45 IRE step read 121 with history against 115 without.
+    #[test]
+    fn a_window_of_one_does_no_temporal_processing() {
+        use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_fields};
+        use crate::vbi::FieldParity;
+
+        let sample_rate = 15_360_000u32;
+        let cfg = |ire: f32| SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Flat(ire),
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let before = generate_fields(&cfg(50.0), 3);
+        let after = generate_fields(&cfg(45.0), 3);
+
+        let sample = |window: usize| -> u32 {
+            let mut r = FrameReconstructor::new(sample_rate, false, 5e6, false)
+                .with_temporal_window(window);
+            let mut f = vec![0u32; r.width * r.height];
+            let _ = r.reconstruct_frame_into(&before, &mut f);
+            let _ = r.reconstruct_frame_into(&after, &mut f);
+            f[100 * r.width + 360] & 0xFF
+        };
+
+        // With no history retained, the second field must render on its
+        // own — no pull toward the brighter first field.
+        let w1 = sample(1);
+        let mut r = FrameReconstructor::new(sample_rate, false, 5e6, false);
+        let mut f = vec![0u32; r.width * r.height];
+        let _ = r.reconstruct_frame_into(&after, &mut f);
+        let alone = f[100 * r.width + 360] & 0xFF;
+        assert_eq!(
+            w1, alone,
+            "window 1 gave {w1} but the field alone is {alone} — history still applied"
+        );
+    }
+
+    /// An even number of samples must take the mean of the two middle
+    /// values, not the upper one. The upper is the maximum at two
+    /// samples, which biases every blended pixel bright.
+    #[test]
+    fn an_even_sample_count_medians_without_bias() {
+        assert!((median_in_place(&mut [10.0, 20.0]) - 15.0).abs() < 1e-6);
+        assert!((median_in_place(&mut [1.0, 2.0, 3.0, 100.0]) - 2.5).abs() < 1e-6);
+        // Odd counts unchanged.
+        assert!((median_in_place(&mut [1.0, 2.0, 100.0]) - 2.0).abs() < 1e-6);
+    }
+
+    /// The default window must still do temporal processing — this is a
+    /// fix to `1`, not a global disable.
+    #[test]
+    fn the_default_window_still_denoises() {
+        let r = FrameReconstructor::new(15_360_000, false, 5e6, false)
+            .with_temporal_window(DEFAULT_TEMPORAL_WINDOW);
+        assert!(r.temporal_enabled);
+        assert!(
+            !FrameReconstructor::new(15_360_000, false, 5e6, false)
+                .with_temporal_window(1)
+                .temporal_enabled
         );
     }
 }
