@@ -1231,9 +1231,34 @@ impl SpectralIntegrator {
     }
 }
 
-/// Frequency window within which two detections are treated as the same
-/// signal. Roughly one FM-video channel width.
-const DEDUP_BW_HZ: f64 = 25e6;
+/// Radius within which two localized carriers are treated as the same
+/// transmitter.
+///
+/// This is a *measurement uncertainty*, not a channel width. It used to
+/// be 25 MHz — "roughly one FM-video channel width" — applied as a
+/// radius, so the effective window was 50 MHz, twice the clustering
+/// radius next to it. Two transmitters one 5.8 GHz channel apart
+/// (19-20 MHz on every real band plan) were merged, and each was
+/// individually detectable at 0.95: a scanner told to find adjacent
+/// VTXs reported one.
+///
+/// Occupied bandwidth is the wrong criterion. Two FM video signals one
+/// channel apart do overlap — that is why the old comment argued this
+/// could not be narrowed — but the thing being compared here is not
+/// their occupied spectrum, it is `localize_carrier`'s estimate of
+/// where each carrier *is*, and that resolves them easily: on
+/// synthetic carriers 20 MHz apart it lands within 30 Hz, and on a real
+/// A1 capture within about 40 kHz of the frequency the device itself
+/// reports. Deciding identity with a window six orders of magnitude
+/// wider than the measurement throws the measurement away.
+///
+/// 2 MHz is roughly three times the worst localization error observed
+/// (~0.7 MHz on a real signal, where the estimate carries a bias from
+/// assuming a particular FM deviation). It separates every real channel
+/// spacing of 5 MHz or more, and still merges the 1-2 MHz neighbours
+/// (5865 A1 against 5866 B8) that localization genuinely cannot tell
+/// apart.
+const DEDUP_RADIUS_HZ: f64 = 2e6;
 
 /// Merge detections that fall within [`DEDUP_BW_HZ`] of each other,
 /// keeping the strongest (highest confidence, then highest RSSI) member
@@ -1244,12 +1269,15 @@ const DEDUP_BW_HZ: f64 = 25e6;
 /// Replacing the kept entry also moves the frequency the *next* result
 /// is compared against, which makes evenly-spaced detections chain: the
 /// standard 5.8 GHz band plans space channels ~19–20 MHz apart (band F
-/// is 5740 / 5760 / 5780 / 5800 …), comfortably inside this 25 MHz
-/// window, so three simultaneous VTXs one channel apart collapsed into a
-/// single detection — each merge dragged the comparison point up to the
-/// next channel, and a whole band could fold into one hit. Same defect,
-/// same fix, as the sweep clustering in `detect_from_iq` (see its
-/// `anchor_freq` note).
+/// is 5740 / 5760 / 5780 / 5800 …), and with the old 25 MHz window every
+/// channel sat inside its neighbour's, so a whole band could fold into
+/// one hit — each merge dragged the comparison point up to the next
+/// channel. Same defect, same fix, as the sweep clustering in
+/// `detect_from_iq` (see its `anchor_freq` note).
+///
+/// The anchor still matters at [`DEDUP_RADIUS_HZ`], for hits closer
+/// together than the radius; it is just no longer load-bearing for
+/// whole bands, since adjacent channels are now separate groups.
 ///
 /// Factored out of `detect_from_iq` so the grouping rule is directly
 /// unit-testable, matching [`apply_vbi_confidence_tier`]'s rationale.
@@ -1258,7 +1286,7 @@ fn dedup_by_frequency(results: Vec<DetectionResult>) -> Vec<DetectionResult> {
     let mut anchor_hz = 0.0f64;
     for r in results {
         if let Some(last) = deduped.last_mut()
-            && (r.frequency_hz as f64 - anchor_hz).abs() < DEDUP_BW_HZ
+            && (r.frequency_hz as f64 - anchor_hz).abs() < DEDUP_RADIUS_HZ
         {
             if r.confidence > last.confidence
                 || (r.confidence == last.confidence && r.rssi_dbm > last.rssi_dbm)
@@ -1860,17 +1888,21 @@ mod tests {
     #[test]
     fn dedup_does_not_chain_a_whole_band_into_one_detection() {
         // Band F, four simultaneous VTXs 20 MHz apart: 5740 / 5760 / 5780
-        // / 5800. Each is within the 25 MHz merge window of its immediate
-        // *neighbour*, so comparing against the running strongest member
-        // walked the comparison point up the band and folded all four into
-        // a single detection — an 8-channel band would collapse to one hit.
-        // Anchoring the comparison bounds each group to one 25 MHz window,
-        // so the span is covered by ceil(80/25) = 2 groups, not 1.
+        // / 5800. With the old 25 MHz window each sat inside its
+        // neighbour's, so comparing against the running strongest member
+        // walked the comparison point up the band and folded all four
+        // into one detection; anchoring bounded that to two groups.
         //
-        // This does NOT separate adjacent channels, and cannot: FM video is
-        // ~20 MHz wide, so two VTXs one channel apart genuinely overlap and
-        // the 25 MHz window is sized for that signal bandwidth. Telling
-        // those apart needs bandwidth-aware merging, not a narrower window.
+        // All four are now separate, which is what a scanner asked to
+        // find adjacent VTXs is for. The comment here used to say this
+        // "cannot" be done because FM video is ~20 MHz wide and adjacent
+        // channels genuinely overlap. That confused two different
+        // measurements: the signals' occupied spectrum does overlap, but
+        // what is compared here is `localize_carrier`'s estimate of
+        // where each carrier is, which resolves 20 MHz to within 30 Hz.
+        // A real transmitter still returns exactly one detection — 32
+        // packets across two capture rates and four signal strengths,
+        // never split.
         let out = dedup_by_frequency(vec![
             det(5_740_000_000, 0.8, -50.0),
             det(5_760_000_000, 0.9, -40.0),
@@ -1879,14 +1911,21 @@ mod tests {
         ]);
         assert_eq!(
             out.len(),
-            2,
-            "expected the 80 MHz span to need 2 anchored groups, got {:?}",
+            4,
+            "expected four channels 20 MHz apart to stay four detections, got {:?}",
             out.iter().map(|r| r.frequency_hz).collect::<Vec<_>>()
         );
-        // Each surviving group reports its own strongest member.
-        assert_eq!(out[0].frequency_hz, 5_760_000_000);
-        // 5800 (0.85) loses to 5780 (0.95) inside the second group.
-        assert_eq!(out[1].frequency_hz, 5_780_000_000);
+        // Each channel keeps its own frequency and its own confidence,
+        // rather than the band reporting whichever member happened to
+        // be strongest.
+        assert_eq!(
+            out.iter().map(|r| r.frequency_hz).collect::<Vec<_>>(),
+            vec![5_740_000_000, 5_760_000_000, 5_780_000_000, 5_800_000_000]
+        );
+        assert_eq!(
+            out.iter().map(|r| r.confidence).collect::<Vec<_>>(),
+            vec![0.8, 0.9, 0.95, 0.85]
+        );
     }
 
     #[test]
@@ -1908,20 +1947,27 @@ mod tests {
 
     #[test]
     fn dedup_still_merges_genuine_duplicates_and_keeps_the_strongest() {
-        // Two probes landing on one real signal a few MHz apart: still one
-        // detection, and it must be the higher-confidence one.
+        // One real signal localized twice, the two estimates inside
+        // `DEDUP_RADIUS_HZ` of each other: still one detection, and it
+        // must be the higher-confidence one.
+        //
+        // The separations here used to be 5 and 2 MHz, which is the
+        // probe grid step rather than a localization disagreement —
+        // hits that far apart are two carriers, and clustering has
+        // already merged a single signal's probes long before dedup
+        // sees them.
         let out = dedup_by_frequency(vec![
             det(5_800_000_000, 0.8, -50.0),
-            det(5_805_000_000, 0.95, -30.0),
+            det(5_800_500_000, 0.95, -30.0),
         ]);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].frequency_hz, 5_805_000_000);
+        assert_eq!(out[0].frequency_hz, 5_800_500_000);
         assert_eq!(out[0].confidence, 0.95);
 
         // Equal confidence -> stronger RSSI wins.
         let out = dedup_by_frequency(vec![
             det(5_800_000_000, 0.8, -50.0),
-            det(5_802_000_000, 0.8, -20.0),
+            det(5_801_000_000, 0.8, -20.0),
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rssi_dbm, -20.0);
@@ -3064,5 +3110,57 @@ mod dead_zone_tests {
             chunk[1] = -0.4;
         }
         assert!(classify_pal_ntsc_time_domain(&demod, 20_000).is_none());
+    }
+
+    /// Two transmitters one FPV channel apart must both survive.
+    ///
+    /// The review's reproduction: each detected alone at high
+    /// confidence, but presented together only one came back. Real
+    /// 5.8 GHz band plans put channels 19-20 MHz apart, so merging at
+    /// that separation collapses adjacent VTXs — the exact case a
+    /// scanner exists to tell apart.
+    #[test]
+    fn two_transmitters_one_channel_apart_are_not_merged() {
+        use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_iq};
+        use crate::vbi::FieldParity;
+
+        let rate = 61_440_000u32;
+        let cfg = SyntheticVideoConfig {
+            sample_rate: rate,
+            is_pal: false,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Bars,
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+        let spacing = 20e6f32;
+        let left = generate_iq(&cfg, 3, -spacing / 2.0);
+        let right = generate_iq(&cfg, 3, spacing / 2.0);
+        let both: Vec<_> = left.iter().zip(&right).map(|(a, b)| *a + *b).collect();
+
+        let d = AnalogFpvDetector {
+            min_confidence: 0.55,
+            ..Default::default()
+        };
+
+        let alone_l = d.detect_from_iq(&left, 5_800_000_000, rate);
+        let alone_r = d.detect_from_iq(&right, 5_800_000_000, rate);
+        assert!(
+            !alone_l.is_empty() && !alone_r.is_empty(),
+            "each transmitter must be detectable on its own"
+        );
+
+        let together = d.detect_from_iq(&both, 5_800_000_000, rate);
+        assert!(
+            together.len() >= 2,
+            "{} MHz apart collapsed to {} detection(s): {:?}",
+            spacing / 1e6,
+            together.len(),
+            together
+                .iter()
+                .map(|h| (h.frequency_hz as f64 / 1e6, h.confidence))
+                .collect::<Vec<_>>()
+        );
     }
 }
