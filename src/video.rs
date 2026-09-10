@@ -22,6 +22,28 @@ use crate::vbi::{FieldParity, find_vertical_sync};
 use rayon::prelude::*;
 use std::io::Write;
 
+/// Unsharp strength for one line, given its own noise floor.
+///
+/// `scratch` is reused across lines so this allocates nothing in the
+/// per-row loop. Returns [`CTI_STRENGTH`] on a clean line, falling
+/// toward zero as the median second difference rises above
+/// [`CTI_NOISE_FLOOR`].
+fn cti_strength(y_clean: &[f32], radians_per_volt: f32, scratch: &mut Vec<f32>) -> f32 {
+    if y_clean.len() < 3 || !(radians_per_volt.is_finite() && radians_per_volt > 0.0) {
+        return CTI_STRENGTH;
+    }
+    scratch.clear();
+    // Every third pixel: the median of a third of the line is the same
+    // number to well inside what this decision needs.
+    for col in (1..y_clean.len() - 1).step_by(3) {
+        let d2 = y_clean[col - 1] - 2.0 * y_clean[col] + y_clean[col + 1];
+        scratch.push((d2 / radians_per_volt).abs());
+    }
+    let noise = median_in_place(scratch);
+    let excess = (noise - CTI_NOISE_FLOOR).max(0.0);
+    CTI_STRENGTH / (1.0 + excess / CTI_NOISE_KNEE)
+}
+
 /// Median of `v`, sorting it in place. Empty slices give 0.0.
 ///
 /// Insertion sort: `v` is at most [`MAX_TEMPORAL_WINDOW`] long and lives
@@ -41,6 +63,41 @@ fn median_in_place(v: &mut [f32]) -> f32 {
     }
     v[v.len() / 2]
 }
+
+/// Unsharp (CTI) strength on a clean picture.
+///
+/// Unsharp masking amplifies the second difference, which is what an
+/// edge looks like — and also what noise looks like. On a clean signal
+/// that is transient improvement; on a noisy one it is a noise
+/// amplifier applied at full strength, which is what this used to be.
+const CTI_STRENGTH: f32 = 0.2;
+
+/// Luma second-difference level treated as "clean", in normalised luma
+/// (0-1) per pixel.
+///
+/// Measured through this decode path on the real A1 capture (15.36
+/// MSPS, 0.15 us deemphasis, 2880 lines each way), against the same
+/// capture with fixed-seed noise 6 dB below its input power:
+///
+/// ```text
+///                    median   p90
+///   as captured      0.0349   0.0522
+///   + noise (6 dB)   0.1380   0.1525
+/// ```
+///
+/// Four times apart, and the clean p90 sits below the noisy median with
+/// nothing in between. The floor is placed just above that clean p90,
+/// so an undegraded picture keeps full sharpening on essentially every
+/// line and only real degradation moves it.
+const CTI_NOISE_FLOOR: f32 = 0.055;
+
+/// Second-difference noise above the floor that halves the sharpening.
+///
+/// 0.042 puts the 6 dB-degraded capture at about a third of full
+/// strength (its 0.1380 median is 0.083 above the floor, or ~2 knees),
+/// which is the point of the exercise: the noisy picture stops being
+/// sharpened as hard as a clean one.
+const CTI_NOISE_KNEE: f32 = 0.042;
 
 /// Default number of fields retained in the temporal history
 /// buffer used by the denoise + dropout-repair stages. Five fields
@@ -1813,15 +1870,26 @@ impl FrameReconstructor {
         let h_blank_end = (self.line_width as f32 * ACTIVE_VIDEO_LEFT_CROP_FRAC) as usize;
         // Hoisted CTI scratch (see the TBC scratch note above).
         let mut y_cti = vec![0.0f32; self.line_width];
+        // Reused by `cti_strength` so the per-row loop allocates nothing.
+        let mut cti_d2_scratch: Vec<f32> = Vec::with_capacity(self.line_width / 3 + 1);
         for row in 0..rows_to_process {
             let offset = row * self.line_width;
             let y_clean = &current_frame_y[offset..offset + self.line_width];
 
-            // 4. CTI (unsharp mask on luma).
+            // 4. CTI (unsharp mask on luma), weakened as noise rises.
+            //
+            // The second difference this sharpens on is an edge *and*
+            // it is noise, and the two are indistinguishable per pixel.
+            // What separates them is how common they are: edges are
+            // sparse along a line, so they barely move the median,
+            // while noise lifts it everywhere. The median |d2y| is
+            // therefore a noise floor estimate that ignores picture
+            // content, and sharpening scales down against it.
             y_cti.copy_from_slice(y_clean);
+            let strength = cti_strength(y_clean, radians_per_volt, &mut cti_d2_scratch);
             for col in 1..self.line_width - 1 {
                 let diff2 = y_clean[col - 1] - 2.0 * y_clean[col] + y_clean[col + 1];
-                y_cti[col] -= 0.2 * diff2;
+                y_cti[col] -= strength * diff2;
             }
 
             // 5. Y→RGB (monochrome), cropped to active video, into this
@@ -2699,5 +2767,76 @@ mod tests {
     #[test]
     fn median_of_nothing_is_zero() {
         assert_eq!(median_in_place(&mut []), 0.0);
+    }
+
+    /// A clean line must keep the sharpening it always had — this is a
+    /// noise guard, not a general softening.
+    #[test]
+    fn a_clean_line_keeps_full_sharpening() {
+        // A ramp: smooth, so its second difference is ~0.
+        let rpv = 1.0_f32;
+        let line: Vec<f32> = (0..720).map(|i| i as f32 / 720.0).collect();
+        let mut scratch = Vec::new();
+        let s = cti_strength(&line, rpv, &mut scratch);
+        assert!(
+            (s - CTI_STRENGTH).abs() < 1e-6,
+            "clean line got {s}, expected full {CTI_STRENGTH}"
+        );
+    }
+
+    /// An edge is sparse along a line, so it must not be mistaken for
+    /// noise and cost the whole line its sharpening — that would soften
+    /// exactly the transient the CTI exists to improve.
+    #[test]
+    fn a_single_edge_does_not_look_like_noise() {
+        let rpv = 1.0_f32;
+        let mut line = vec![0.2_f32; 720];
+        line[360..].fill(0.8);
+        let mut scratch = Vec::new();
+        let s = cti_strength(&line, rpv, &mut scratch);
+        assert!(
+            (s - CTI_STRENGTH).abs() < 1e-6,
+            "one edge dropped strength to {s}"
+        );
+    }
+
+    /// The measured noisy case must actually be attenuated, or the
+    /// change does nothing.
+    #[test]
+    fn a_noisy_line_is_sharpened_less() {
+        let rpv = 1.0_f32;
+        // Alternating pixels: |d2y| = 4x the amplitude, so amplitude
+        // 0.0345 gives ~0.138 — the 6 dB-degraded capture's median.
+        let line: Vec<f32> = (0..720)
+            .map(|i| {
+                if i % 2 == 0 {
+                    0.5 + 0.0345
+                } else {
+                    0.5 - 0.0345
+                }
+            })
+            .collect();
+        let mut scratch = Vec::new();
+        let s = cti_strength(&line, rpv, &mut scratch);
+        assert!(
+            s < CTI_STRENGTH * 0.5,
+            "noisy line kept {s} of {CTI_STRENGTH} — should be well under half"
+        );
+        assert!(s > 0.0, "sharpening should weaken, not vanish");
+    }
+
+    /// Degenerate input must not panic or divide by zero.
+    #[test]
+    fn cti_strength_survives_degenerate_input() {
+        let mut scratch = Vec::new();
+        assert_eq!(cti_strength(&[], 1.0, &mut scratch), CTI_STRENGTH);
+        assert_eq!(
+            cti_strength(&[0.1, 0.2, 0.3], 0.0, &mut scratch),
+            CTI_STRENGTH
+        );
+        assert_eq!(
+            cti_strength(&[0.1, 0.2, 0.3], f32::NAN, &mut scratch),
+            CTI_STRENGTH
+        );
     }
 }
