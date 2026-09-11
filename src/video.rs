@@ -1277,14 +1277,35 @@ impl FrameReconstructor {
                     };
 
                     match maybe_measured {
-                        // Sanity: reject a tip that landed too far from
-                        // where the constant period predicts (noise / a
-                        // wrong feature); interpolate it later instead.
-                        Some(measured) if (measured - expected).abs() < self.line_period * 0.25 => {
+                        // There is deliberately no distance check here.
+                        //
+                        // One used to sit here, rejecting a tip further
+                        // than `line_period * 0.25` from where a constant
+                        // period predicts. It could never fire: the
+                        // search is bounded to `sync_window` (2 µs), and
+                        // `robust_sync_tip_center`'s centroid can add at
+                        // most `porch_radius` (3.5 µs) on top — so the
+                        // largest possible deviation is `fs * 5.5e-6`
+                        // against a guard of `0.25 * fs / 15734`, which
+                        // is 2.9x larger *at every sample rate*. Measured
+                        // across 15.36-61.44 MSPS on noisy sync, the
+                        // worst deviation seen was 157 samples against a
+                        // guard of 976.
+                        //
+                        // Making it fire is not an improvement. Sweeping
+                        // an effective threshold against the real A1
+                        // capture with noise 3 dB under the signal: at
+                        // half the search window the picture is unchanged
+                        // to within 0.01 dB PSNR, and at a quarter the
+                        // sync quality falls from 0.74 to 0.61. Outliers
+                        // are already handled downstream, by the MAD
+                        // interval filter and by fitting the grid to the
+                        // *median* intercept over every surviving tip.
+                        Some(measured) => {
                             raw_sync_positions.push(Some(measured));
                             cursor = measured;
                         }
-                        _ => {
+                        None => {
                             raw_sync_positions.push(None);
                             cursor = expected;
                         }
@@ -1493,9 +1514,21 @@ impl FrameReconstructor {
         //
         // Fraction of sync-tip slots in `raw_sync_positions` that
         // survived the MAD outlier filter. 1.0 means every line had
-        // a clean sync; 0.0 means catastrophic dropout. Used as the
-        // primary driver for the temporal denoise / dropout-repair
-        // stage downstream: when this drops below the enter threshold,
+        // a clean sync; 0.0 means catastrophic dropout.
+        //
+        // Read it as sync-detection consistency, not picture quality,
+        // and never use it to compare two *rejection* schemes: it is
+        // the fraction the filter chose not to reject, so it scores a
+        // scheme by its own leniency. Measured on the A1 capture with
+        // noise 3 dB under the signal, an alternative filter that
+        // rejected three times as many tips scored 0.01 *higher* here
+        // while producing a picture identical to within 0.01 dB PSNR.
+        // For that comparison decode a clean reference and measure
+        // against it.
+        //
+        // Used as the primary driver for the temporal denoise /
+        // dropout-repair stage downstream: when this drops below the
+        // enter threshold,
         // we force the per-pixel denoise into "static" mode (full blend
         // toward history), substituting recent good output for the
         // current noisy frame, and stay there until it recovers past the
@@ -3300,6 +3333,76 @@ mod tests {
                     "width {width} offset {offset}"
                 );
             }
+        }
+    }
+
+    /// A distance guard between pass 1's search and the constant-period
+    /// prediction cannot do anything, at any sample rate.
+    ///
+    /// Both bounds scale with `fs`, so the ratio is fixed: the largest
+    /// deviation a search can return is `sync_window + porch_radius`
+    /// (`fs * 5.5e-6`), while `line_period * 0.25` is `0.25 * fs / 15734`
+    /// — 2.9x larger. A guard written in those terms is dead code, which
+    /// is why there is none. This pins the arithmetic so a future one
+    /// does not get added under the impression that it works.
+    #[test]
+    fn a_constant_period_distance_guard_could_never_fire() {
+        let mut seed = 0xC0FFEEu32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) - 0.5
+        };
+        for rate in [15_360_000u32, 25_000_000, 30_720_000, 61_440_000] {
+            let fs = rate as f32;
+            let spl = (fs / 15734.0) as usize;
+            let sync_window = (fs * 2.0e-6) as usize;
+            let porch_radius = (fs * 3.5e-6) as usize;
+            let ma_win = ((fs * 0.5e-6) as usize).max(1);
+            let w = (4.7e-6 * fs).round() as usize;
+            let guard = 0.25 * spl as f32;
+
+            let demod: Vec<f32> = (0..spl * 8)
+                .map(|i| {
+                    let base = if i % spl < w { -0.4f32 } else { 0.5 };
+                    base + 0.30 * rnd()
+                })
+                .collect();
+
+            let mut worst = 0.0f32;
+            for row in 2..6 {
+                for off in [-12.0f32, -4.0, 0.0, 5.0, 13.0] {
+                    let expected = (row * spl) as f32 + off;
+                    let mut scratch = Vec::new();
+                    if let Some(m) =
+                        matched_sync_center(&demod, expected, sync_window, w, -0.1, &mut scratch)
+                    {
+                        worst = worst.max((m - expected).abs());
+                    }
+                    if let Some(m) = robust_sync_tip_center(
+                        &demod,
+                        expected,
+                        sync_window,
+                        porch_radius,
+                        ma_win,
+                        -0.1,
+                    ) {
+                        worst = worst.max((m - expected).abs());
+                    }
+                }
+            }
+            // Structural bound, not just the observed one.
+            let structural = (sync_window + porch_radius) as f32;
+            assert!(
+                worst <= structural,
+                "{rate} Hz: saw {worst} beyond the structural bound {structural}"
+            );
+            assert!(
+                structural < guard,
+                "{rate} Hz: guard {guard} is reachable (bound {structural}) — \
+                 a distance check here would no longer be dead"
+            );
         }
     }
 }
