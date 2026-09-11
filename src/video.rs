@@ -2040,18 +2040,20 @@ impl FrameReconstructor {
                     } else {
                         (motion / motion_threshold).clamp(0.0, 1.0)
                     };
-                    // Median via insertion sort on the tiny stack array
-                    // (n ≤ MAX_HISTORY + 1): branchless, register-resident.
+                    // The blend target, through the shared helper — it
+                    // is the same insertion sort on the same tiny stack
+                    // array, and it averages the two middle values on an
+                    // even count.
+                    //
+                    // Taking `sorted[len / 2]` alone, as this did, is the
+                    // *upper* of the two, so every blended pixel was
+                    // pulled bright. This is the median that reaches the
+                    // picture: the motion estimator's only decides a
+                    // weight, while this one *is* the value blended in.
+                    // A 50 -> 45 IRE step read 121 instead of 118 at
+                    // temporal windows 2 and 5.
                     let mut sorted = samples;
-                    let len = n_samples;
-                    for i in 1..len {
-                        let mut j = i;
-                        while j > 0 && sorted[j - 1] > sorted[j] {
-                            sorted.swap(j - 1, j);
-                            j -= 1;
-                        }
-                    }
-                    let median = sorted[len / 2];
+                    let median = median_in_place(&mut sorted[..n_samples]);
                     y_line[col] = motion_weight * cur + (1.0 - motion_weight) * median;
                 }
             });
@@ -3402,6 +3404,55 @@ mod tests {
                 structural < guard,
                 "{rate} Hz: guard {guard} is reachable (bound {structural}) — \
                  a distance check here would no longer be dead"
+            );
+        }
+    }
+
+    /// The review's reproduction, on reconstructed output rather than
+    /// the helper in isolation: the blend target's median was the upper
+    /// of two middle values, so a step between levels settled bright.
+    ///
+    /// This is the median that reaches the picture. The motion
+    /// estimator's only chooses a weight; fixing that one and not this
+    /// one left the bias exactly where it was visible.
+    #[test]
+    fn a_level_step_does_not_settle_bright() {
+        use crate::synthetic::{SyntheticVideoConfig, TestPattern, generate_fields};
+        use crate::vbi::FieldParity;
+
+        let sample_rate = 15_360_000u32;
+        let cfg = |ire: f32| SyntheticVideoConfig {
+            sample_rate,
+            is_pal: false,
+            deviation_hz: 5e6,
+            pattern: TestPattern::Flat(ire),
+            start_field: FieldParity::First,
+            noise_sigma: 0.0,
+            dc_offset: 0.0,
+        };
+
+        // Decode `from` then `to`, and read an interior pixel.
+        let settle = |from: f32, to: f32, window: usize| -> i32 {
+            let mut r = FrameReconstructor::new(sample_rate, false, 5e6, false)
+                .with_temporal_window(window);
+            let mut f = vec![0u32; r.width * r.height];
+            let _ = r.reconstruct_frame_into(&generate_fields(&cfg(from), 3), &mut f);
+            let _ = r.reconstruct_frame_into(&generate_fields(&cfg(to), 3), &mut f);
+            (f[100 * r.width + 360] & 0xFF) as i32
+        };
+
+        for window in [2usize, 5] {
+            let down = settle(50.0, 45.0, window);
+            let up = settle(45.0, 50.0, window);
+            // The blend sits between the two levels either way. What the
+            // bias did was push *both* transitions upward, so the
+            // descending one settled as high as the ascending one's
+            // neighbourhood. Require the descent to land below the
+            // ascent by a real margin.
+            assert!(
+                down < up,
+                "window {window}: 50->45 settled at {down}, 45->50 at {up} — \
+                 a symmetric blend cannot put the descent at or above the ascent"
             );
         }
     }
