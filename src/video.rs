@@ -713,6 +713,16 @@ fn robust_sync_tip_center(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ReconstructInternalResult {
+    Success {
+        consumed: usize,
+        timing: crate::timing::FieldTiming,
+    },
+    NeedMoreData,
+    NoSync,
+}
+
 impl FrameReconstructor {
     pub fn new(sample_rate: u32, is_pal: bool, fm_deviation: f32, debug_dump: bool) -> Self {
         let line_rate = if is_pal {
@@ -1037,8 +1047,10 @@ impl FrameReconstructor {
         demod_data: &[f32],
         frame: &mut [u32],
     ) -> Option<usize> {
-        self.reconstruct_field_internal(demod_data, frame, 0, false)
-            .map(|(consumed, _timing)| consumed)
+        match self.reconstruct_field_internal(demod_data, frame, 0, false) {
+            ReconstructInternalResult::Success { consumed, .. } => Some(consumed),
+            _ => None,
+        }
     }
 
     /// Reconstruct one field from a timestamped demodulation slice.
@@ -1067,21 +1079,20 @@ impl FrameReconstructor {
             self.forget_history();
         }
 
-        if let Some((consumed, timing)) =
-            self.reconstruct_field_internal(slice.samples, frame, slice.first_sample, true)
-        {
-            self.timing_tracker.last_processed_sample = slice.first_sample + consumed as u64;
-            Ok(crate::timing::DecodeStep::Advance {
-                consumed_samples: consumed,
-                field: Some(timing),
-            })
-        } else {
-            let min_required = self.samples_per_line * (self.field_lines / 2);
-            if slice.samples.len() < min_required {
+        match self.reconstruct_field_internal(slice.samples, frame, slice.first_sample, true) {
+            ReconstructInternalResult::Success { consumed, timing } => {
+                self.timing_tracker.last_processed_sample = slice.first_sample + consumed as u64;
+                Ok(crate::timing::DecodeStep::Advance {
+                    consumed_samples: consumed,
+                    field: Some(timing),
+                })
+            }
+            ReconstructInternalResult::NeedMoreData => {
                 Ok(crate::timing::DecodeStep::NeedMoreData {
                     consumed_samples: 0,
                 })
-            } else {
+            }
+            ReconstructInternalResult::NoSync => {
                 let advance_step = (self.samples_per_line * 8).min(slice.samples.len());
                 self.timing_tracker.last_processed_sample =
                     slice.first_sample + advance_step as u64;
@@ -1099,17 +1110,12 @@ impl FrameReconstructor {
         frame: &mut [u32],
         slice_first_sample: u64,
         is_timed: bool,
-    ) -> Option<(usize, crate::timing::FieldTiming)> {
+    ) -> ReconstructInternalResult {
         if demod_data.is_empty() {
-            return None;
+            return ReconstructInternalResult::NeedMoreData;
         }
-        // `frame` is a caller-supplied buffer; every write below indexes
-        // it assuming exactly `width * height` elements (the field-merge
-        // step even `copy_from_slice`s into `self.field_buf`, which is
-        // fixed at that size), so a mismatched buffer must be rejected
-        // here rather than panicking partway through.
         if frame.len() != self.width * self.height {
-            return None;
+            return ReconstructInternalResult::NoSync;
         }
 
         let fs = self.sample_rate as f32;
@@ -1296,7 +1302,17 @@ impl FrameReconstructor {
                     }
                 }
             }
-            let v_idx = v_sync_idx?;
+            let v_idx = match v_sync_idx {
+                Some(idx) => idx,
+                None => {
+                    let min_search_len = self.samples_per_line * (self.field_lines + 30);
+                    if demod_data.len() < min_search_len {
+                        return ReconstructInternalResult::NeedMoreData;
+                    } else {
+                        return ReconstructInternalResult::NoSync;
+                    }
+                }
+            };
             vbi_offset_sample = v_idx as f64;
             required_samples = v_idx + self.samples_per_line * (20 + self.field_lines + 2);
             if demod_data.len() >= required_samples {
@@ -1336,7 +1352,7 @@ impl FrameReconstructor {
             }
         }
         if demod_data.len() < required_samples {
-            return None;
+            return ReconstructInternalResult::NeedMoreData;
         }
 
         // Snap the anchor onto a real sync tip before pass 1 starts.
@@ -2504,7 +2520,10 @@ impl FrameReconstructor {
             confidence: sync_quality,
             uncertainty_seconds,
         };
-        Some((consumed.min(demod_data.len()), timing))
+        ReconstructInternalResult::Success {
+            consumed: consumed.min(demod_data.len()),
+            timing,
+        }
     }
 
     pub fn save_ppm_frame(&self, frame: &[u32], path: &str) -> std::io::Result<()> {

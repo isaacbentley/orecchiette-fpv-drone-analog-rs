@@ -10,6 +10,7 @@ use orecchiette_fpv_drone_analog_rs::synthetic::{
     ExtendedSyntheticConfig, ImpairmentSchedule, SyntheticVideoConfig, TestPattern,
     generate_extended_fixture,
 };
+use orecchiette_fpv_drone_analog_rs::timing::{DecodeStep, TimedDemodSlice};
 use orecchiette_fpv_drone_analog_rs::vbi::FieldParity;
 use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
 
@@ -108,68 +109,92 @@ fn run_scenario(sc: &Scenario) -> ScenarioResult {
     let mut sync_qualities = Vec::new();
     let mut first_field_sample = None;
     let mut h_errors = Vec::new();
+    let mut is_discontinuous = false;
 
     while consumed_cursor < fixture.demod.len() {
         // Attempt reconstruction on currently available streaming input
         while available_samples.saturating_sub(consumed_cursor) >= min_samples_per_field {
-            let slice = &fixture.demod[consumed_cursor..available_samples];
-            if let Some(consumed) = recon.reconstruct_frame_into(slice, &mut frame) {
-                if first_field_sample.is_none() {
-                    first_field_sample = Some(consumed_cursor);
-                }
-                fields_decoded += 1;
-                sync_qualities.push(recon.latest_sync_quality());
+            let slice_data = &fixture.demod[consumed_cursor..available_samples];
+            let timed_slice = TimedDemodSlice::new(
+                slice_data,
+                consumed_cursor as u64,
+                sc.sample_rate,
+                is_discontinuous,
+            );
+            is_discontinuous = false;
 
-                // Evaluate horizontal timing error across all rendered lines,
-                // matching measurements strictly by ground-truth field and line identity.
-                let sync_positions = recon.latest_sync_positions();
-                if !sync_positions.is_empty() {
-                    let field_active_start = consumed_cursor as f64 + sync_positions[0] as f64;
-                    if let Some(gt_field) = fixture.ground_truth_fields.iter().min_by(|a, b| {
-                        (a.active_video_start_sample as f64 - field_active_start)
-                            .abs()
-                            .partial_cmp(
-                                &(b.active_video_start_sample as f64 - field_active_start).abs(),
-                            )
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    }) {
-                        let field_idx = gt_field.field_index;
-                        let base_active_lines = if sc.is_pal {
-                            orecchiette_fpv_drone_analog_rs::vbi::consts::PAL_BASE_ACTIVE_START_LINES
-                        } else {
-                            orecchiette_fpv_drone_analog_rs::vbi::consts::NTSC_BASE_ACTIVE_START_LINES
-                        };
-                        let active_start_lines = base_active_lines
-                            + if gt_field.parity == FieldParity::Second {
-                                0.5
-                            } else {
-                                0.0
-                            };
+            match recon.reconstruct_timed_into(timed_slice, &mut frame) {
+                Ok(DecodeStep::NeedMoreData { .. }) => break,
+                Ok(DecodeStep::Advance {
+                    consumed_samples,
+                    field,
+                }) => {
+                    let field_consumed_cursor = consumed_cursor;
+                    consumed_cursor += consumed_samples;
 
-                        // Scale factor converting input-sample errors to TBC output-sample units (pixels)
-                        let tbc_scale = recon.line_width as f64 / recon.line_period as f64;
+                    if let Some(_timing) = field {
+                        if first_field_sample.is_none() {
+                            first_field_sample = Some(field_consumed_cursor);
+                        }
+                        fields_decoded += 1;
+                        sync_qualities.push(recon.latest_sync_quality());
 
-                        for (row, &pos) in sync_positions.iter().enumerate() {
-                            let expected_line = active_start_lines + row as f64;
-                            if let Some(pulse) = fixture.ground_truth_pulses.iter().find(|p| {
-                                p.field_index == field_idx
-                                    && p.kind == orecchiette_fpv_drone_analog_rs::vbi::PulseKind::Horizontal
-                                    && (p.line_in_field - expected_line).abs() < 1e-4
-                            }) {
-                                let decoded_sample = consumed_cursor as f64 + pos as f64;
-                                let err_input = (decoded_sample - pulse.center_sample).abs();
-                                let err_tbc = err_input * tbc_scale;
-                                h_errors.push(err_tbc);
+                        // Evaluate horizontal timing error across all rendered lines,
+                        // matching measurements strictly by ground-truth field and line identity.
+                        let sync_positions = recon.latest_sync_positions();
+                        if !sync_positions.is_empty() {
+                            let field_active_start =
+                                field_consumed_cursor as f64 + sync_positions[0] as f64;
+                            if let Some(gt_field) =
+                                fixture.ground_truth_fields.iter().min_by(|a, b| {
+                                    (a.active_video_start_sample as f64 - field_active_start)
+                                        .abs()
+                                        .partial_cmp(
+                                            &(b.active_video_start_sample as f64
+                                                - field_active_start)
+                                                .abs(),
+                                        )
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                            {
+                                let field_idx = gt_field.field_index;
+                                let base_active_lines = if sc.is_pal {
+                                    orecchiette_fpv_drone_analog_rs::vbi::consts::PAL_BASE_ACTIVE_START_LINES
+                                } else {
+                                    orecchiette_fpv_drone_analog_rs::vbi::consts::NTSC_BASE_ACTIVE_START_LINES
+                                };
+                                let active_start_lines = base_active_lines
+                                    + if gt_field.parity == FieldParity::Second {
+                                        0.5
+                                    } else {
+                                        0.0
+                                    };
+
+                                // Scale factor converting input-sample errors to TBC output-sample units (pixels)
+                                let tbc_scale = recon.line_width as f64 / recon.line_period as f64;
+
+                                for (row, &pos) in sync_positions.iter().enumerate() {
+                                    let expected_line = active_start_lines + row as f64;
+                                    if let Some(pulse) = fixture.ground_truth_pulses.iter().find(|p| {
+                                        p.field_index == field_idx
+                                            && p.kind == orecchiette_fpv_drone_analog_rs::vbi::PulseKind::Horizontal
+                                            && (p.line_in_field - expected_line).abs() < 1e-4
+                                    }) {
+                                        let decoded_sample = field_consumed_cursor as f64 + pos as f64;
+                                        let err_input = (decoded_sample - pulse.center_sample).abs();
+                                        let err_tbc = err_input * tbc_scale;
+                                        h_errors.push(err_tbc);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-
-                // Advance consumption exactly as reported by the decoder
-                consumed_cursor += consumed;
-            } else {
-                // When reconstructor returns None, retain input and await further streaming arrivals
-                break;
+                Err(_) => {
+                    let fallback = recon.samples_per_line;
+                    consumed_cursor += fallback;
+                    break;
+                }
             }
         }
 
