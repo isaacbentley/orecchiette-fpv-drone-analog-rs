@@ -301,6 +301,9 @@ pub fn estimate_fm_deviation(demod: &[f32], sample_rate: u32) -> Option<Deviatio
 
     let mut tips: Vec<f32> = Vec::new();
     let mut porches: Vec<f32> = Vec::new();
+    // Pulse windows are short and consumed immediately. Reuse one allocation
+    // for both medians instead of allocating twice for every sync pulse.
+    let mut pulse_scratch = Vec::new();
     let n = smoothed.len();
     let mut i = 0usize;
     while i < n {
@@ -312,13 +315,15 @@ pub fn estimate_fm_deviation(demod: &[f32], sample_rate: u32) -> Option<Deviatio
             let end = i; // exclusive
             let width = end - start;
             if width >= min_width && width <= max_width {
-                let mut interior: Vec<f32> = smoothed[start..end].to_vec();
-                let tip = median(&mut interior);
                 let plo = (end + porch_lo).min(n);
                 let phi = (end + porch_hi).min(n);
                 if phi > plo {
-                    let mut porch_window: Vec<f32> = smoothed[plo..phi].to_vec();
-                    let porch = median(&mut porch_window);
+                    pulse_scratch.clear();
+                    pulse_scratch.extend_from_slice(&smoothed[start..end]);
+                    let tip = median(&mut pulse_scratch);
+                    pulse_scratch.clear();
+                    pulse_scratch.extend_from_slice(&smoothed[plo..phi]);
+                    let porch = median(&mut pulse_scratch);
                     tips.push(tip);
                     porches.push(porch);
                 }
@@ -368,10 +373,9 @@ pub fn estimate_fm_deviation(demod: &[f32], sample_rate: u32) -> Option<Deviatio
         return None;
     }
 
-    let mut tip_sorted = kept_tips.clone();
-    let sync_tip = median(&mut tip_sorted);
-    let mut porch_sorted = kept_porches.clone();
-    let blanking = median(&mut porch_sorted);
+    // Pairwise filtering is complete; neither vector's order is needed now.
+    let sync_tip = median(&mut kept_tips);
+    let blanking = median(&mut kept_porches);
 
     let radians_per_volt = swing / SYNC_TO_BLANK_FRACTION;
     let deviation_hz = radians_per_volt * fs / (2.0 * std::f32::consts::PI);

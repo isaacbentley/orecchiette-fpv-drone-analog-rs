@@ -22,11 +22,12 @@
 //!
 //! ## Phase tracking
 //!
-//! The mixer LO uses phasor recursion: each step is a single complex
+//! For frequency translation, the mixer LO uses phasor recursion: each step is a single complex
 //! multiply by `exp(j·phase_adv)` instead of a `sincos` call.
 //! Magnitude is renormalised every sample with a first-order Newton
 //! step (`0.5·(3 − |φ|²)`) so f32 round-off doesn't drift |phasor|
-//! away from 1.
+//! away from 1. A centered channel with an identity LO skips mixing and
+//! oscillator updates while retaining the full anti-alias filter.
 
 use num_complex::Complex;
 use std::f32::consts::PI;
@@ -107,8 +108,8 @@ pub(crate) fn design_fir_taps(cutoff_hz: f32, sample_rate: u32, num_taps: usize)
 /// float dot-product reduction, and LLVM may not reassociate FP adds,
 /// so the scalar `sum += …` form only ever became a sequential FMA
 /// chain regardless of `target-cpu`. The kernel therefore writes the
-/// lanes itself (see `process_into_decimated`); measured 779 µs → 498 µs
-/// on a 65536-sample block decimating by 2.
+/// lanes itself, with four independent accumulators to overlap multiply-add
+/// latency (see `process_kernel`). This changes summation order, not taps.
 ///
 /// Taps are stored **pre-reversed** (and pair-duplicated for the SIMD
 /// kernel) in `taps_dup`, so the convolution iterates both `delay_line`
@@ -288,12 +289,24 @@ impl StreamingDDC {
     }
 
     /// Same as [`Self::process_decimated`] but appends into a caller-supplied `Vec`.
-    // `chunks_exact(8)` over `as_chunks::<8>()`: the latter is a 1.88+
-    // API and this crate pins no MSRV beyond edition 2024's 1.85, while
-    // the iterator form is what the SIMD lane split below is written
-    // against. Same generated code either way.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn process_into_decimated(
+        &mut self,
+        iq: &[Complex<f32>],
+        output: &mut Vec<Complex<f32>>,
+        decimation_factor: usize,
+    ) {
+        // A centered channel needs the FIR but no frequency translation.
+        // Dispatch once per chunk, so the identity case has neither an
+        // oscillator recurrence nor a branch in its per-sample loop.
+        let identity = Complex::new(1.0, 0.0);
+        if self.step_phasor == identity && self.phasor == identity {
+            self.process_kernel::<false>(iq, output, decimation_factor);
+        } else {
+            self.process_kernel::<true>(iq, output, decimation_factor);
+        }
+    }
+
+    fn process_kernel<const MIX: bool>(
         &mut self,
         iq: &[Complex<f32>],
         output: &mut Vec<Complex<f32>>,
@@ -306,10 +319,14 @@ impl StreamingDDC {
         let num_taps = self.taps.len();
         for &sample in iq {
             // Mix: sample × phasor.
-            let mixed = Complex::new(
-                sample.re * self.phasor.re - sample.im * self.phasor.im,
-                sample.re * self.phasor.im + sample.im * self.phasor.re,
-            );
+            let mixed = if MIX {
+                Complex::new(
+                    sample.re * self.phasor.re - sample.im * self.phasor.im,
+                    sample.re * self.phasor.im + sample.im * self.phasor.re,
+                )
+            } else {
+                sample
+            };
 
             // Dual-write: keep `delay_line[idx]` and
             // `delay_line[idx + num_taps]` in sync so the read
@@ -332,24 +349,35 @@ impl StreamingDDC {
                 // if anything more accurate than one long chain).
                 let win = &self.delay_line[self.idx + 1..self.idx + 1 + num_taps];
                 let flat: &[f32] = bytemuck::cast_slice(win);
-                let mut acc = f32x8::ZERO;
-                let mut fc = flat.chunks_exact(8);
-                let mut hc = self.taps_dup.chunks_exact(8);
-                for (v, t) in (&mut fc).zip(&mut hc) {
-                    let v = f32x8::from(<[f32; 8]>::try_from(v).unwrap());
-                    let t = f32x8::from(<[f32; 8]>::try_from(t).unwrap());
-                    acc = v.mul_add(t, acc);
+                // Independent accumulators let the CPU overlap multiply-adds
+                // instead of waiting on one dependency chain for all taps.
+                let mut acc0 = f32x8::ZERO;
+                let mut acc1 = f32x8::ZERO;
+                let mut acc2 = f32x8::ZERO;
+                let mut acc3 = f32x8::ZERO;
+                let (fv, ftail) = flat.as_chunks::<32>();
+                let (hv, htail) = self.taps_dup.as_chunks::<32>();
+                for (v, t) in fv.iter().zip(hv) {
+                    let (v, _) = v.as_chunks::<8>();
+                    let (t, _) = t.as_chunks::<8>();
+                    acc0 = f32x8::from(v[0]).mul_add(f32x8::from(t[0]), acc0);
+                    acc1 = f32x8::from(v[1]).mul_add(f32x8::from(t[1]), acc1);
+                    acc2 = f32x8::from(v[2]).mul_add(f32x8::from(t[2]), acc2);
+                    acc3 = f32x8::from(v[3]).mul_add(f32x8::from(t[3]), acc3);
                 }
-                let a = acc.to_array();
+                let (fv, ftail) = ftail.as_chunks::<8>();
+                let (hv, htail) = htail.as_chunks::<8>();
+                for (&v, &t) in fv.iter().zip(hv) {
+                    acc0 = f32x8::from(v).mul_add(f32x8::from(t), acc0);
+                }
+                let a = ((acc0 + acc1) + (acc2 + acc3)).to_array();
                 let mut sum_re = a[0] + a[2] + a[4] + a[6];
                 let mut sum_im = a[1] + a[3] + a[5] + a[7];
                 // `flat` is 2·num_taps long, so the tail is an even
                 // number of floats — i.e. whole [re,im] pairs.
-                for (vp, tp) in fc
-                    .remainder()
-                    .chunks_exact(2)
-                    .zip(hc.remainder().chunks_exact(2))
-                {
+                let (fv, _) = ftail.as_chunks::<2>();
+                let (hv, _) = htail.as_chunks::<2>();
+                for (vp, tp) in fv.iter().zip(hv) {
                     sum_re += vp[0] * tp[0];
                     sum_im += vp[1] * tp[1];
                 }
@@ -370,11 +398,13 @@ impl StreamingDDC {
             // Advance LO phasor and renormalise. `0.5·(3 − |φ|²)`
             // is a single-step Newton iteration for `1/sqrt(x)` near
             // x=1 — one MAC, no transcendental.
-            self.phasor *= self.step_phasor;
-            let mag_sq = self.phasor.re * self.phasor.re + self.phasor.im * self.phasor.im;
-            let inv = 0.5 * (3.0 - mag_sq);
-            self.phasor.re *= inv;
-            self.phasor.im *= inv;
+            if MIX {
+                self.phasor *= self.step_phasor;
+                let mag_sq = self.phasor.re * self.phasor.re + self.phasor.im * self.phasor.im;
+                let inv = 0.5 * (3.0 - mag_sq);
+                self.phasor.re *= inv;
+                self.phasor.im *= inv;
+            }
         }
     }
 }
@@ -382,6 +412,62 @@ impl StreamingDDC {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Independent direct convolution with f64 accumulation checks the SIMD
+    /// grouping, short/tail tap counts, mixer state and reset semantics.
+    #[test]
+    fn streaming_kernel_matches_direct_convolution_across_gaps() {
+        let iq: Vec<_> = (0..701)
+            .map(|i| Complex::new((i as f32 * 0.731).sin(), (i as f32 * 0.317).cos()))
+            .collect();
+        for taps in [3, 4, 7, 16, 31, 63, 127, 128] {
+            for offset in [0.0, 0.1, -850_000.0] {
+                for factor in [0usize, 1, 3, 4] {
+                    let mut ddc = StreamingDDC::with_taps(offset, 15_360_000, 3e6, taps);
+                    let mut phase = Complex::new(1.0f32, 0.0);
+                    for segment in [&iq[..173], &iq[173..]] {
+                        ddc.reset();
+                        let mixed: Vec<_> = segment
+                            .iter()
+                            .map(|&sample| {
+                                let result = sample * phase;
+                                phase *= ddc.step_phasor;
+                                let inv = 0.5 * (3.0 - phase.norm_sqr());
+                                phase.re *= inv;
+                                phase.im *= inv;
+                                result
+                            })
+                            .collect();
+                        let expected: Vec<_> = (0..mixed.len())
+                            .step_by(factor.max(1))
+                            .map(|i| {
+                                let mut sum = Complex::new(0.0f64, 0.0);
+                                for k in 0..taps.min(i + 1) {
+                                    sum.re += f64::from(mixed[i - k].re) * f64::from(ddc.taps[k]);
+                                    sum.im += f64::from(mixed[i - k].im) * f64::from(ddc.taps[k]);
+                                }
+                                Complex::new(sum.re as f32, sum.im as f32)
+                            })
+                            .collect();
+                        let sentinel = Complex::new(42.0, -42.0);
+                        let mut actual = vec![sentinel];
+                        for part in segment.chunks(17) {
+                            ddc.process_into_decimated(&[], &mut actual, factor);
+                            ddc.process_into_decimated(part, &mut actual, factor);
+                        }
+                        assert_eq!(actual[0], sentinel, "output must append");
+                        assert_eq!(actual.len() - 1, expected.len());
+                        for (i, (a, b)) in actual[1..].iter().zip(expected).enumerate() {
+                            assert!(
+                                (*a - b).norm() < 2e-6,
+                                "taps={taps} offset={offset} factor={factor} sample={i}: {a:?} != {b:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Pure tone at DC should pass through (LO at 0 Hz, FIR is unity-
     /// gain at DC).

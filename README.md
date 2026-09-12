@@ -217,6 +217,19 @@ mismatched buffers or degenerate configuration.
 and 61.44 MSPS and frame reconstruction at 15.36 MSPS, so real-time
 performance is measured rather than assumed.
 
+The `streaming_ddc` benchmark covers 63/127-tap filters, decimation by
+1/2/4, and centered/offset carriers on 65,536-sample chunks:
+
+```bash
+cargo bench --bench dsp -- streaming_ddc
+```
+
+The CPU kernel uses four independent SIMD accumulators and skips oscillator
+work for an exactly centered channel. Filter coefficients and decimation
+phase are unchanged. Summation order differs, so output is numerically
+equivalent rather than bit-for-bit identical; direct-convolution tests cover
+short filters, SIMD tails, tiny offsets, irregular chunks and stream resets.
+
 `--features gpu` adds a stage-level GPU-against-CPU comparison and two
 end-to-end equivalence tests. All three skip cleanly when no GPU adapter
 is present.

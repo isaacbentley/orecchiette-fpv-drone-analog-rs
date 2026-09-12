@@ -5,7 +5,8 @@
 //! chunk runs in single-digit ms at both rates; a reconstructed field
 //! at 15.36 MSPS lands well under its own 16.7 ms real-time budget.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use orecchiette_fpv_drone_analog_rs::ddc::StreamingDDC;
 use orecchiette_fpv_drone_analog_rs::detector::{
     AnalogFpvDetector, FpvDetector, SpectralIntegrator,
 };
@@ -71,5 +72,41 @@ fn bench_reconstruction(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_detection, bench_reconstruction);
+fn bench_ddc(c: &mut Criterion) {
+    let iq = generate_iq(&cfg(61_440_000), 1, 0.0);
+    let chunk = &iq[..65_536];
+    let mut group = c.benchmark_group("streaming_ddc");
+    group.throughput(Throughput::Elements(chunk.len() as u64));
+    for taps in [63, 127] {
+        for decimation in [1, 2, 4] {
+            for offset in [0.0, 1_000_000.0] {
+                let name = format!("taps{taps}_decim{decimation}_offset{offset:.0}");
+                group.bench_with_input(BenchmarkId::from_parameter(name), &offset, |b, &offset| {
+                    let mut ddc = StreamingDDC::with_taps(offset, 61_440_000, 7e6, taps);
+                    let mut out = Vec::with_capacity(chunk.len());
+                    b.iter(|| {
+                        out.clear();
+                        ddc.process_into_decimated(black_box(chunk), &mut out, decimation);
+                        black_box(&out);
+                    });
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
+fn bench_levels(c: &mut Criterion) {
+    let data = generate_fields(&cfg(15_360_000), 1);
+    c.bench_function("estimate_fm_deviation_15msps", |b| {
+        b.iter(|| {
+            orecchiette_fpv_drone_analog_rs::levels::estimate_fm_deviation(
+                black_box(&data),
+                15_360_000,
+            )
+        });
+    });
+}
+
+criterion_group!(benches, bench_detection, bench_reconstruction, bench_ddc, bench_levels);
 criterion_main!(benches);

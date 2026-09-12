@@ -82,6 +82,74 @@ fn median_in_place(v: &mut [f32]) -> f32 {
     }
 }
 
+/// Denoise one row against the retained fields. A disabled or unprimed
+/// history needs no per-pixel work; during dropout, the forced static
+/// weight also makes the motion-difference calculation unnecessary.
+fn temporal_denoise_line(
+    y_line: &mut [f32],
+    history_rows: &[&[f32]],
+    motion_threshold: f32,
+    force_static: bool,
+) {
+    if history_rows.is_empty() {
+        return;
+    }
+    debug_assert!(history_rows.len() <= MAX_TEMPORAL_WINDOW);
+    let n_samples = history_rows.len() + 1;
+    for col in 0..y_line.len() {
+        let cur = y_line[col];
+        let mut samples = [0.0f32; MAX_TEMPORAL_WINDOW + 1];
+        samples[0] = cur;
+        for (n, row) in history_rows.iter().enumerate() {
+            samples[n + 1] = row[col];
+        }
+        let motion_weight = if force_static {
+            0.0
+        } else {
+            let mut diffs = [0.0f32; MAX_TEMPORAL_WINDOW];
+            for n in 0..history_rows.len() {
+                diffs[n] = (cur - samples[n + 1]).abs();
+            }
+            // Median motion tolerates a minority of corrupt fields;
+            // the maximum let one bad field switch denoising off.
+            let motion = median_in_place(&mut diffs[..history_rows.len()]);
+            (motion / motion_threshold).clamp(0.0, 1.0)
+        };
+        // Keep the blend arithmetic even at weights 0 and 1: replacing
+        // it with one operand would change nonfinite-input behavior.
+        // The median averages both middle values at even counts, so a
+        // brightness step cannot acquire an upward bias.
+        let median = median_in_place(&mut samples[..n_samples]);
+        y_line[col] = motion_weight * cur + (1.0 - motion_weight) * median;
+    }
+}
+
+/// Sharpen and pack only the visible portion of a row. The noise-based
+/// strength is still measured over the complete row by the caller.
+fn pack_luma_line(
+    y_clean: &[f32],
+    output: &mut [u32],
+    left_crop: usize,
+    strength: f32,
+    radians_per_volt: f32,
+) {
+    for (col, pixel) in output.iter_mut().enumerate() {
+        let src_col = left_crop + col;
+        if src_col >= y_clean.len() {
+            break;
+        }
+        let mut y = y_clean[src_col];
+        if src_col > 0 && src_col + 1 < y_clean.len() {
+            let diff2 = y_clean[src_col - 1] - 2.0 * y_clean[src_col] + y_clean[src_col + 1];
+            y -= strength * diff2;
+        }
+        let y_norm = y / radians_per_volt;
+        // Round to nearest instead of biasing every pixel half an LSB dark.
+        let c = (y_norm.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+        *pixel = 0xFF000000 | (c << 16) | (c << 8) | c;
+    }
+}
+
 /// Taps in the anti-alias filter ahead of the TBC's point sampling.
 ///
 /// This used to be a boxcar the width of the decimation ratio, skipped
@@ -2219,7 +2287,7 @@ impl FrameReconstructor {
         //
         // Temporal denoise, per pixel: collect the current value plus
         // the same-pixel value from every stored history field; the
-        // max abs difference is the motion estimate; blend the current
+        // median abs difference is the motion estimate; blend the current
         // value toward the median (kills FM "click" sparkles) by
         // `1 - motion_weight`. Static pixels denoise fully (√N), moving
         // pixels keep the current value. On dropout (`force_static`)
@@ -2309,64 +2377,20 @@ impl FrameReconstructor {
                 }
 
                 // 3. Temporal denoise. Stack scratch, allocation-free.
-                let mut history_rows: [Option<&[f32]>; MAX_HISTORY] = [None; MAX_HISTORY];
+                let mut history_rows: [&[f32]; MAX_HISTORY] = [&[]; MAX_HISTORY];
                 let mut history_count = 0usize;
                 for n in 0..hist_len {
                     if let Some(field) = history.prev_field(n) {
-                        history_rows[history_count] = Some(&field[offset..offset + line_width]);
+                        history_rows[history_count] = &field[offset..offset + line_width];
                         history_count += 1;
                     }
                 }
-                for col in 0..line_width {
-                    let cur = y_line[col];
-                    let mut samples = [0.0f32; MAX_HISTORY + 1];
-                    let mut diffs = [0.0f32; MAX_HISTORY];
-                    let mut n_samples = 1usize;
-                    samples[0] = cur;
-                    for row_slice in history_rows.iter().take(history_count).flatten() {
-                        let prev = row_slice[col];
-                        samples[n_samples] = prev;
-                        diffs[n_samples - 1] = (cur - prev).abs();
-                        n_samples += 1;
-                    }
-                    if n_samples == 1 {
-                        // No history yet — pass through unchanged.
-                        continue;
-                    }
-                    // Motion is the *median* difference from history,
-                    // not the largest.
-                    //
-                    // Taking the max let a single bad field decide: one
-                    // FM click, dropout or noisy field anywhere in the
-                    // window drove the weight to 1.0, the pixel kept its
-                    // current value, and the denoise switched itself off
-                    // exactly on the frames that needed it. The median
-                    // tolerates a minority of corrupt fields, which is
-                    // the case worth surviving — with one history field
-                    // there is no redundancy to exploit and this reduces
-                    // to the difference it always was.
-                    let motion = median_in_place(&mut diffs[..n_samples - 1]);
-                    let motion_weight = if force_static {
-                        0.0
-                    } else {
-                        (motion / motion_threshold).clamp(0.0, 1.0)
-                    };
-                    // The blend target, through the shared helper — it
-                    // is the same insertion sort on the same tiny stack
-                    // array, and it averages the two middle values on an
-                    // even count.
-                    //
-                    // Taking `sorted[len / 2]` alone, as this did, is the
-                    // *upper* of the two, so every blended pixel was
-                    // pulled bright. This is the median that reaches the
-                    // picture: the motion estimator's only decides a
-                    // weight, while this one *is* the value blended in.
-                    // A 50 -> 45 IRE step read 121 instead of 118 at
-                    // temporal windows 2 and 5.
-                    let mut sorted = samples;
-                    let median = median_in_place(&mut sorted[..n_samples]);
-                    y_line[col] = motion_weight * cur + (1.0 - motion_weight) * median;
-                }
+                temporal_denoise_line(
+                    y_line,
+                    &history_rows[..history_count],
+                    motion_threshold,
+                    force_static,
+                );
             });
 
         // ── CTI + Y→RGB pack (SEQUENTIAL) ──────────────────────────
@@ -2376,8 +2400,6 @@ impl FrameReconstructor {
         // dst_row max is `(field_lines - 1) * 2 + 1` (479 NTSC / 575
         // PAL), within `height - 1`, so the row math needs no guard.
         let h_blank_end = (self.line_width as f32 * ACTIVE_VIDEO_LEFT_CROP_FRAC) as usize;
-        // Hoisted CTI scratch (see the TBC scratch note above).
-        let mut y_cti = vec![0.0f32; self.line_width];
         // Reused by `cti_strength` so the per-row loop allocates nothing.
         let mut cti_d2_scratch: Vec<f32> = Vec::with_capacity(self.line_width / 3 + 1);
         for row in 0..rows_to_process {
@@ -2393,28 +2415,20 @@ impl FrameReconstructor {
             // while noise lifts it everywhere. The median |d2y| is
             // therefore a noise floor estimate that ignores picture
             // content, and sharpening scales down against it.
-            y_cti.copy_from_slice(y_clean);
             let strength = cti_strength(y_clean, radians_per_volt, &mut cti_d2_scratch);
-            for col in 1..self.line_width - 1 {
-                let diff2 = y_clean[col - 1] - 2.0 * y_clean[col] + y_clean[col + 1];
-                y_cti[col] -= strength * diff2;
-            }
 
-            // 5. Y→RGB (monochrome), cropped to active video, into this
-            //    field's parity rows of the interlaced output frame.
+            // 5. Sharpen and pack the visible luma directly into this
+            // field's parity row, avoiding a full-row copy and CTI work
+            // on the horizontal blanking that will be cropped away.
             let dst_row = row * 2 + self.field_parity as usize;
             let dst_off = dst_row * self.width;
-            for col in 0..self.width {
-                let src_col = h_blank_end + col;
-                if src_col >= self.line_width {
-                    break;
-                }
-                let y_norm = y_cti[src_col] / radians_per_volt;
-                // `+ 0.5`: round to nearest instead of truncating, which
-                // biased every pixel ~half an LSB dark.
-                let c = (y_norm.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-                frame[dst_off + col] = 0xFF000000 | (c << 16) | (c << 8) | c;
-            }
+            pack_luma_line(
+                y_clean,
+                &mut frame[dst_off..dst_off + self.width],
+                h_blank_end,
+                strength,
+                radians_per_volt,
+            );
         }
 
         // Field merge. The current call rendered the `field_parity`
@@ -2696,6 +2710,113 @@ impl FrameReconstructor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporal_fast_paths_match_the_original_blend() {
+        // This reference retains the original unconditional differences
+        // and motion median, including when dropout discards their result.
+        fn reference(y: &mut [f32], history: &[&[f32]], threshold: f32, force_static: bool) {
+            for (col, value) in y.iter_mut().enumerate() {
+                let cur = *value;
+                let mut samples = vec![cur];
+                let mut diffs = Vec::new();
+                for row in history {
+                    samples.push(row[col]);
+                    diffs.push((cur - row[col]).abs());
+                }
+                if diffs.is_empty() {
+                    continue;
+                }
+                let motion = median_in_place(&mut diffs);
+                let weight = if force_static {
+                    0.0
+                } else {
+                    (motion / threshold).clamp(0.0, 1.0)
+                };
+                let median = median_in_place(&mut samples);
+                *value = weight * cur + (1.0 - weight) * median;
+            }
+        }
+
+        let mut current: Vec<f32> = (0..67).map(|col| col as f32 / 66.0).collect();
+        current[..5].copy_from_slice(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0]);
+        let history: Vec<Vec<f32>> = (0..MAX_TEMPORAL_WINDOW)
+            .map(|n| {
+                (0..current.len())
+                    .map(|col| match col % 7 {
+                        0 => current[col],
+                        1 => current[col] + (n as f32 - 4.0) * 0.002,
+                        2 => current[col] - 0.5,
+                        3 if n == 0 => 9.0,
+                        4 if n == 2 => f32::NAN,
+                        5 if n == 3 => f32::INFINITY,
+                        _ => current[col] - n as f32 * 0.01,
+                    })
+                    .collect()
+            })
+            .collect();
+        for count in 0..=MAX_TEMPORAL_WINDOW {
+            let rows: Vec<&[f32]> = history[..count].iter().map(Vec::as_slice).collect();
+            for force_static in [false, true] {
+                for threshold in [0.1, 0.0, f32::INFINITY, f32::NAN] {
+                    let mut actual = current.clone();
+                    let mut expected = current.clone();
+                    temporal_denoise_line(&mut actual, &rows, threshold, force_static);
+                    reference(&mut expected, &rows, threshold, force_static);
+                    for (col, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                        assert!(
+                            actual.to_bits() == expected.to_bits()
+                                || (actual.is_nan() && expected.is_nan()),
+                            "history={count} static={force_static} threshold={threshold} col={col}: {actual:?} != {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_luma_pack_matches_full_line_sharpening() {
+        for len in [0usize, 1, 2, 3, 17, 858, 864] {
+            let mut input: Vec<f32> = (0..len)
+                .map(|col| ((col * 31) % 97) as f32 / 64.0 - 0.25)
+                .collect();
+            for (value, special) in
+                input
+                    .iter_mut()
+                    .zip([0.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY])
+            {
+                *value = special;
+            }
+            for strength in [0.0, 0.2, f32::NAN] {
+                // The old implementation sharpened and copied the entire
+                // line before cropping. Preserve its endpoint behavior.
+                let mut sharpened = input.clone();
+                for col in 1..len.saturating_sub(1) {
+                    let diff2 = input[col - 1] - 2.0 * input[col] + input[col + 1];
+                    sharpened[col] -= strength * diff2;
+                }
+                for left_crop in [0, len * 16 / 100, len.saturating_sub(1), len] {
+                    for radians_per_volt in [1.3, 0.0, f32::INFINITY, f32::NAN] {
+                        // Oversized output also verifies cropped rows leave
+                        // their unused tail unchanged, as the old loop did.
+                        let mut expected = vec![0x01234567; len + 3];
+                        for (col, pixel) in expected.iter_mut().enumerate() {
+                            let Some(&y) = sharpened.get(left_crop + col) else {
+                                break;
+                            };
+                            let y_norm = y / radians_per_volt;
+                            let c = (y_norm.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                            *pixel = 0xFF000000 | (c << 16) | (c << 8) | c;
+                        }
+                        let mut actual = vec![0x01234567; expected.len()];
+                        pack_luma_line(&input, &mut actual, left_crop, strength, radians_per_volt);
+                        assert_eq!(actual, expected, "len={len} crop={left_crop}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn detect_video_standard_rejects_noise_instead_of_claiming_ntsc() {
