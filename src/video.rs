@@ -511,6 +511,10 @@ pub struct FrameReconstructor {
     /// the threshold doesn't flicker the denoise mode frame to frame.
     in_dropout: bool,
     pub(crate) timing_tracker: crate::timing::TimingTracker,
+    /// Next legal origin, including a pending short read while unlocked.
+    timed_expected_sample: Option<u64>,
+    /// A discontinuity may be repeated when extending a short input slice.
+    pending_discontinuity_origin: Option<u64>,
 }
 
 #[inline]
@@ -720,6 +724,9 @@ enum ReconstructInternalResult {
         timing: crate::timing::FieldTiming,
     },
     NeedMoreData,
+    Skipped {
+        consumed: usize,
+    },
     NoSync,
 }
 
@@ -825,6 +832,8 @@ impl FrameReconstructor {
             field_counter: 0,
             in_dropout: false,
             timing_tracker: crate::timing::TimingTracker::new(sample_rate, is_pal),
+            timed_expected_sample: None,
+            pending_discontinuity_origin: None,
         }
     }
 
@@ -881,8 +890,17 @@ impl FrameReconstructor {
     /// re-derived from the next field's own sync, and zeroing them
     /// would throw away a good starting estimate for no gain.
     pub fn forget_history(&mut self) {
-        self.history.clear();
+        self.clear_picture_history();
         self.period_history.clear();
+        let next_epoch = self.timing_tracker.continuity_epoch.wrapping_add(1);
+        self.timing_tracker.reset_discontinuity(next_epoch);
+        self.timed_expected_sample = None;
+        self.pending_discontinuity_origin = None;
+    }
+
+    /// Drop image references without invalidating an intact sample clock.
+    fn clear_picture_history(&mut self) {
+        self.history.clear();
         self.prev_frame_tbc.fill(0.0);
         // Zeroing `prev_frame_tbc` without clearing this left dropout
         // compensation enabled against an all-zero reference: it went
@@ -900,8 +918,11 @@ impl FrameReconstructor {
         // reacquisition costs vertical detail for one field rather than
         // showing black bars.
         self.interlace_reacquiring = true;
-        let next_epoch = self.timing_tracker.continuity_epoch.wrapping_add(1);
-        self.timing_tracker.reset_discontinuity(next_epoch);
+        self.in_dropout = false;
+        #[cfg(feature = "neural-vsr")]
+        {
+            self.hidden_state = None;
+        }
     }
 
     /// Builder-style: returns `self` so callers can chain with
@@ -1071,17 +1092,42 @@ impl FrameReconstructor {
                 actual: frame.len(),
             });
         }
-
-        let is_discontinuous = slice.is_discontinuous
-            || (self.timing_tracker.is_locked
-                && slice.first_sample != self.timing_tracker.last_processed_sample);
+        if slice.sample_rate == 0 || slice.sample_rate != self.sample_rate {
+            return Err(crate::timing::DecodeValidationError::SampleRateMismatch {
+                expected: self.sample_rate,
+                actual: slice.sample_rate,
+            });
+        }
+        if slice
+            .first_sample
+            .checked_add(slice.samples.len() as u64)
+            .is_none()
+        {
+            return Err(crate::timing::DecodeValidationError::SampleCoordinateOverflow);
+        }
+        if !slice.is_discontinuous
+            && self
+                .timed_expected_sample
+                .is_some_and(|next| slice.first_sample < next)
+        {
+            return Err(crate::timing::DecodeValidationError::DiscontinuousBuffer);
+        }
+        let repeated_gap = self.pending_discontinuity_origin == Some(slice.first_sample);
+        let is_discontinuous = (slice.is_discontinuous && !repeated_gap)
+            || self
+                .timed_expected_sample
+                .is_some_and(|next| slice.first_sample > next);
         if is_discontinuous {
             self.forget_history();
+            self.pending_discontinuity_origin = Some(slice.first_sample);
         }
+        self.timed_expected_sample = Some(slice.first_sample);
 
         match self.reconstruct_field_internal(slice.samples, frame, slice.first_sample, true) {
             ReconstructInternalResult::Success { consumed, timing } => {
                 self.timing_tracker.last_processed_sample = slice.first_sample + consumed as u64;
+                self.timed_expected_sample = Some(self.timing_tracker.last_processed_sample);
+                self.pending_discontinuity_origin = None;
                 Ok(crate::timing::DecodeStep::Advance {
                     consumed_samples: consumed,
                     field: Some(timing),
@@ -1093,11 +1139,31 @@ impl FrameReconstructor {
                 })
             }
             ReconstructInternalResult::NoSync => {
+                if self.timing_tracker.is_locked {
+                    // Lost evidence, not lost samples: keep the continuity epoch
+                    // but search the next slice globally instead of following an
+                    // expired prediction forever.
+                    self.clear_picture_history();
+                    self.period_history.clear();
+                    self.timing_tracker
+                        .reset_discontinuity(self.timing_tracker.continuity_epoch);
+                }
                 let advance_step = (self.samples_per_line * 8).min(slice.samples.len());
                 self.timing_tracker.last_processed_sample =
                     slice.first_sample + advance_step as u64;
+                self.timed_expected_sample = Some(self.timing_tracker.last_processed_sample);
+                self.pending_discontinuity_origin = None;
                 Ok(crate::timing::DecodeStep::Advance {
                     consumed_samples: advance_step,
+                    field: None,
+                })
+            }
+            ReconstructInternalResult::Skipped { consumed } => {
+                self.timing_tracker.last_processed_sample = slice.first_sample + consumed as u64;
+                self.timed_expected_sample = Some(self.timing_tracker.last_processed_sample);
+                self.pending_discontinuity_origin = None;
+                Ok(crate::timing::DecodeStep::Advance {
+                    consumed_samples: consumed,
                     field: None,
                 })
             }
@@ -1214,7 +1280,8 @@ impl FrameReconstructor {
         let mut coasted_pred_rel = 0.0f32;
         let first_sync_center;
         let required_samples;
-        let vbi_offset_sample: f64;
+        let mut vbi_offset_sample: f64;
+        let mut render_parity = self.field_parity;
         if let Some(info) = &vbi_info {
             let parity = if is_timed {
                 info.parity.unwrap_or(self.timing_tracker.field_parity)
@@ -1223,7 +1290,7 @@ impl FrameReconstructor {
                     crate::vbi::FieldParity::from_index(self.field_parity as usize)
                 })
             };
-            self.field_parity = parity.to_index() as u8;
+            render_parity = parity.to_index() as u8;
             first_sync_center = info.field_active_start;
             required_samples = (info.field_active_start.max(0.0) as usize)
                 + self.samples_per_line * (self.field_lines + 1);
@@ -1250,7 +1317,7 @@ impl FrameReconstructor {
             is_coasting_vbi = true;
             coasted_pred_rel = pred_rel;
             let parity = self.timing_tracker.field_parity;
-            self.field_parity = parity.to_index() as u8;
+            render_parity = parity.to_index() as u8;
 
             let map = crate::timing::CalibratedCoordinateMap::new(self.sample_rate, self.pal);
             let active_offset = map.broad_to_active_start_samples(
@@ -1272,6 +1339,11 @@ impl FrameReconstructor {
                 );
             }
         } else {
+            if predicted_vbi_rel.is_some() {
+                // No structural VBI and no remaining holdover budget. Do not
+                // promote the density fallback to a replacement clock anchor.
+                return ReconstructInternalResult::NoSync;
+            }
             // Fall back to the density heuristic + a fixed 20-line
             // blanking skip — real VBI is dirtier than the spec on
             // cheap FPV cameras and deep fades, and this path stays
@@ -1354,6 +1426,14 @@ impl FrameReconstructor {
         if demod_data.len() < required_samples {
             return ReconstructInternalResult::NeedMoreData;
         }
+        if is_timed && !self.timing_tracker.is_locked && self.has_prev {
+            // A density-only preview has no verified field origin. Reacquire
+            // with fresh image references instead of blending its uncertain
+            // geometry into the first field with observed timing evidence.
+            self.clear_picture_history();
+            self.period_history.clear();
+        }
+        self.field_parity = render_parity;
 
         // Snap the anchor onto a real sync tip before pass 1 starts.
         //
@@ -1425,8 +1505,8 @@ impl FrameReconstructor {
             let mut cursor = self.sync_phase;
             for _row in 0..total_rows {
                 if _row == 0 {
-                    // Row 0: use the anchor directly
-                    raw_sync_positions.push(Some(cursor));
+                    // A predicted anchor is not an observed horizontal pulse.
+                    raw_sync_positions.push(snapped);
                 } else {
                     let expected = cursor + self.line_period;
                     if expected.round() as usize + sync_window
@@ -1574,7 +1654,43 @@ impl FrameReconstructor {
             count += 1.0;
         }
 
-        if count > 10.0 {
+        // Require enough measured tips across the field for a stable slope;
+        // a short cluster of noise or VBI pulses cannot establish its clock.
+        let fit_span = kept
+            .first()
+            .zip(kept.last())
+            .map_or(0.0, |(a, b)| b.0 - a.0);
+        let nominal = crate::timing::nominal_line_period_samples(self.sample_rate, self.pal);
+        let qualified_h_grid = count >= 16.0
+            && fit_span >= self.field_lines as f64 * 0.5
+            && ols(&kept)
+                .is_some_and(|(slope, _)| (0.95 * nominal..1.05 * nominal).contains(&slope));
+
+        if is_timed && !qualified_h_grid {
+            self.clear_picture_history();
+            if self.timing_tracker.is_locked
+                && self.timing_tracker.h_sync_coasted_fields
+                    < crate::timing::EXPERIMENTAL_MAX_COASTED_H_SYNC_FIELDS
+                && self.timing_tracker.coasted_fields
+                    < crate::timing::EXPERIMENTAL_MAX_COASTED_VBI_FIELDS
+                && self.timing_tracker.uncertainty_seconds
+                    <= crate::timing::EXPERIMENTAL_MAX_TIMING_UNCERTAINTY_S
+            {
+                // Keep timing for one missing H grid, but do not publish an
+                // unsupported picture or blend it into subsequent good fields.
+                let field_lines = self.timing_tracker.half_lines_per_field() as f32 * 0.5;
+                let advance = predicted_vbi_rel.unwrap_or(vbi_offset_sample as f32)
+                    + (field_lines - 6.0) * self.line_period;
+                self.timing_tracker.h_sync_coasted_fields += 1;
+                self.timing_tracker.advance_predicted_field();
+                return ReconstructInternalResult::Skipped {
+                    consumed: (advance.round() as usize).clamp(1, demod_data.len()),
+                };
+            }
+            return ReconstructInternalResult::NoSync;
+        }
+
+        if qualified_h_grid {
             let denom = count * sum_xx - sum_x * sum_x;
             if denom.abs() > 1e-6 {
                 let ols_slope = (count * sum_xy - sum_x * sum_y) / denom;
@@ -1683,6 +1799,19 @@ impl FrameReconstructor {
             intercepts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             intercepts[intercepts.len() / 2]
         };
+        if is_coasting_vbi && qualified_h_grid {
+            // Use the same measured H clock for both line placement and the
+            // next field prediction. Preserve the phase datum calibrated on
+            // observed VBI; the tip center is displaced by pulse width/filtering.
+            let map = crate::timing::CalibratedCoordinateMap::new(self.sample_rate, self.pal);
+            let active_offset = map.broad_to_active_start_samples(
+                self.line_period as f64,
+                render_parity == FieldParity::Second.to_index() as u8,
+            );
+            vbi_offset_sample =
+                intercept as f64 - active_offset - self.timing_tracker.h_sync_center_offset_samples;
+            coasted_pred_rel = vbi_offset_sample as f32;
+        }
         for (row, sp) in sync_positions.iter_mut().enumerate() {
             *sp = intercept + row as f32 * self.line_period;
         }
@@ -2485,19 +2614,20 @@ impl FrameReconstructor {
             .extend_from_slice(&sync_positions[..n_rows]);
         self.last_rendered_parity = parity;
 
-        let has_observed_timing_evidence = !is_coasting_vbi
-            && self.timing_tracker.h_sync_coasted_fields == 0
-            && sync_quality >= 0.5;
-        let coasted_field_count = if is_coasting_vbi {
-            self.timing_tracker.coasted_fields + 1
-        } else {
-            0
-        };
-        let uncertainty_seconds = self.timing_tracker.uncertainty_seconds;
+        let has_observed_timing_evidence =
+            vbi_info.is_some() && qualified_h_grid && sync_quality >= 0.5;
 
         if is_timed {
+            if qualified_h_grid {
+                self.timing_tracker.h_sync_coasted_fields = 0;
+            }
             if is_coasting_vbi {
-                self.timing_tracker.advance_predicted_field();
+                self.timing_tracker.record_coasted_field(
+                    slice_first_sample,
+                    vbi_offset_sample,
+                    self.line_period as f64,
+                    parity,
+                );
             } else if has_observed_timing_evidence {
                 self.timing_tracker.record_observed_field(
                     slice_first_sample,
@@ -2505,10 +2635,19 @@ impl FrameReconstructor {
                     self.line_period as f64,
                     parity,
                 );
+                let map = crate::timing::CalibratedCoordinateMap::new(self.sample_rate, self.pal);
+                self.timing_tracker.h_sync_center_offset_samples = intercept as f64
+                    - vbi_offset_sample
+                    - map.broad_to_active_start_samples(
+                        self.line_period as f64,
+                        parity == FieldParity::Second,
+                    );
             } else if self.timing_tracker.is_locked {
                 self.timing_tracker.advance_predicted_field();
             }
         }
+        let coasted_field_count = self.timing_tracker.coasted_fields;
+        let uncertainty_seconds = self.timing_tracker.uncertainty_seconds;
 
         let timing = crate::timing::FieldTiming {
             origin_sample: slice_first_sample,

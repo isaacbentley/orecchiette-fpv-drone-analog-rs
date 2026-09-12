@@ -578,16 +578,34 @@ pub fn find_vertical_sync_near(
     window_samples: usize,
     expected_parity: Option<FieldParity>,
 ) -> Option<VerticalSyncInfo> {
-    let candidates = find_vertical_sync_candidates(demod, sample_rate, levels, is_pal);
+    if sample_rate == 0 || !predicted_sample_relative.is_finite() {
+        return None;
+    }
     let win = window_samples as f32;
+    // Include the neighboring H grid, complete equalizing groups and active
+    // start used for parity, while keeping work independent of backlog length.
+    let period = crate::timing::nominal_line_period_samples(sample_rate, is_pal) as f32;
+    let padding = period * (H_GRID_SEARCH_LINES + 12.0);
+    let lo = ((predicted_sample_relative - win - padding).max(0.0) as usize).min(demod.len());
+    let hi =
+        ((predicted_sample_relative + win + padding).ceil().max(0.0) as usize).min(demod.len());
+    if lo >= hi {
+        return None;
+    }
+    let candidates = find_vertical_sync_candidates(&demod[lo..hi], sample_rate, levels, is_pal);
 
     candidates
         .into_iter()
+        .map(|mut info| {
+            info.broad_start += lo as f32;
+            info.field_active_start += lo as f32;
+            info
+        })
         .filter(|info| (info.broad_start - predicted_sample_relative).abs() <= win)
         .max_by(|a, b| {
             let score = |info: &VerticalSyncInfo| -> f32 {
                 let dist = (info.broad_start - predicted_sample_relative).abs();
-                let dist_penalty = dist / win; // in [0.0, 1.0]
+                let dist_penalty = dist / win.max(1.0); // in [0.0, 1.0]
                 let broad_score = (info.n_broad as f32).min(6.0) / 6.0;
                 let eq_score = ((info.n_eq_pre + info.n_eq_post) as f32).min(10.0) / 10.0;
                 let parity_bonus = match (info.parity, expected_parity) {

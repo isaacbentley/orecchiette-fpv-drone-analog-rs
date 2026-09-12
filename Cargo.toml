@@ -1,7 +1,7 @@
 [package]
 name = "orecchiette-fpv-drone-analog-rs"
 license = "GPL-3.0-or-later"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # Set by `wide`/`safe_arch` in the dependency tree, which need 1.89.
 # Declared so a consumer's MSRV-aware resolution sees the real floor

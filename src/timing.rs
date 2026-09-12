@@ -267,6 +267,8 @@ pub enum DecodeStep {
 pub enum DecodeValidationError {
     EmptyBuffer,
     FrameBufferTooSmall { required: usize, actual: usize },
+    SampleRateMismatch { expected: u32, actual: u32 },
+    SampleCoordinateOverflow,
     DiscontinuousBuffer,
 }
 
@@ -280,7 +282,14 @@ impl std::fmt::Display for DecodeValidationError {
                     "frame buffer too small: required {required}, actual {actual}"
                 )
             }
-            Self::DiscontinuousBuffer => write!(f, "stream discontinuity was detected"),
+            Self::SampleRateMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "sample rate mismatch: expected {expected}, actual {actual}"
+                )
+            }
+            Self::SampleCoordinateOverflow => write!(f, "sample coordinates overflow u64"),
+            Self::DiscontinuousBuffer => write!(f, "input overlaps samples already consumed"),
         }
     }
 }
@@ -313,6 +322,9 @@ pub struct TimingTracker {
     pub fractional_offset: f64,
     pub elapsed_half_lines: u64,
     pub line_period: f64,
+    /// Calibrated displacement from the active-line datum to its measured
+    /// H-sync tip center (including sync-path filtering delay).
+    pub h_sync_center_offset_samples: f64,
     pub field_parity: FieldParity,
     pub coasted_fields: u32,
     pub h_sync_coasted_fields: u32,
@@ -332,6 +344,7 @@ impl TimingTracker {
             fractional_offset: 0.0,
             elapsed_half_lines: 0,
             line_period: nominal_period,
+            h_sync_center_offset_samples: 0.0,
             field_parity: FieldParity::First,
             coasted_fields: 0,
             h_sync_coasted_fields: 0,
@@ -347,7 +360,8 @@ impl TimingTracker {
         Standard::from_is_pal(self.is_pal).half_lines_per_field()
     }
 
-    /// Calculate predicted VBI serration sample as an absolute unrounded sample index.
+    /// Approximate absolute VBI position for telemetry. Use the slice-relative
+    /// method for decoding, since f64 loses sample precision beyond 2^53.
     #[inline]
     pub fn predict_vbi_sample_absolute(&self) -> f64 {
         self.anchor_sample as f64
@@ -358,7 +372,12 @@ impl TimingTracker {
     /// Calculate slice-relative predicted VBI sample as an `f32`.
     #[inline]
     pub fn predict_vbi_sample_relative(&self, slice_first_sample: u64) -> f32 {
-        (self.predict_vbi_sample_absolute() - slice_first_sample as f64) as f32
+        // Subtract the integer origins before conversion: absolute f64 sample
+        // indices lose both integer and fractional precision beyond 2^53.
+        let relative_anchor = self.anchor_sample as i128 - slice_first_sample as i128;
+        (relative_anchor as f64
+            + self.fractional_offset
+            + self.elapsed_half_lines as f64 * self.line_period * 0.5) as f32
     }
 
     /// Record an observed field with qualified VBI and H-sync evidence.
@@ -369,17 +388,45 @@ impl TimingTracker {
         line_period: f64,
         parity: FieldParity,
     ) {
-        let abs_vbi = slice_first_sample as f64 + vbi_sample_offset;
-        let floor_sample = abs_vbi.floor();
-        self.anchor_sample = floor_sample.max(0.0) as u64;
-        self.fractional_offset = abs_vbi - floor_sample;
-        self.elapsed_half_lines = self.half_lines_per_field() as u64;
-        self.line_period = line_period;
-        self.field_parity = parity.toggle();
+        self.anchor_next_field(slice_first_sample, vbi_sample_offset, line_period, parity);
         self.coasted_fields = 0;
         self.h_sync_coasted_fields = 0;
         self.uncertainty_seconds = 0.0;
         self.is_locked = true;
+    }
+
+    /// Re-anchor a VBI holdover field using the qualified horizontal grid.
+    /// Keep VBI age/uncertainty: observing H-sync does not verify field identity.
+    pub fn record_coasted_field(
+        &mut self,
+        slice_first_sample: u64,
+        vbi_sample_offset: f64,
+        line_period: f64,
+        parity: FieldParity,
+    ) {
+        // Accrue age before rebasing, so changing the measured line period does
+        // not apply the new slope retroactively to an old multi-field anchor.
+        self.advance_predicted_field();
+        self.anchor_next_field(slice_first_sample, vbi_sample_offset, line_period, parity);
+    }
+
+    fn anchor_next_field(
+        &mut self,
+        slice_first_sample: u64,
+        vbi_sample_offset: f64,
+        line_period: f64,
+        parity: FieldParity,
+    ) {
+        let floor_offset = vbi_sample_offset.floor();
+        self.anchor_sample = if floor_offset >= 0.0 {
+            slice_first_sample.saturating_add(floor_offset as u64)
+        } else {
+            slice_first_sample.saturating_sub((-floor_offset) as u64)
+        };
+        self.fractional_offset = vbi_sample_offset - floor_offset;
+        self.elapsed_half_lines = self.half_lines_per_field() as u64;
+        self.line_period = line_period;
+        self.field_parity = parity.toggle();
     }
 
     /// Advance tracker by one field when coasting/holdover is active.

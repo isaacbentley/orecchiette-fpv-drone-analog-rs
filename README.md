@@ -117,6 +117,39 @@ if let Some(gpu) = GpuAnalog::try_new() {
 }
 ```
 
+## Receiver API and ownership
+
+The crate owns the reusable receiver logic, from IQ slices through fields:
+
+| Module | Responsibility |
+| --- | --- |
+| `decode` | `DecodePlan` selects cutoff, FIR decimation and demodulator together. `StreamingFpvDecoder` owns DDC/demodulator continuity, deemphasis, timed reconstruction, optional restoration and telemetry. |
+| `acquisition` | Bounded contiguous probe records, PAL/NTSC resolution, carrier refinement inside the decode passband, and lock release based on fresh timing evidence. |
+| `scanner` | Tune coverage, packet budgets, configurable sensitive-sweep cadence, completion tracking, skip-aware candidate ranking and fine-tune fallback. |
+| `bands` | One catalog for scan coverage, names, aliases, parsing and candidate frequencies. |
+
+A client constructs `DecoderConfig`, calls `push_iq(samples, source_gap)`, then
+repeatedly calls `next_field_into(&mut frame)` until it returns `None`. The frame
+buffer belongs to the caller; each returned `FieldTiming` describes one field
+update to the interlaced picture. Drain between chunks to bound pending memory.
+`discard_pending_except` lets the caller enforce a latency budget while keeping
+sample accounting and timing/history invalidation inside the decoder. Unknown
+source loss starts a new continuity epoch. Confidence telemetry can vary slightly
+with available lookahead; pixels and timing positions are tested across chunk
+partitions. The `decode` module documentation contains a compiling example.
+
+Hardware drivers own capture transport, supported rates, retunes and settling.
+Applications own scheduling, deadlines, queues, display, frame recycling and
+snapshot files. They supply hardware costs to `SweepPolicy`; the crate has no
+Aaronia, USRP, HackRF, windowing or SDR-buffer dependency. The viewer's
+`profile_decode` example instruments this same production decoder.
+
+The catalog includes A/B/E/F/R/L/D/U, narrow and wide 1.2 GHz, 2.4 GHz and
+3.3 GHz grids. Canonical codes for the latter groups are `N1`–`N8`, `W1`–`W9`,
+`T1`–`T9` and `S1`–`S64`. Exact carrier labels preserve shared aliases. A
+localization estimate remains a measurement: snapping identifies a channel;
+it does not correct the DDC or remove the uncertainty between A1 and B8.
+
 ## Usage
 
 `detect_from_iq` selects its strategy from the sample rate:
@@ -189,6 +222,33 @@ end-to-end equivalence tests. All three skip cleanly when no GPU adapter
 is present.
 
 ### Reference captures
+
+The timed streaming entry point, `FrameReconstructor::reconstruct_timed_into`,
+accepts a `TimedDemodSlice` at the reconstructor's sample rate. Advance its
+integer sample origin by exactly `DecodeStep::Advance::consumed_samples`, even
+when no field is returned. On `NeedMoreData`, append input and retry at the same
+origin; parity, timing and picture history are not committed on a short read.
+Replaying consumed samples requires an explicit discontinuity. A source gap
+clears both timing and image history; changing sample rate requires a new
+reconstructor.
+
+Qualified VBI and horizontal pulses establish observed timing evidence.
+Horizontal sync can sustain up to three missing VBI fields using the measured
+line clock, subject to the experimental uncertainty budget. Without a qualified
+horizontal grid, the decoder skips the picture and clears image history; it
+retains timing for at most one such field. Exhausted holdover returns to global
+VBI acquisition. Density fallback and coasted fields never count as observed
+timing evidence.
+
+`cargo run --release --example sync_recovery_sweep` exercises streaming input,
+clock mismatch and missing sync. Its JSON includes observed/coasted counts,
+missed and duplicate fields, parity errors, horizontal error in TBC pixels and
+the input sample count available at first output. `decode_wall_time_s` and
+`decode_wall_ratio` measure decoder calls only, excluding fixture generation and
+scoring; they are elapsed wall time, not process CPU measurements. The report
+records the analog Git revision and whether tracked changes are present. Eight
+lines of unscored trailing input let the last field finish without counting
+end-of-file truncation as lost sync.
 
 `examples/make_reference_capture.rs` writes standards-conformant PAL and
 NTSC captures in SigMF format (`.sigmf-data` and `.sigmf-meta`) using the

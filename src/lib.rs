@@ -20,6 +20,11 @@
 //!
 //! # Decoding
 //!
+//! [`decode::DecodePlan`] selects filtering, decimation and demodulation together.
+//! [`decode::StreamingFpvDecoder`] owns the continuous IQ-to-field pipeline,
+//! including gap resets and timing telemetry. [`acquisition`] resolves standards
+//! and carrier identity; [`scanner`] supplies tune planning and scan/lock inputs.
+//!
 //! [`demod::fm_demod`] is a quadrature discriminator;
 //! [`demod::PllFmDemod`] is a phase-locked alternative that measures
 //! better at 25 MSPS and above. [`demod::Deemphasis`] inverts a
@@ -54,8 +59,10 @@
 //! See `DESIGN.md` in the repository for the architecture and the
 //! underlying math.
 
+pub mod acquisition;
 pub mod bands;
 pub mod ddc;
+pub mod decode;
 pub mod demod;
 pub mod detector;
 pub mod frame_history;

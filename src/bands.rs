@@ -18,9 +18,11 @@ pub enum FpvBand {
     /// The 9-channel "1.2G/1.3G" long-range VTX grid (1080-1360 MHz,
     /// 40 MHz spacing plus CH9 at 1258). See [`BAND_1200_WIDE_FREQS`].
     Band1200Wide,
+    UltraLow,
+    Band2400,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FpvChannel {
     pub band: FpvBand,
     pub channel: u8,
@@ -91,9 +93,7 @@ pub const BAND_E_FREQS: [u64; 8] = [
 // band* ([`BAND_D_FREQS`] below), not L — the reconciliation went in
 // the wrong direction and made `--channel L1` tune 5362 MHz while a
 // VTX set to L1 transmits at 5333 MHz, 29 MHz off. Both grids are now
-// modelled, under their correct names, here and in fpv-viewer-rs's
-// `FPV_CHANNELS_MHZ` / `get_fpv_channel_name` — keep the two repos'
-// tables in lockstep when editing either.
+// modelled under their correct names in this shared catalog.
 pub const LOWBAND_FREQS: [u64; 8] = [
     5_333_000_000,
     5_373_000_000,
@@ -142,10 +142,7 @@ pub const BAND_1200_FREQS: [u64; 8] = [
 /// long-range analog VTX / RX modules (the 1.2G 9CH / 12CH units) use —
 /// CH1–CH8 at 40 MHz spacing from 1080 MHz, plus CH9 at 1258 MHz.
 /// Indexed in that CH order so `channel` matches the VTX's own menu;
-/// the frequencies are therefore *not* monotonic. fpv-viewer-rs labels
-/// CH1–CH5 "1.2G" and CH6–CH9 "1.3G" in `get_fpv_channel_name`; keep
-/// its `FPV_CHANNELS_MHZ` and this array in lockstep when editing
-/// either.
+/// the frequencies are therefore not monotonic.
 pub const BAND_1200_WIDE_FREQS: [u64; 9] = [
     1_080_000_000,
     1_120_000_000,
@@ -167,118 +164,196 @@ pub fn get_3300_freqs() -> Vec<u64> {
     freqs
 }
 
-pub fn get_all_channels() -> Vec<FpvChannel> {
-    let mut channels = Vec::new();
+/// Ultra-low grid previously supported only by the viewer.
+pub const ULTRA_LOW_FREQS: [u64; 8] = [
+    5_300_000_000,
+    5_325_000_000,
+    5_348_000_000,
+    5_373_000_000,
+    5_398_000_000,
+    5_423_000_000,
+    5_448_000_000,
+    5_473_000_000,
+];
+/// Nine-channel 2.4 GHz video grid. CH3 and CH8 share a carrier.
+pub const BAND_2400_FREQS: [u64; 9] = [
+    2_414_000_000,
+    2_432_000_000,
+    2_450_000_000,
+    2_468_000_000,
+    2_490_000_000,
+    2_410_000_000,
+    2_430_000_000,
+    2_450_000_000,
+    2_470_000_000,
+];
 
-    for (i, &f) in RACEBAND_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::Raceband,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
+impl FpvBand {
+    /// Unambiguous short code used in channel identifiers.
+    pub fn code(self) -> char {
+        match self {
+            Self::BandA => 'A',
+            Self::BandB => 'B',
+            Self::BandE => 'E',
+            Self::Fatshark => 'F',
+            Self::Raceband => 'R',
+            Self::Lowband => 'L',
+            Self::BandD => 'D',
+            Self::UltraLow => 'U',
+            Self::Band1200 => 'N',
+            Self::Band1200Wide => 'W',
+            Self::Band3300 => 'S',
+            Self::Band2400 => 'T',
+        }
     }
-    for (i, &f) in FATSHARK_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::Fatshark,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
+}
+impl FpvChannel {
+    pub fn name(&self) -> String {
+        format!("{}{}", self.band.code(), self.channel)
     }
-    for (i, &f) in BAND_A_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::BandA,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
+    pub fn display_name(&self) -> String {
+        match self.band {
+            FpvBand::Band1200Wide => format!(
+                "1.{}G Ch{}",
+                if self.channel <= 5 { 2 } else { 3 },
+                self.channel
+            ),
+            FpvBand::Band2400 => format!("2.4G Ch{}", self.channel),
+            FpvBand::Band3300 => format!("3.3G Ch{}", self.channel),
+            _ => self.name(),
+        }
     }
-    for (i, &f) in BAND_B_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::BandB,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-    for (i, &f) in BAND_E_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::BandE,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-    for (i, &f) in LOWBAND_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::Lowband,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-    for (i, &f) in BAND_D_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::BandD,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-    for (i, &f) in BAND_1200_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::Band1200,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-    for (i, &f) in BAND_1200_WIDE_FREQS.iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::Band1200Wide,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-
-    // Add 3.3GHz band
-    for (i, f) in get_3300_freqs().into_iter().enumerate() {
-        channels.push(FpvChannel {
-            band: FpvBand::Band3300,
-            channel: (i + 1) as u8,
-            frequency_hz: f,
-        });
-    }
-
-    channels
 }
 
-/// Resolve a channel name (case-insensitive) to its centre frequency in Hz.
-///
-/// Accepted formats: `A1`–`A8`, `B1`–`B8`, `E1`–`E8`, `F1`–`F8`,
-/// `R1`–`R8`, `L1`–`L8`, `D1`–`D8`. Returns `None` for unrecognised
-/// names.
-///
-/// This is the inverse of the `get_fpv_channel_name` lookup in
-/// fpv-viewer-rs's `src/main.rs` — but lives in the library crate so
-/// both the viewer and the main orchestrator can use it.
+/// Shared catalog used by tuning, scanning, candidate matching and labels.
+/// Aliases remain distinct entries; use candidate frequencies to deduplicate.
+pub fn channel_catalog() -> &'static [FpvChannel] {
+    static CATALOG: std::sync::OnceLock<Vec<FpvChannel>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut channels = Vec::new();
+        let grid3300 = get_3300_freqs();
+        for (band, frequencies) in [
+            (FpvBand::BandA, BAND_A_FREQS.as_slice()),
+            (FpvBand::BandB, &BAND_B_FREQS),
+            (FpvBand::BandE, &BAND_E_FREQS),
+            (FpvBand::Fatshark, &FATSHARK_FREQS),
+            (FpvBand::Raceband, &RACEBAND_FREQS),
+            (FpvBand::BandD, &BAND_D_FREQS),
+            (FpvBand::Lowband, &LOWBAND_FREQS),
+            (FpvBand::UltraLow, &ULTRA_LOW_FREQS),
+            (FpvBand::Band1200Wide, &BAND_1200_WIDE_FREQS),
+            (FpvBand::Band1200, &BAND_1200_FREQS),
+            (FpvBand::Band2400, &BAND_2400_FREQS),
+            (FpvBand::Band3300, grid3300.as_slice()),
+        ] {
+            channels.extend(
+                frequencies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &frequency_hz)| FpvChannel {
+                        band,
+                        channel: (i + 1) as u8,
+                        frequency_hz,
+                    }),
+            );
+        }
+        channels
+    })
+}
+pub fn get_all_channels() -> Vec<FpvChannel> {
+    channel_catalog().to_vec()
+}
+
+/// Shared scan coverage selection, independent of CLI argument parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandSelection {
+    Band58,
+    All,
+}
+impl BandSelection {
+    pub fn channels(self) -> impl Iterator<Item = &'static FpvChannel> {
+        channel_catalog().iter().filter(move |c| {
+            self == Self::All || (5_645_000_000..=5_945_000_000).contains(&c.frequency_hz)
+        })
+    }
+}
+
+/// Resolve case-insensitive A/B/E/F/R/L/D/U1–8, N1–8 (narrow 1.2 GHz),
+/// W1–9 (wide 1.2 GHz), T1–9 (2.4 GHz), or S1–64 (3.3 GHz).
 pub fn lookup_channel_by_name(name: &str) -> Option<u64> {
-    let name = name.trim().to_uppercase();
+    let name = name.trim().to_ascii_uppercase();
     let mut chars = name.chars();
-    let first_char = chars.next()?;
-    let channel_str: String = chars.collect();
-    if !first_char.is_ascii() {
+    let code = chars.next()?;
+    let number = chars.as_str().parse::<u8>().ok()?;
+    channel_catalog()
+        .iter()
+        .find(|c| c.band.code() == code && c.channel == number)
+        .map(|c| c.frequency_hz)
+}
+
+/// Exact carrier label, including all aliases sharing that frequency.
+pub fn channel_name(frequency_hz: u64) -> Option<&'static str> {
+    static LABELS: std::sync::OnceLock<Vec<(u64, String)>> = std::sync::OnceLock::new();
+    LABELS
+        .get_or_init(|| {
+            let mut labels: Vec<(u64, String)> = Vec::new();
+            // Keep familiar shared labels R7/F8 and U4/L2 in that order.
+            let mut channels = get_all_channels();
+            channels.sort_by_key(|c| match c.band {
+                FpvBand::Raceband | FpvBand::UltraLow => 0,
+                _ => 1,
+            });
+            for c in channels {
+                if let Some((_, label)) = labels.iter_mut().find(|(f, _)| *f == c.frequency_hz) {
+                    label.push('/');
+                    label.push_str(&c.display_name());
+                } else {
+                    labels.push((c.frequency_hz, c.display_name()));
+                }
+            }
+            labels
+        })
+        .iter()
+        .find(|(f, _)| *f == frequency_hz)
+        .map(|(_, name)| name.as_str())
+}
+
+/// Label after rounding a display frequency to the nearest MHz.
+pub fn get_fpv_channel_name(freq_mhz: f64) -> Option<&'static str> {
+    if !freq_mhz.is_finite() || freq_mhz < 0.0 {
         return None;
     }
-    let band_char = first_char as u8;
-    let channel_num: usize = channel_str.parse().ok()?;
-    if !(1..=8).contains(&channel_num) {
-        return None;
+    channel_name((freq_mhz.round() * 1e6) as u64)
+}
+
+pub const CHANNEL_SNAP_TOLERANCE_MHZ: f64 = 15.0;
+/// Candidate carriers in Hz, ordered by distance, with aliases deduplicated.
+/// The tolerance is inclusive; equal distances retain catalog order.
+pub fn candidate_frequencies(freq_hz: f64, tolerance_hz: f64) -> Vec<f64> {
+    if !freq_hz.is_finite() || !tolerance_hz.is_finite() || tolerance_hz < 0.0 {
+        return Vec::new();
     }
-    let idx = channel_num - 1;
-    match band_char {
-        b'A' => BAND_A_FREQS.get(idx).copied(),
-        b'B' => BAND_B_FREQS.get(idx).copied(),
-        b'E' => BAND_E_FREQS.get(idx).copied(),
-        b'F' => FATSHARK_FREQS.get(idx).copied(),
-        b'R' => RACEBAND_FREQS.get(idx).copied(),
-        b'L' => LOWBAND_FREQS.get(idx).copied(),
-        b'D' => BAND_D_FREQS.get(idx).copied(),
-        _ => None,
-    }
+    let mut candidates: Vec<f64> = channel_catalog()
+        .iter()
+        .map(|c| c.frequency_hz as f64)
+        .filter(|f| (f - freq_hz).abs() <= tolerance_hz)
+        .collect();
+    candidates.sort_by(|a, b| (a - freq_hz).abs().total_cmp(&(b - freq_hz).abs()));
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|f| seen.insert(*f as u64));
+    candidates
+}
+pub fn get_candidate_fpv_channels(freq_hz: f64) -> Vec<f64> {
+    candidate_frequencies(freq_hz, CHANNEL_SNAP_TOLERANCE_MHZ * 1e6)
+}
+/// Preserve an off-table measurement; snap only strictly inside the tolerance.
+/// This is channel identification, not a recommendation to retune the decoder.
+pub fn snap_to_nearest_fpv_channel(freq_hz: f64) -> f64 {
+    get_candidate_fpv_channels(freq_hz)
+        .first()
+        .copied()
+        .filter(|f| (f - freq_hz).abs() < CHANNEL_SNAP_TOLERANCE_MHZ * 1e6)
+        .unwrap_or(freq_hz)
 }
 
 #[cfg(test)]

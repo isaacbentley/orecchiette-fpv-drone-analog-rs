@@ -9,6 +9,20 @@ Detecting analog FPV (First Person View) drones requires distinguishing a wideba
 
 The system is designed to be hardware-agnostic, interacting with RF frontends through abstracted I/Q data buffers.
 
+The public receiver layer is implemented in `decode`, `acquisition`, `scanner`
+and `bands`. `StreamingFpvDecoder` accepts borrowed IQ slices and writes into a
+caller-owned frame buffer. It owns all state that must reset together after a
+source gap: DDC phase, discriminator carry, PLL, deemphasis, pending demodulated
+samples, field timing and restoration history. Known discarded samples advance
+the stream coordinate; unknown lost samples advance the continuity epoch.
+
+The application supplies packet scheduling, source deadlines and latency budgets.
+Hardware-specific tuning costs configure `SweepPolicy`. `ScanProgress` requires
+every planned hop to receive its budget, and `ScanSelector` applies the same skip
+policy to coarse selection and failed fine-tune fallback. Channel parsing,
+coverage and display derive from one catalog. `tests/receiver.rs` tests these
+public contracts without a viewer or SDR driver.
+
 ```mermaid
 graph TD
     A[RF Source] --> B[Scanner]

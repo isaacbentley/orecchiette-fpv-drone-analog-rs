@@ -9,6 +9,441 @@ use orecchiette_fpv_drone_analog_rs::timing::{DecodeStep, DecodeValidationError,
 use orecchiette_fpv_drone_analog_rs::vbi::{FieldParity, PulseKind};
 use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
 
+fn recovery_config(is_pal: bool, start_field: FieldParity) -> ExtendedSyntheticConfig {
+    ExtendedSyntheticConfig::new(SyntheticVideoConfig {
+        sample_rate: 15_360_000,
+        is_pal,
+        deviation_hz: 3_000_000.0,
+        pattern: TestPattern::Bars,
+        start_field,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    })
+}
+
+#[test]
+fn need_more_data_does_not_commit_parity_or_picture_state() {
+    for is_pal in [false, true] {
+        let fixture = generate_extended_fixture(&recovery_config(is_pal, FieldParity::Second), 2);
+        let mut recon = FrameReconstructor::new(fixture.sample_rate, is_pal, 3_000_000.0, false);
+        let mut frame = vec![0x12345678; recon.width * recon.height];
+        let tracker = recon.timing_tracker().clone();
+        for _ in 0..2 {
+            let result = recon
+                .reconstruct_timed_into(
+                    TimedDemodSlice::new(&fixture.demod[..100_000], 0, fixture.sample_rate, false),
+                    &mut frame,
+                )
+                .unwrap();
+            assert_eq!(
+                result,
+                DecodeStep::NeedMoreData {
+                    consumed_samples: 0
+                }
+            );
+            assert_eq!(recon.field_parity, 0, "short input must not change parity");
+            assert_eq!(*recon.timing_tracker(), tracker);
+            assert_eq!(recon.history_depth(), 0);
+            assert!(frame.iter().all(|&p| p == 0x12345678));
+        }
+        let result = recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(&fixture.demod, 0, fixture.sample_rate, false),
+                &mut frame,
+            )
+            .unwrap();
+        assert!(
+            matches!(result, DecodeStep::Advance { field: Some(ref t), .. }
+            if t.parity == FieldParity::Second && t.has_observed_timing_evidence)
+        );
+    }
+}
+
+#[test]
+fn duplicate_completed_input_and_wrong_rate_are_rejected_without_mutation() {
+    let fixture = generate_extended_fixture(&recovery_config(false, FieldParity::First), 2);
+    let mut recon = FrameReconstructor::new(fixture.sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0; recon.width * recon.height];
+    assert!(
+        recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(&fixture.demod, 0, fixture.sample_rate / 2, false),
+                &mut frame,
+            )
+            .is_err(),
+        "a mismatched clock must be rejected"
+    );
+    recon
+        .reconstruct_timed_into(
+            TimedDemodSlice::new(&fixture.demod, 0, fixture.sample_rate, false),
+            &mut frame,
+        )
+        .unwrap();
+    let tracker = recon.timing_tracker().clone();
+    let previous_frame = frame.clone();
+    assert!(
+        recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(&fixture.demod, 0, fixture.sample_rate, false),
+                &mut frame,
+            )
+            .is_err(),
+        "replaying consumed input must not emit a duplicate field"
+    );
+    assert_eq!(*recon.timing_tracker(), tracker);
+    assert_eq!(frame, previous_frame);
+    assert!(
+        recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(&fixture.demod, u64::MAX - 100, fixture.sample_rate, true),
+                &mut frame,
+            )
+            .is_err(),
+        "overflowing sample coordinates must be rejected"
+    );
+    assert_eq!(*recon.timing_tracker(), tracker);
+}
+
+#[test]
+fn discontinuity_on_a_short_read_is_applied_once() {
+    let mut recon = FrameReconstructor::new(15_360_000, false, 3_000_000.0, false);
+    let mut frame = vec![0; recon.width * recon.height];
+    for _ in 0..2 {
+        let result = recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(&[0.0; 1000], 100_000, 15_360_000, true),
+                &mut frame,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            DecodeStep::NeedMoreData {
+                consumed_samples: 0
+            }
+        );
+        assert_eq!(recon.timing_tracker().continuity_epoch, 1);
+    }
+}
+
+#[test]
+fn large_sample_origins_preserve_fractional_timing() {
+    use orecchiette_fpv_drone_analog_rs::timing::TimingTracker;
+    for is_pal in [false, true] {
+        let mut small = TimingTracker::new(15_360_000, is_pal);
+        let mut large = small.clone();
+        let base = (1_u64 << 55) + 3;
+        small.record_observed_field(0, 123.375, 976.2133333333334, FieldParity::First);
+        large.record_observed_field(base, 123.375, 976.2133333333334, FieldParity::First);
+        assert_eq!(large.anchor_sample - base, small.anchor_sample);
+        assert_eq!(large.fractional_offset, small.fractional_offset);
+        assert_eq!(
+            large.predict_vbi_sample_relative(base + 250_000),
+            small.predict_vbi_sample_relative(250_000)
+        );
+    }
+}
+
+#[test]
+fn density_fallback_is_not_observed_vbi_evidence() {
+    let mut config = recovery_config(false, FieldParity::First);
+    config.impairments.erase_vbi_fields = vec![0, 1];
+    let mut fixture = generate_extended_fixture(&config, 3);
+    // A single long negative plateau trips density detection but has no
+    // half-line serrations or equalizing sequence.
+    fixture.demod[3_000..4_500].fill(-0.5);
+    let mut recon = FrameReconstructor::new(fixture.sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0; recon.width * recon.height];
+    let result = recon
+        .reconstruct_timed_into(
+            TimedDemodSlice::new(&fixture.demod[..2 * 256_256], 0, fixture.sample_rate, false),
+            &mut frame,
+        )
+        .unwrap();
+    let consumed = match result {
+        DecodeStep::Advance {
+            field: Some(timing),
+            consumed_samples,
+        } => {
+            assert!(!timing.has_observed_timing_evidence);
+            consumed_samples
+        }
+        other => panic!("expected an unverified density preview: {other:?}"),
+    };
+    assert!(!recon.timing_tracker().is_locked);
+    let result = recon
+        .reconstruct_timed_into(
+            TimedDemodSlice::new(
+                &fixture.demod[consumed..],
+                consumed as u64,
+                fixture.sample_rate,
+                false,
+            ),
+            &mut frame,
+        )
+        .unwrap();
+    assert!(
+        matches!(result, DecodeStep::Advance { field: Some(t), .. } if t.has_observed_timing_evidence)
+    );
+    assert_eq!(
+        recon.history_depth(),
+        1,
+        "unverified preview history must not contaminate acquisition"
+    );
+}
+
+#[test]
+fn missing_horizontal_sync_does_not_publish_or_pollute_history() {
+    for is_pal in [false, true] {
+        let mut fixture =
+            generate_extended_fixture(&recovery_config(is_pal, FieldParity::First), 5);
+        let field_samples = if is_pal { 307_200 } else { 256_256 };
+        fixture.demod[field_samples..4 * field_samples].fill(0.0);
+        let mut recon = FrameReconstructor::new(fixture.sample_rate, is_pal, 3_000_000.0, false);
+        let mut frame = vec![0; recon.width * recon.height];
+        let first = recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(&fixture.demod, 0, fixture.sample_rate, false),
+                &mut frame,
+            )
+            .unwrap();
+        let mut cursor = match first {
+            DecodeStep::Advance {
+                consumed_samples,
+                field: Some(_),
+            } => consumed_samples,
+            other => panic!("initial acquisition failed: {other:?}"),
+        };
+        let previous_frame = frame.clone();
+        let missing = recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(
+                    &fixture.demod[cursor..],
+                    cursor as u64,
+                    fixture.sample_rate,
+                    false,
+                ),
+                &mut frame,
+            )
+            .unwrap();
+        match missing {
+            DecodeStep::Advance {
+                consumed_samples,
+                field: None,
+            } => cursor += consumed_samples,
+            other => panic!("unsupported field must be skipped: {other:?}"),
+        }
+        assert_eq!(frame, previous_frame);
+        assert_eq!(recon.history_depth(), 0);
+        assert_eq!(recon.timing_tracker().h_sync_coasted_fields, 1);
+        assert!(
+            recon.timing_tracker().is_locked,
+            "one field of timing holdover is allowed"
+        );
+        let missing = recon
+            .reconstruct_timed_into(
+                TimedDemodSlice::new(
+                    &fixture.demod[cursor..],
+                    cursor as u64,
+                    fixture.sample_rate,
+                    false,
+                ),
+                &mut frame,
+            )
+            .unwrap();
+        assert!(matches!(missing, DecodeStep::Advance { field: None, .. }));
+        assert!(
+            !recon.timing_tracker().is_locked,
+            "second missing H grid exhausts its own budget"
+        );
+        assert_eq!(frame, previous_frame);
+    }
+}
+
+#[test]
+fn reacquires_structural_vbi_after_exhausted_holdover() {
+    for is_pal in [false, true] {
+        let mut config = recovery_config(is_pal, FieldParity::First);
+        config.impairments.erase_vbi_fields = vec![1, 2, 3, 4];
+        let fixture = generate_extended_fixture(&config, 7);
+        let mut recon = FrameReconstructor::new(fixture.sample_rate, is_pal, 3_000_000.0, false);
+        let mut frame = vec![0; recon.width * recon.height];
+        let mut cursor = 0;
+        let mut decoded = Vec::new();
+        while cursor < fixture.demod.len() {
+            match recon
+                .reconstruct_timed_into(
+                    TimedDemodSlice::new(
+                        &fixture.demod[cursor..],
+                        cursor as u64,
+                        fixture.sample_rate,
+                        false,
+                    ),
+                    &mut frame,
+                )
+                .unwrap()
+            {
+                DecodeStep::Advance {
+                    consumed_samples,
+                    field,
+                } => {
+                    assert!(consumed_samples > 0);
+                    cursor += consumed_samples;
+                    if let Some(timing) = field {
+                        decoded.push(timing);
+                    }
+                }
+                DecodeStep::NeedMoreData { .. } => break,
+            }
+        }
+        assert_eq!(
+            decoded.len(),
+            6,
+            "only field 4 should be lost for PAL={is_pal}"
+        );
+        for (timing, field_index) in decoded.iter().zip([0, 1, 2, 3, 5, 6]) {
+            let truth = &fixture.ground_truth_fields[field_index];
+            assert_eq!(timing.parity, truth.parity);
+            let broad = timing.origin_sample as f64 + timing.vbi_sample_offset;
+            // The parser's moving average delays the measured leading edge.
+            assert!(
+                (broad - truth.broad_start_sample as f64).abs()
+                    < fixture.sample_rate as f64 * 0.5e-6,
+                "PAL={is_pal} field={field_index}: broad={broad}, expected={}, timing={timing:?}",
+                truth.broad_start_sample
+            );
+            assert_eq!(
+                timing.has_observed_timing_evidence,
+                matches!(field_index, 0 | 5 | 6)
+            );
+        }
+        assert!(recon.timing_tracker().is_locked);
+        assert_eq!(
+            recon.timing_tracker().continuity_epoch,
+            0,
+            "loss of sync is not loss of samples"
+        );
+    }
+}
+
+#[test]
+fn bounded_vbi_search_preserves_coordinates_and_parity() {
+    use orecchiette_fpv_drone_analog_rs::levels::SyncLevels;
+    use orecchiette_fpv_drone_analog_rs::vbi::{
+        find_vertical_sync_candidates, find_vertical_sync_near,
+    };
+    for is_pal in [false, true] {
+        let fixture = generate_extended_fixture(&recovery_config(is_pal, FieldParity::First), 6);
+        let levels = SyncLevels {
+            sync_tip: -0.4 * 2.0 * std::f32::consts::PI * 3_000_000.0 / fixture.sample_rate as f32,
+            blanking: 0.0,
+        };
+        let candidates =
+            find_vertical_sync_candidates(&fixture.demod, fixture.sample_rate, &levels, is_pal);
+        assert_eq!(candidates.len(), 6);
+        for expected in candidates {
+            let found = find_vertical_sync_near(
+                &fixture.demod,
+                fixture.sample_rate,
+                &levels,
+                is_pal,
+                expected.broad_start + 20.0,
+                100,
+                expected.parity,
+            )
+            .unwrap();
+            assert_eq!(found.parity, expected.parity);
+            assert!((found.broad_start - expected.broad_start).abs() < 0.1);
+            assert!((found.field_active_start - expected.field_active_start).abs() < 0.2);
+            assert_eq!(
+                (found.n_broad, found.n_eq_pre, found.n_eq_post),
+                (expected.n_broad, expected.n_eq_pre, expected.n_eq_post)
+            );
+            assert!(
+                find_vertical_sync_near(
+                    &fixture.demod,
+                    fixture.sample_rate,
+                    &levels,
+                    is_pal,
+                    expected.broad_start,
+                    0,
+                    expected.parity
+                )
+                .is_some()
+            );
+        }
+        assert!(
+            find_vertical_sync_near(
+                &fixture.demod,
+                fixture.sample_rate,
+                &levels,
+                is_pal,
+                f32::NAN,
+                100,
+                None
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn coasted_fields_follow_the_measured_horizontal_clock() {
+    for is_pal in [false, true] {
+        let mut config = recovery_config(is_pal, FieldParity::First)
+            .with_clock_error_ppm(50.0)
+            .with_clock_drift(1_000.0);
+        config.impairments.erase_vbi_fields = vec![1, 2, 3];
+        let fixture = generate_extended_fixture(&config, 5);
+        let mut recon = FrameReconstructor::new(fixture.sample_rate, is_pal, 3_000_000.0, false);
+        let mut frame = vec![0; recon.width * recon.height];
+        let mut cursor = 0;
+        let mut previous_uncertainty = 0.0;
+        for field_index in 0..4 {
+            let result = recon
+                .reconstruct_timed_into(
+                    TimedDemodSlice::new(
+                        &fixture.demod[cursor..],
+                        cursor as u64,
+                        fixture.sample_rate,
+                        false,
+                    ),
+                    &mut frame,
+                )
+                .unwrap();
+            let (consumed, timing) = match result {
+                DecodeStep::Advance {
+                    consumed_samples,
+                    field: Some(timing),
+                } => (consumed_samples, timing),
+                other => panic!("PAL={is_pal} field={field_index}: {other:?}"),
+            };
+            assert_eq!(timing.coasted_field_count, field_index as u32);
+            assert_eq!(
+                recon.timing_tracker().line_period,
+                timing.line_period_samples,
+                "VBI prediction and H resampling must use the same clock"
+            );
+            if field_index > 0 {
+                assert!(
+                    timing.uncertainty_seconds > previous_uncertainty,
+                    "H-only observations must not reset VBI uncertainty"
+                );
+            }
+            previous_uncertainty = timing.uncertainty_seconds;
+            cursor += consumed;
+            let prediction = recon
+                .timing_tracker()
+                .predict_vbi_sample_relative(cursor as u64) as f64;
+            let truth = fixture.ground_truth_fields[field_index + 1].broad_start_sample as f64
+                - cursor as f64;
+            assert!(
+                (prediction - truth).abs() < fixture.sample_rate as f64 * 1.0e-6,
+                "PAL={is_pal} field={field_index}: predicted={prediction}, truth={truth}"
+            );
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. Independent Timing Vectors (ITU-R BT.470 Tables 1 & 2)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -413,7 +848,7 @@ fn timed_reconstruct_pure_noise_and_short_slices() {
 }
 
 #[test]
-fn timed_reconstruct_clean_ntsc_and_idempotence() {
+fn timed_reconstruct_clean_ntsc_is_deterministic() {
     let sample_rate = 15_360_000;
     let base = SyntheticVideoConfig {
         sample_rate,
@@ -438,7 +873,7 @@ fn timed_reconstruct_clean_ntsc_and_idempotence() {
     let res1 = recon1.reconstruct_timed_into(slice1, &mut frame1).unwrap();
     let res2 = recon2.reconstruct_timed_into(slice2, &mut frame2).unwrap();
 
-    // Idempotence: both reconstructors produce identical results
+    // Determinism: both reconstructors produce identical results
     assert_eq!(res1, res2, "Reconstruction must be deterministic");
     assert_eq!(
         frame1, frame2,
@@ -696,6 +1131,7 @@ fn timing_metric_detects_whole_line_slip() {
         let err_tbc = (decoded_sample - pulse.center_sample).abs() * tbc_scale;
         normal_errors.push(err_tbc);
     }
+    normal_errors.sort_by(f64::total_cmp);
     let p95_normal = normal_errors[(normal_errors.len() as f64 * 0.95) as usize];
     assert!(
         p95_normal < 1.0,
@@ -719,6 +1155,7 @@ fn timing_metric_detects_whole_line_slip() {
         let err_tbc = (displaced_sample - pulse.center_sample).abs() * tbc_scale;
         slipped_errors.push(err_tbc);
     }
+    slipped_errors.sort_by(f64::total_cmp);
     let p95_slipped = slipped_errors[(slipped_errors.len() as f64 * 0.95) as usize];
     // Must report approximately 858 TBC pixels (one full line width), NOT sub-sample error!
     assert!(
