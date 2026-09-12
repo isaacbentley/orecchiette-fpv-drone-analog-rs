@@ -20,7 +20,7 @@
 //! baseband onto a complex carrier, for tests that exercise the
 //! detector's `detect_from_iq` entry point.
 
-use crate::vbi::{FieldParity, consts};
+use crate::vbi::{FieldParity, PulseKind, consts};
 use num_complex::Complex;
 use std::f32::consts::PI;
 
@@ -435,6 +435,469 @@ pub fn generate_iq(
         out.push(Complex::new(phase.cos(), phase.sin()));
     }
     out
+}
+
+/// Ground-truth record of a sync pulse generated in an extended synthetic fixture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundTruthPulse {
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub center_sample: f64,
+    pub kind: PulseKind,
+    pub field_index: usize,
+    pub line_in_field: f64,
+}
+
+/// Ground-truth record of a video field generated in an extended synthetic fixture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundTruthField {
+    pub field_index: usize,
+    pub parity: FieldParity,
+    pub vbi_start_sample: usize,
+    pub broad_start_sample: usize,
+    pub active_video_start_sample: usize,
+    pub active_lines: usize,
+    pub nominal_line_period_samples: f64,
+}
+
+/// Impairments schedule for synthetic video generation.
+#[derive(Debug, Clone, Default)]
+pub struct ImpairmentSchedule {
+    /// Field indices whose vertical blanking interval (equalizing & broad pulses) are erased to blanking level.
+    pub erase_vbi_fields: Vec<usize>,
+    /// Global pulse indices whose sync tips are erased to blanking level.
+    pub erase_hsync_pulses: Vec<usize>,
+    /// Specific `(start_sample, len_samples, attenuation_factor)` intervals for amplitude fades.
+    pub fade_intervals: Vec<(usize, usize, f32)>,
+    /// Specific `(start_sample, len_samples, noise_sigma)` intervals for AWGN injection.
+    pub awgn_intervals: Vec<(usize, usize, f32)>,
+}
+
+/// Extended configuration for test fixtures.
+#[derive(Debug, Clone)]
+pub struct ExtendedSyntheticConfig {
+    pub base: SyntheticVideoConfig,
+    /// Independent camera clock rate error in parts-per-million (e.g. +50.0 ppm means camera runs 50 ppm fast).
+    pub clock_error_ppm: f64,
+    /// Linear clock drift in ppm per second.
+    pub clock_drift_ppm_per_s: f64,
+    /// Schedule of impairments to apply during generation.
+    pub impairments: ImpairmentSchedule,
+}
+
+impl ExtendedSyntheticConfig {
+    pub fn new(base: SyntheticVideoConfig) -> Self {
+        Self {
+            base,
+            clock_error_ppm: 0.0,
+            clock_drift_ppm_per_s: 0.0,
+            impairments: ImpairmentSchedule::default(),
+        }
+    }
+
+    pub fn with_clock_error_ppm(mut self, ppm: f64) -> Self {
+        self.clock_error_ppm = ppm;
+        self
+    }
+
+    pub fn with_clock_drift(mut self, drift_ppm_per_s: f64) -> Self {
+        self.clock_drift_ppm_per_s = drift_ppm_per_s;
+        self
+    }
+
+    pub fn with_impairments(mut self, impairments: ImpairmentSchedule) -> Self {
+        self.impairments = impairments;
+        self
+    }
+}
+
+/// A complete synthetic fixture containing demod baseband samples and ground-truth metadata.
+pub struct ExtendedSyntheticFixture {
+    pub demod: Vec<f32>,
+    pub ground_truth_pulses: Vec<GroundTruthPulse>,
+    pub ground_truth_fields: Vec<GroundTruthField>,
+    pub sample_rate: u32,
+    pub total_fields: usize,
+}
+
+/// Generate an extended synthetic video fixture with continuous camera time coordinates,
+/// independent clock mismatch/drift, ground-truth pulse/field schedules, and impairment intervals.
+pub fn generate_extended_fixture(
+    cfg: &ExtendedSyntheticConfig,
+    n_fields: usize,
+) -> ExtendedSyntheticFixture {
+    let p = params(cfg.base.is_pal);
+    let fs = cfg.base.sample_rate as f64;
+    let radians_per_volt = 2.0 * PI * cfg.base.deviation_hz / cfg.base.sample_rate as f32;
+    let rad_per_ire = radians_per_volt * 0.01;
+    let sync_tip = -40.0 * rad_per_ire;
+    let blank = 0.0f32;
+    let half_line_s = 0.5 / p.line_hz;
+    let line_s = 1.0 / p.line_hz;
+
+    let mut out = Vec::new();
+    let mut emitted = 0usize;
+    let mut t_cam = 0.0f64;
+    let mut t_rx = 0.0f64;
+    let mut parity = cfg.base.start_field;
+
+    let mut ground_truth_pulses = Vec::new();
+    let mut ground_truth_fields = Vec::new();
+    let mut global_pulse_idx = 0usize;
+
+    let advance_cam = |out: &mut Vec<f32>,
+                       emitted: &mut usize,
+                       t_cam: &mut f64,
+                       t_rx: &mut f64,
+                       dur_cam_s: f64,
+                       level: f32| {
+        *t_cam += dur_cam_s;
+        let r = 1.0 + (cfg.clock_error_ppm + cfg.clock_drift_ppm_per_s * *t_rx) * 1e-6;
+        let dur_rx_s = dur_cam_s / r;
+        *t_rx += dur_rx_s;
+        let target_samples = (*t_rx * fs).round() as usize;
+        let n = target_samples.saturating_sub(*emitted);
+        out.resize(out.len() + n, level);
+        *emitted = target_samples;
+    };
+
+    let advance_cam_fn = |out: &mut Vec<f32>,
+                          emitted: &mut usize,
+                          t_cam: &mut f64,
+                          t_rx: &mut f64,
+                          dur_cam_s: f64,
+                          level_at: &mut dyn FnMut(f32) -> f32| {
+        *t_cam += dur_cam_s;
+        let r = 1.0 + (cfg.clock_error_ppm + cfg.clock_drift_ppm_per_s * *t_rx) * 1e-6;
+        let dur_rx_s = dur_cam_s / r;
+        *t_rx += dur_rx_s;
+        let target_samples = (*t_rx * fs).round() as usize;
+        let n = target_samples.saturating_sub(*emitted);
+        for k in 0..n {
+            let frac = if n > 1 {
+                k as f32 / (n - 1) as f32
+            } else {
+                0.0
+            };
+            out.push(level_at(frac));
+        }
+        *emitted = target_samples;
+    };
+
+    for field_idx in 0..n_fields {
+        let erase_vbi = cfg.impairments.erase_vbi_fields.contains(&field_idx);
+        let active_start_lines = p.base_active_start_lines
+            + if parity == FieldParity::Second {
+                0.5
+            } else {
+                0.0
+            };
+        let mut lines_in_field = 0.0f64;
+        let vbi_start_sample = emitted;
+
+        // Pre-equalizing pulses
+        for _ in 0..p.eq_pulses {
+            let start = emitted;
+            let tip = if erase_vbi { blank } else { sync_tip };
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                p.eq_width_s,
+                tip,
+            );
+            let end = emitted;
+            ground_truth_pulses.push(GroundTruthPulse {
+                start_sample: start,
+                end_sample: end,
+                center_sample: (start + end) as f64 * 0.5,
+                kind: PulseKind::Equalizing,
+                field_index: field_idx,
+                line_in_field: lines_in_field,
+            });
+            global_pulse_idx += 1;
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                half_line_s - p.eq_width_s,
+                blank,
+            );
+            lines_in_field += 0.5;
+        }
+
+        // Serrated broad pulses
+        let broad_start_sample = emitted;
+        for _ in 0..p.broad_pulses {
+            let start = emitted;
+            let tip = if erase_vbi { blank } else { sync_tip };
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                p.broad_low_s,
+                tip,
+            );
+            let end = emitted;
+            ground_truth_pulses.push(GroundTruthPulse {
+                start_sample: start,
+                end_sample: end,
+                center_sample: (start + end) as f64 * 0.5,
+                kind: PulseKind::Broad,
+                field_index: field_idx,
+                line_in_field: lines_in_field,
+            });
+            global_pulse_idx += 1;
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                half_line_s - p.broad_low_s,
+                blank,
+            );
+            lines_in_field += 0.5;
+        }
+
+        // Post-equalizing pulses
+        for _ in 0..p.posteq_pulses {
+            let start = emitted;
+            let tip = if erase_vbi { blank } else { sync_tip };
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                p.eq_width_s,
+                tip,
+            );
+            let end = emitted;
+            ground_truth_pulses.push(GroundTruthPulse {
+                start_sample: start,
+                end_sample: end,
+                center_sample: (start + end) as f64 * 0.5,
+                kind: PulseKind::Equalizing,
+                field_index: field_idx,
+                line_in_field: lines_in_field,
+            });
+            global_pulse_idx += 1;
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                half_line_s - p.eq_width_s,
+                blank,
+            );
+            lines_in_field += 0.5;
+        }
+
+        // Blanking lines before active video
+        while lines_in_field + 1.0 <= active_start_lines {
+            let start = emitted;
+            let tip = if cfg
+                .impairments
+                .erase_hsync_pulses
+                .contains(&global_pulse_idx)
+            {
+                blank
+            } else {
+                sync_tip
+            };
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                consts::H_SYNC_WIDTH_S,
+                tip,
+            );
+            let end = emitted;
+            ground_truth_pulses.push(GroundTruthPulse {
+                start_sample: start,
+                end_sample: end,
+                center_sample: (start + end) as f64 * 0.5,
+                kind: PulseKind::Horizontal,
+                field_index: field_idx,
+                line_in_field: lines_in_field,
+            });
+            global_pulse_idx += 1;
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                line_s - consts::H_SYNC_WIDTH_S,
+                blank,
+            );
+            lines_in_field += 1.0;
+        }
+
+        let leftover = active_start_lines - lines_in_field;
+        if leftover > 1e-9 {
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                leftover / p.line_hz,
+                blank,
+            );
+            lines_in_field = active_start_lines;
+        }
+
+        // Active video lines
+        let active_video_start_sample = emitted;
+        for active_line_idx in 0..p.active_lines {
+            let start = emitted;
+            let tip = if cfg
+                .impairments
+                .erase_hsync_pulses
+                .contains(&global_pulse_idx)
+            {
+                blank
+            } else {
+                sync_tip
+            };
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                consts::H_SYNC_WIDTH_S,
+                tip,
+            );
+            let end = emitted;
+            ground_truth_pulses.push(GroundTruthPulse {
+                start_sample: start,
+                end_sample: end,
+                center_sample: (start + end) as f64 * 0.5,
+                kind: PulseKind::Horizontal,
+                field_index: field_idx,
+                line_in_field: lines_in_field,
+            });
+            global_pulse_idx += 1;
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                BACK_PORCH_S,
+                blank,
+            );
+            let active_content_s = line_s - consts::H_SYNC_WIDTH_S - BACK_PORCH_S;
+            let mut pattern_fn = |frac: f32| {
+                let col = ((frac * OUTPUT_WIDTH as f32) as usize).min(OUTPUT_WIDTH - 1);
+                pattern_ire(&cfg.base.pattern, active_line_idx, col) * rad_per_ire
+            };
+            advance_cam_fn(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                active_content_s,
+                &mut pattern_fn,
+            );
+            lines_in_field += 1.0;
+        }
+
+        // Trailing lines
+        while lines_in_field + 1.0 <= p.field_total_lines {
+            let start = emitted;
+            let tip = if cfg
+                .impairments
+                .erase_hsync_pulses
+                .contains(&global_pulse_idx)
+            {
+                blank
+            } else {
+                sync_tip
+            };
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                consts::H_SYNC_WIDTH_S,
+                tip,
+            );
+            let end = emitted;
+            ground_truth_pulses.push(GroundTruthPulse {
+                start_sample: start,
+                end_sample: end,
+                center_sample: (start + end) as f64 * 0.5,
+                kind: PulseKind::Horizontal,
+                field_index: field_idx,
+                line_in_field: lines_in_field,
+            });
+            global_pulse_idx += 1;
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                line_s - consts::H_SYNC_WIDTH_S,
+                blank,
+            );
+            lines_in_field += 1.0;
+        }
+
+        let trailing_leftover = p.field_total_lines - lines_in_field;
+        if trailing_leftover > 1e-9 {
+            advance_cam(
+                &mut out,
+                &mut emitted,
+                &mut t_cam,
+                &mut t_rx,
+                trailing_leftover / p.line_hz,
+                blank,
+            );
+        }
+
+        let nominal_period = fs / (p.line_hz * (1.0 + cfg.clock_error_ppm * 1e-6));
+        ground_truth_fields.push(GroundTruthField {
+            field_index: field_idx,
+            parity,
+            vbi_start_sample,
+            broad_start_sample,
+            active_video_start_sample,
+            active_lines: p.active_lines,
+            nominal_line_period_samples: nominal_period,
+        });
+
+        parity = match parity {
+            FieldParity::First => FieldParity::Second,
+            FieldParity::Second => FieldParity::First,
+        };
+    }
+
+    // Apply fade intervals
+    crate::impairments::apply_demod_fade(&mut out, &cfg.impairments.fade_intervals);
+
+    // Apply specific AWGN intervals
+    let mut rng = 0x1234_5678_9abc_def0u64 ^ (out.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    crate::impairments::apply_demod_awgn(&mut out, &cfg.impairments.awgn_intervals, &mut rng);
+
+    // Apply base noise and DC offset
+    if cfg.base.dc_offset != 0.0 || cfg.base.noise_sigma > 0.0 {
+        for v in out.iter_mut() {
+            *v += cfg.base.dc_offset;
+            if cfg.base.noise_sigma > 0.0 {
+                *v += gaussian_noise(&mut rng) * cfg.base.noise_sigma;
+            }
+        }
+    }
+
+    ExtendedSyntheticFixture {
+        demod: out,
+        ground_truth_pulses,
+        ground_truth_fields,
+        sample_rate: cfg.base.sample_rate,
+        total_fields: n_fields,
+    }
 }
 
 #[cfg(test)]

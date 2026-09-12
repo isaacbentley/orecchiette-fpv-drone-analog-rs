@@ -64,3 +64,36 @@ pub fn add_impulsive_noise(
         }
     }
 }
+
+/// Erases demod-domain sync pulses to blanking level across the specified sample runs `(start, len)`.
+pub fn apply_demod_blanking(demod: &mut [f32], runs: &[(usize, usize)], blank_level: f32) {
+    for &(start, len) in runs {
+        let end = (start + len).min(demod.len());
+        if start < end {
+            demod[start..end].fill(blank_level);
+        }
+    }
+}
+
+/// Applies attenuation fades to demod-domain samples over `(start, len, attenuation_factor)` runs.
+pub fn apply_demod_fade(demod: &mut [f32], runs: &[(usize, usize, f32)]) {
+    for &(start, len, atten) in runs {
+        let end = (start + len).min(demod.len());
+        for sample in &mut demod[start..end] {
+            *sample *= atten;
+        }
+    }
+}
+
+/// Injects additive Gaussian noise into demod-domain samples over the specified `(start, len, sigma)` intervals.
+pub fn apply_demod_awgn(demod: &mut [f32], runs: &[(usize, usize, f32)], seed: &mut u64) {
+    for &(start, len, sigma) in runs {
+        if sigma <= 0.0 {
+            continue;
+        }
+        let end = (start + len).min(demod.len());
+        for sample in &mut demod[start..end] {
+            *sample += sigma * crate::synthetic::gaussian_noise(seed);
+        }
+    }
+}
