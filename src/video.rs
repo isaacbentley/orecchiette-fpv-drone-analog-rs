@@ -18,7 +18,7 @@
 use crate::frame_history::{FieldMeta, FrameHistory};
 use crate::levels::{SyncLevels, estimate_sync_levels};
 use crate::types::SignalType;
-use crate::vbi::{FieldParity, find_vertical_sync};
+use crate::vbi::{FieldParity, find_vertical_sync, find_vertical_sync_near};
 use rayon::prelude::*;
 use std::io::Write;
 
@@ -442,6 +442,8 @@ pub struct FrameReconstructor {
     // Sync Tracking State
     pub sync_phase: f32,
     pub line_period: f32,
+    pub last_sync_positions: Vec<f32>,
+    pub last_rendered_parity: crate::vbi::FieldParity,
 
     // Period history for cross-frame stabilisation: stores the last
     // N frames' median line periods. The median of this buffer gives
@@ -794,6 +796,8 @@ impl FrameReconstructor {
             interlace_reacquiring: false,
             sync_phase: 0.0,
             line_period: nominal_period as f32,
+            last_sync_positions: Vec::with_capacity(field_lines),
+            last_rendered_parity: crate::vbi::FieldParity::First,
             period_history: Vec::with_capacity(8),
 
             notch_b0,
@@ -822,6 +826,18 @@ impl FrameReconstructor {
     /// Access mutable reference to internal timing tracker.
     pub fn timing_tracker_mut(&mut self) -> &mut crate::timing::TimingTracker {
         &mut self.timing_tracker
+    }
+
+    /// Measured or interpolated slice-relative sync tip centers for every rendered line in the last field.
+    #[inline]
+    pub fn latest_sync_positions(&self) -> &[f32] {
+        &self.last_sync_positions
+    }
+
+    /// Field parity with which the last field was rendered.
+    #[inline]
+    pub fn latest_rendered_parity(&self) -> crate::vbi::FieldParity {
+        self.last_rendered_parity
     }
 
     /// Override the temporal history window size. Default is
@@ -1021,7 +1037,7 @@ impl FrameReconstructor {
         demod_data: &[f32],
         frame: &mut [u32],
     ) -> Option<usize> {
-        self.reconstruct_field_internal(demod_data, frame, 0)
+        self.reconstruct_field_internal(demod_data, frame, 0, false)
             .map(|(consumed, _timing)| consumed)
     }
 
@@ -1052,7 +1068,7 @@ impl FrameReconstructor {
         }
 
         if let Some((consumed, timing)) =
-            self.reconstruct_field_internal(slice.samples, frame, slice.first_sample)
+            self.reconstruct_field_internal(slice.samples, frame, slice.first_sample, true)
         {
             self.timing_tracker.last_processed_sample = slice.first_sample + consumed as u64;
             Ok(crate::timing::DecodeStep::Advance {
@@ -1082,6 +1098,7 @@ impl FrameReconstructor {
         demod_data: &[f32],
         frame: &mut [u32],
         slice_first_sample: u64,
+        is_timed: bool,
     ) -> Option<(usize, crate::timing::FieldTiming)> {
         if demod_data.is_empty() {
             return None;
@@ -1162,21 +1179,48 @@ impl FrameReconstructor {
                 sync_tip: -0.4 * radians_per_volt,
                 blanking: 0.0,
             });
-        let vbi_info = find_vertical_sync(demod_data, self.sample_rate, &sync_levels, self.pal);
+        let predicted_vbi_rel = if is_timed && self.timing_tracker.is_locked {
+            Some(
+                self.timing_tracker
+                    .predict_vbi_sample_relative(slice_first_sample),
+            )
+        } else {
+            None
+        };
 
+        let vbi_info = if let Some(pred_rel) = predicted_vbi_rel {
+            let window_samples = (self.line_period * 4.0).round() as usize;
+            let exp_parity = Some(self.timing_tracker.field_parity);
+            find_vertical_sync_near(
+                demod_data,
+                self.sample_rate,
+                &sync_levels,
+                self.pal,
+                pred_rel,
+                window_samples,
+                exp_parity,
+            )
+        } else {
+            find_vertical_sync(demod_data, self.sample_rate, &sync_levels, self.pal)
+        };
+
+        let mut is_coasting_vbi = false;
+        let mut coasted_pred_rel = 0.0f32;
         let first_sync_center;
         let required_samples;
         let vbi_offset_sample: f64;
         if let Some(info) = &vbi_info {
-            if let Some(parity) = info.parity {
-                self.field_parity = match parity {
-                    FieldParity::First => 0,
-                    FieldParity::Second => 1,
-                };
-            }
+            let parity = if is_timed {
+                info.parity.unwrap_or(self.timing_tracker.field_parity)
+            } else {
+                info.parity.unwrap_or_else(|| {
+                    crate::vbi::FieldParity::from_index(self.field_parity as usize)
+                })
+            };
+            self.field_parity = parity.to_index() as u8;
             first_sync_center = info.field_active_start;
             required_samples = (info.field_active_start.max(0.0) as usize)
-                + self.samples_per_line * (self.field_lines + 2);
+                + self.samples_per_line * (self.field_lines + 1);
             vbi_offset_sample = info.broad_start as f64;
             if self.debug_dump {
                 let _ = writeln!(
@@ -1187,6 +1231,38 @@ impl FrameReconstructor {
                     info.n_eq_post,
                     info.parity,
                     info.field_active_start
+                );
+            }
+        } else if let Some(pred_rel) = predicted_vbi_rel
+            && self.timing_tracker.is_locked
+            && self.timing_tracker.coasted_fields
+                < crate::timing::EXPERIMENTAL_MAX_COASTED_VBI_FIELDS
+            && self.timing_tracker.uncertainty_seconds
+                <= crate::timing::EXPERIMENTAL_MAX_TIMING_UNCERTAINTY_S
+            && pred_rel >= -(self.line_period * 2.0)
+        {
+            is_coasting_vbi = true;
+            coasted_pred_rel = pred_rel;
+            let parity = self.timing_tracker.field_parity;
+            self.field_parity = parity.to_index() as u8;
+
+            let map = crate::timing::CalibratedCoordinateMap::new(self.sample_rate, self.pal);
+            let active_offset = map.broad_to_active_start_samples(
+                self.line_period as f64,
+                parity == FieldParity::Second,
+            ) as f32;
+            first_sync_center = pred_rel + active_offset;
+            required_samples = (first_sync_center.max(0.0) as usize)
+                + self.samples_per_line * (self.field_lines + 1);
+            vbi_offset_sample = pred_rel as f64;
+            if self.debug_dump {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "[VBI-COAST] pred_broad={:.1} parity={:?} active@{:.0} coasted_fields={}",
+                    pred_rel,
+                    parity,
+                    first_sync_center,
+                    self.timing_tracker.coasted_fields
                 );
             }
         } else {
@@ -2330,6 +2406,15 @@ impl FrameReconstructor {
             let margin_lines = 6.0;
             let advance = info.broad_start + (field_total_lines - margin_lines) * self.line_period;
             advance.round() as usize
+        } else if is_coasting_vbi {
+            let field_total_lines = if self.pal {
+                crate::vbi::consts::PAL_FIELD_TOTAL_LINES
+            } else {
+                crate::vbi::consts::NTSC_FIELD_TOTAL_LINES
+            } as f32;
+            let margin_lines = 6.0;
+            let advance = coasted_pred_rel + (field_total_lines - margin_lines) * self.line_period;
+            advance.round() as usize
         } else {
             // Anchor the search to the expected field boundary — row-0
             // sync (`sync_positions[0]`, the most reliable datum) plus
@@ -2379,25 +2464,46 @@ impl FrameReconstructor {
         // enough, `consumed` can land a fraction of a line past
         // `demod_data.len()`. The caller advances its cursor by `consumed`
         let parity = crate::vbi::FieldParity::from_index(rendered_parity as usize);
-        let has_observed_timing_evidence = vbi_info.is_some() && sync_quality >= 0.5;
+        self.last_sync_positions.clear();
+        self.last_sync_positions
+            .extend_from_slice(&sync_positions[..n_rows]);
+        self.last_rendered_parity = parity;
+
+        let has_observed_timing_evidence = !is_coasting_vbi
+            && self.timing_tracker.h_sync_coasted_fields == 0
+            && sync_quality >= 0.5;
+        let coasted_field_count = if is_coasting_vbi {
+            self.timing_tracker.coasted_fields + 1
+        } else {
+            0
+        };
+        let uncertainty_seconds = self.timing_tracker.uncertainty_seconds;
+
+        if is_timed {
+            if is_coasting_vbi {
+                self.timing_tracker.advance_predicted_field();
+            } else if has_observed_timing_evidence {
+                self.timing_tracker.record_observed_field(
+                    slice_first_sample,
+                    vbi_offset_sample,
+                    self.line_period as f64,
+                    parity,
+                );
+            } else if self.timing_tracker.is_locked {
+                self.timing_tracker.advance_predicted_field();
+            }
+        }
+
         let timing = crate::timing::FieldTiming {
             origin_sample: slice_first_sample,
             vbi_sample_offset: vbi_offset_sample,
             line_period_samples: self.line_period as f64,
             parity,
             has_observed_timing_evidence,
-            coasted_field_count: 0,
+            coasted_field_count,
             confidence: sync_quality,
-            uncertainty_seconds: 0.0,
+            uncertainty_seconds,
         };
-        if has_observed_timing_evidence {
-            self.timing_tracker.record_observed_field(
-                slice_first_sample,
-                vbi_offset_sample,
-                self.line_period as f64,
-                parity,
-            );
-        }
         Some((consumed.min(demod_data.len()), timing))
     }
 

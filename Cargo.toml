@@ -49,6 +49,7 @@ neural-vsr = ["dep:ort"]
 
 [dev-dependencies]
 criterion = "0.7"
+serde_json = "1.0"
 
 [[bench]]
 name = "dsp"

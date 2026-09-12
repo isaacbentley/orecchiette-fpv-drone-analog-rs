@@ -287,6 +287,18 @@ impl std::fmt::Display for DecodeValidationError {
 
 impl std::error::Error for DecodeValidationError {}
 
+/// Maximum consecutive fields sustained via VBI holdover/coasting without observed VBI serrations.
+/// (Experimental setting: default 3 fields).
+pub const EXPERIMENTAL_MAX_COASTED_VBI_FIELDS: u32 = 3;
+
+/// Maximum consecutive fields sustained via H-sync holdover without observed H-sync pulses.
+/// (Experimental setting: default 1 field).
+pub const EXPERIMENTAL_MAX_COASTED_H_SYNC_FIELDS: u32 = 1;
+
+/// Maximum timing uncertainty budget allowed for holdover/coasting in seconds.
+/// (Experimental setting: default 3.0 µs, corresponding to ~3 fields at 50 ppm).
+pub const EXPERIMENTAL_MAX_TIMING_UNCERTAINTY_S: f64 = 3.0e-6;
+
 /// Persistent timing and holdover tracker across fields.
 ///
 /// Timestamps are preserved using an integer sample anchor (`anchor_sample`)
@@ -361,9 +373,9 @@ impl TimingTracker {
         let floor_sample = abs_vbi.floor();
         self.anchor_sample = floor_sample.max(0.0) as u64;
         self.fractional_offset = abs_vbi - floor_sample;
-        self.elapsed_half_lines = 0;
+        self.elapsed_half_lines = self.half_lines_per_field() as u64;
         self.line_period = line_period;
-        self.field_parity = parity;
+        self.field_parity = parity.toggle();
         self.coasted_fields = 0;
         self.h_sync_coasted_fields = 0;
         self.uncertainty_seconds = 0.0;

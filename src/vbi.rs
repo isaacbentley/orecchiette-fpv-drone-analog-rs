@@ -467,51 +467,35 @@ pub fn confirm_field_sync(
 /// whatever less-structural vsync detection they already have (real
 /// VBI is dirtier than the spec on cheap FPV cameras; only the broad
 /// group is treated as load-bearing here). A `Some` result's `parity`
-/// field can still independently be `None` (see its doc).
-pub fn find_vertical_sync(
-    demod: &[f32],
-    sample_rate: u32,
-    levels: &SyncLevels,
+fn parse_broad_group(
+    pulses: &[SyncPulse],
+    broads: &[&SyncPulse],
+    gi: usize,
+    gj: usize,
+    nominal_period: f32,
     is_pal: bool,
-) -> Option<VerticalSyncInfo> {
-    if sample_rate == 0 {
-        return None;
-    }
-    let pulses = extract_pulses(demod, sample_rate, levels);
-    let nominal_line_hz = if is_pal {
-        consts::PAL_LINE_HZ
-    } else {
-        consts::NTSC_LINE_HZ
-    };
-    let nominal_period = sample_rate as f32 / nominal_line_hz as f32;
-    let half_period = nominal_period * 0.5;
-
-    let broads: Vec<&SyncPulse> = pulses
-        .iter()
-        .filter(|p| p.kind == PulseKind::Broad)
-        .collect();
-    let (gi, gj) = *find_broad_groups(&broads, half_period).first()?;
+) -> VerticalSyncInfo {
     let n_broad = gj - gi + 1;
     let broad_start = broads[gi].start as f32;
     let last_start = broads[gj].start as f32;
+    let half_period = nominal_period * 0.5;
 
     let n_eq_pre = count_adjacent_run(
-        &pulses,
+        pulses,
         broad_start,
         half_period,
         -1.0,
         PulseKind::Equalizing,
     );
-    let n_eq_post =
-        count_adjacent_run(&pulses, last_start, half_period, 1.0, PulseKind::Equalizing);
+    let n_eq_post = count_adjacent_run(pulses, last_start, half_period, 1.0, PulseKind::Equalizing);
 
     // Refine the line period from this field's own plain H-sync pulses
     // (prefer after the group — guaranteed present in any single-
     // field-plus slice — falling back to before it). Only the period
     // is used from this fit; see the doc comment on why an intercept-
     // based phase can't carry parity here.
-    let fitted_period = fit_h_grid(&pulses, nominal_period, last_start + nominal_period * 3.0)
-        .or_else(|| fit_h_grid(&pulses, nominal_period, broad_start - nominal_period * 3.0));
+    let fitted_period = fit_h_grid(pulses, nominal_period, last_start + nominal_period * 3.0)
+        .or_else(|| fit_h_grid(pulses, nominal_period, broad_start - nominal_period * 3.0));
     let period_for_datum = fitted_period.unwrap_or(nominal_period);
 
     let broad_to_active = if is_pal {
@@ -539,7 +523,7 @@ pub fn find_vertical_sync(
         _ => candidate_first,
     };
 
-    Some(VerticalSyncInfo {
+    VerticalSyncInfo {
         broad_start,
         field_active_start,
         parity,
@@ -547,7 +531,93 @@ pub fn find_vertical_sync(
         n_eq_pre,
         n_eq_post,
         line_period: fitted_period,
-    })
+    }
+}
+
+/// Find all qualifying vertical sync candidate groups across a demod slice.
+pub fn find_vertical_sync_candidates(
+    demod: &[f32],
+    sample_rate: u32,
+    levels: &SyncLevels,
+    is_pal: bool,
+) -> Vec<VerticalSyncInfo> {
+    if sample_rate == 0 || demod.is_empty() {
+        return Vec::new();
+    }
+    let pulses = extract_pulses(demod, sample_rate, levels);
+    let nominal_line_hz = if is_pal {
+        consts::PAL_LINE_HZ
+    } else {
+        consts::NTSC_LINE_HZ
+    };
+    let nominal_period = sample_rate as f32 / nominal_line_hz as f32;
+    let half_period = nominal_period * 0.5;
+
+    let broads: Vec<&SyncPulse> = pulses
+        .iter()
+        .filter(|p| p.kind == PulseKind::Broad)
+        .collect();
+    let groups = find_broad_groups(&broads, half_period);
+    groups
+        .into_iter()
+        .map(|(gi, gj)| parse_broad_group(&pulses, &broads, gi, gj, nominal_period, is_pal))
+        .collect()
+}
+
+/// Find the best qualifying vertical sync candidate near a slice-relative predicted sample position.
+///
+/// Bounded search within `±window_samples` of `predicted_sample_relative`. Candidates are scored
+/// using distance from predicted position, structural completeness (broad and equalizing pulse count),
+/// and parity consistency.
+pub fn find_vertical_sync_near(
+    demod: &[f32],
+    sample_rate: u32,
+    levels: &SyncLevels,
+    is_pal: bool,
+    predicted_sample_relative: f32,
+    window_samples: usize,
+    expected_parity: Option<FieldParity>,
+) -> Option<VerticalSyncInfo> {
+    let candidates = find_vertical_sync_candidates(demod, sample_rate, levels, is_pal);
+    let win = window_samples as f32;
+
+    candidates
+        .into_iter()
+        .filter(|info| (info.broad_start - predicted_sample_relative).abs() <= win)
+        .max_by(|a, b| {
+            let score = |info: &VerticalSyncInfo| -> f32 {
+                let dist = (info.broad_start - predicted_sample_relative).abs();
+                let dist_penalty = dist / win; // in [0.0, 1.0]
+                let broad_score = (info.n_broad as f32).min(6.0) / 6.0;
+                let eq_score = ((info.n_eq_pre + info.n_eq_post) as f32).min(10.0) / 10.0;
+                let parity_bonus = match (info.parity, expected_parity) {
+                    (Some(p), Some(exp)) if p == exp => 0.5,
+                    (Some(_), Some(_)) => -0.5,
+                    _ => 0.0,
+                };
+                broad_score * 1.5 + eq_score * 0.5 + parity_bonus - dist_penalty
+            };
+            score(a)
+                .partial_cmp(&score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Parse a demod slice's vertical-sync structure: locate the serrated
+/// broad-pulse group, determine field parity, and derive where active
+/// video starts.
+///
+/// Returns `None` when no run of at least [`MIN_BROAD_RUN`] half-line-
+/// spaced broad pulses is found at all.
+pub fn find_vertical_sync(
+    demod: &[f32],
+    sample_rate: u32,
+    levels: &SyncLevels,
+    is_pal: bool,
+) -> Option<VerticalSyncInfo> {
+    find_vertical_sync_candidates(demod, sample_rate, levels, is_pal)
+        .into_iter()
+        .next()
 }
 
 #[cfg(test)]

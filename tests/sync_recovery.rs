@@ -26,11 +26,63 @@ fn independent_ntsc_pal_rational_frequencies() {
     let pal_line_hz: f64 = 15_625.0;
     assert_eq!(pal_line_hz, 15_625.0);
 
+    // Assert that library production constants in timing.rs, vbi.rs, and Standard enum
+    // exactly match these independent ITU-R BT.470 values:
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::NTSC_NOMINAL_LINE_HZ,
+        ntsc_line_hz
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::PAL_NOMINAL_LINE_HZ,
+        pal_line_hz
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::vbi::consts::NTSC_LINE_HZ,
+        ntsc_line_hz
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::vbi::consts::PAL_LINE_HZ,
+        pal_line_hz
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::Standard::Ntsc.nominal_line_hz(),
+        ntsc_line_hz
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::Standard::Pal.nominal_line_hz(),
+        pal_line_hz
+    );
+
     // Half-lines per field (525 / 2 = 262.5 for NTSC; 625 / 2 = 312.5 for PAL)
     let ntsc_field_lines: f64 = 525.0 * 0.5;
     let pal_field_lines: f64 = 625.0 * 0.5;
     assert_eq!(ntsc_field_lines, 262.5);
     assert_eq!(pal_field_lines, 312.5);
+
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::NTSC_FIELD_TOTAL_LINES,
+        ntsc_field_lines
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::PAL_FIELD_TOTAL_LINES,
+        pal_field_lines
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::vbi::consts::NTSC_FIELD_TOTAL_LINES,
+        ntsc_field_lines
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::vbi::consts::PAL_FIELD_TOTAL_LINES,
+        pal_field_lines
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::Standard::Ntsc.half_lines_per_field(),
+        525
+    );
+    assert_eq!(
+        orecchiette_fpv_drone_analog_rs::timing::Standard::Pal.half_lines_per_field(),
+        625
+    );
 
     // Subcarrier cycles per line
     // NTSC: 455 / 2 = 227.5
@@ -53,6 +105,11 @@ fn integer_rounding_error_accumulation() {
     let ntsc_line_hz: f64 = 15_750_000.0 / 1001.0;
     let exact_period: f64 = fs / ntsc_line_hz;
     assert!((exact_period - 976.2133333333334f64).abs() < 1e-9);
+
+    // Assert that FrameReconstructor initializes line_period to the exact unrounded period
+    let recon = FrameReconstructor::new(15_360_000, false, 3_000_000.0, false);
+    assert_eq!(recon.line_period, exact_period as f32);
+    assert_ne!(recon.line_period, 976.0);
 
     // If initialized at integer-rounded 976:
     let rounded_period: f64 = 976.0;
@@ -87,6 +144,21 @@ fn nominal_sample_periods_across_standard_sdr_rates() {
         let pal_time_us: f64 = (pal_period / fs) * 1e6;
         assert!((ntsc_time_us - 63.55555555555556f64).abs() < 1e-9);
         assert!((pal_time_us - 64.0f64).abs() < 1e-9);
+
+        // Assert that library function nominal_line_period_samples matches exact calculation
+        let lib_ntsc =
+            orecchiette_fpv_drone_analog_rs::timing::nominal_line_period_samples(fs as u32, false);
+        let lib_pal =
+            orecchiette_fpv_drone_analog_rs::timing::nominal_line_period_samples(fs as u32, true);
+        assert_eq!(lib_ntsc, ntsc_period);
+        assert_eq!(lib_pal, pal_period);
+
+        // Assert that FrameReconstructor initializes line_period to exact nominal period
+        let recon_ntsc = FrameReconstructor::new(fs as u32, false, 3_000_000.0, false);
+        assert_eq!(recon_ntsc.line_period, ntsc_period as f32);
+
+        let recon_pal = FrameReconstructor::new(fs as u32, true, 3_000_000.0, false);
+        assert_eq!(recon_pal.line_period, pal_period as f32);
     }
 }
 
@@ -152,27 +224,38 @@ fn clock_mismatch_accurately_scales_sample_interval() {
     };
 
     let cfg_nominal = ExtendedSyntheticConfig::new(base);
-    let fix_nominal = generate_extended_fixture(&cfg_nominal, 2);
+    let fix_nominal = generate_extended_fixture(&cfg_nominal, 8);
 
     let cfg_fast = ExtendedSyntheticConfig::new(base).with_clock_error_ppm(100.0); // +100 ppm
-    let fix_fast = generate_extended_fixture(&cfg_fast, 2);
+    let fix_fast = generate_extended_fixture(&cfg_fast, 8);
 
-    // When camera is 100 ppm fast, duration of 1 line in receiver samples should be smaller by ~100 ppm
+    // Measure over a sufficiently long interval (2000 pulses, ~1.95M samples)
+    // so sample-rounding discretization error is < 3e-7, allowing a tight 1e-6 tolerance.
     let p0_nom = fix_nominal.ground_truth_pulses[30].center_sample;
-    let p1_nom = fix_nominal.ground_truth_pulses[130].center_sample;
+    let p1_nom = fix_nominal.ground_truth_pulses[2030].center_sample;
     let dt_nom = p1_nom - p0_nom;
 
     let p0_fast = fix_fast.ground_truth_pulses[30].center_sample;
-    let p1_fast = fix_fast.ground_truth_pulses[130].center_sample;
+    let p1_fast = fix_fast.ground_truth_pulses[2030].center_sample;
     let dt_fast = p1_fast - p0_fast;
 
     let ratio = dt_nom / dt_fast;
     let expected_ratio = 1.0 + 100.0 * 1e-6;
     assert!(
-        (ratio - expected_ratio).abs() < 1e-4,
-        "ratio: {}, expected: {}",
+        (ratio - expected_ratio).abs() < 1e-6,
+        "ratio: {:.8}, expected: {:.8}, error: {:.8}",
         ratio,
-        expected_ratio
+        expected_ratio,
+        (ratio - expected_ratio).abs()
+    );
+
+    // Explicitly assert that a no-op / null clock adjustment (ratio = 1.0)
+    // would fail this test with a large ~100 ppm margin:
+    let null_error = (1.0f64 - expected_ratio).abs();
+    assert!(
+        null_error >= 9.9e-5,
+        "Null adjustment must fail tight tolerance with ~100 ppm deviation: {:.8}",
+        null_error
     );
 }
 
@@ -420,5 +503,232 @@ fn timed_reconstruct_handles_discontinuity() {
         recon.timing_tracker().continuity_epoch,
         1,
         "Epoch must increment upon discontinuity"
+    );
+}
+
+#[test]
+fn holdover_recovers_missing_vbi_field() {
+    let sample_rate = 15_360_000;
+    let base = SyntheticVideoConfig {
+        sample_rate,
+        is_pal: false,
+        deviation_hz: 3_000_000.0,
+        pattern: TestPattern::Bars,
+        start_field: FieldParity::First,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    };
+    let impairments = ImpairmentSchedule {
+        erase_vbi_fields: vec![1], // Field 1 has VBI erased
+        ..Default::default()
+    };
+    let cfg = ExtendedSyntheticConfig::new(base).with_impairments(impairments);
+    let fixture = generate_extended_fixture(&cfg, 3);
+
+    let mut recon = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0u32; recon.width * recon.height];
+
+    let mut cursor = 0usize;
+    let mut decoded_fields = Vec::new();
+
+    while cursor < fixture.demod.len() && decoded_fields.len() < 3 {
+        let slice =
+            TimedDemodSlice::new(&fixture.demod[cursor..], cursor as u64, sample_rate, false);
+        match recon.reconstruct_timed_into(slice, &mut frame) {
+            Ok(DecodeStep::Advance {
+                consumed_samples,
+                field,
+            }) => {
+                cursor += consumed_samples;
+                if let Some(timing) = field {
+                    decoded_fields.push(timing);
+                }
+            }
+            Ok(DecodeStep::NeedMoreData { .. }) => break,
+            Err(e) => panic!("Unexpected decode error: {e:?}"),
+        }
+    }
+
+    assert_eq!(decoded_fields.len(), 3, "All 3 fields must be recovered!");
+
+    // Field 0: Observed VBI
+    assert!(
+        decoded_fields[0].has_observed_timing_evidence,
+        "Field 0 must have observed timing evidence"
+    );
+    assert_eq!(decoded_fields[0].coasted_field_count, 0);
+    assert_eq!(decoded_fields[0].parity, FieldParity::First);
+
+    // Field 1: Coasted / Holdover VBI (missing serration group)
+    assert!(
+        !decoded_fields[1].has_observed_timing_evidence,
+        "Field 1 was coasted, so has_observed_timing_evidence must be false"
+    );
+    assert_eq!(decoded_fields[1].coasted_field_count, 1);
+    assert_eq!(
+        decoded_fields[1].parity,
+        FieldParity::Second,
+        "Field 1 must alternate to Second parity"
+    );
+
+    // Field 2: Reacquired observed VBI
+    assert!(
+        decoded_fields[2].has_observed_timing_evidence,
+        "Field 2 must reacquire observed timing evidence"
+    );
+    assert_eq!(decoded_fields[2].coasted_field_count, 0);
+    assert_eq!(
+        decoded_fields[2].parity,
+        FieldParity::First,
+        "Field 2 must alternate back to First parity"
+    );
+}
+
+#[test]
+fn holdover_budget_exhaustion_drops_field() {
+    let sample_rate = 15_360_000;
+    let base = SyntheticVideoConfig {
+        sample_rate,
+        is_pal: false,
+        deviation_hz: 3_000_000.0,
+        pattern: TestPattern::Bars,
+        start_field: FieldParity::First,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    };
+    // Erase VBI for 4 consecutive fields (fields 1, 2, 3, 4)
+    let impairments = ImpairmentSchedule {
+        erase_vbi_fields: vec![1, 2, 3, 4],
+        ..Default::default()
+    };
+    let cfg = ExtendedSyntheticConfig::new(base).with_impairments(impairments);
+    let fixture = generate_extended_fixture(&cfg, 6);
+
+    let mut recon = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0u32; recon.width * recon.height];
+
+    let mut cursor = 0usize;
+    let mut coasted_counts = Vec::new();
+
+    for _ in 0..5 {
+        if cursor >= fixture.demod.len() {
+            break;
+        }
+        let slice =
+            TimedDemodSlice::new(&fixture.demod[cursor..], cursor as u64, sample_rate, false);
+        match recon.reconstruct_timed_into(slice, &mut frame) {
+            Ok(DecodeStep::Advance {
+                consumed_samples,
+                field,
+            }) => {
+                cursor += consumed_samples;
+                if let Some(timing) = field {
+                    coasted_counts.push(timing.coasted_field_count);
+                } else {
+                    coasted_counts.push(999); // dropped field marker
+                }
+            }
+            Ok(DecodeStep::NeedMoreData { .. }) => break,
+            Err(e) => panic!("Unexpected error: {e:?}"),
+        }
+    }
+
+    // Field 0: 0 coasted
+    // Field 1: 1 coasted
+    // Field 2: 2 coasted
+    // Field 3: 3 coasted
+    // Field 4: dropped (budget of 3 exhausted)
+    assert!(coasted_counts.len() >= 4);
+    assert_eq!(coasted_counts[0], 0);
+    assert_eq!(coasted_counts[1], 1);
+    assert_eq!(coasted_counts[2], 2);
+    assert_eq!(coasted_counts[3], 3);
+    if coasted_counts.len() >= 5 {
+        assert_eq!(
+            coasted_counts[4], 999,
+            "4th consecutive missing VBI must exceed holdover budget and drop field"
+        );
+    }
+}
+
+#[test]
+fn timing_metric_detects_whole_line_slip() {
+    let sample_rate = 15_360_000;
+    let base = SyntheticVideoConfig {
+        sample_rate,
+        is_pal: false,
+        deviation_hz: 3_000_000.0,
+        pattern: TestPattern::Flat(50.0),
+        start_field: FieldParity::First,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    };
+    let cfg = ExtendedSyntheticConfig::new(base);
+    let fixture = generate_extended_fixture(&cfg, 2);
+
+    let mut recon = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0u32; recon.width * recon.height];
+
+    let consumed = recon.reconstruct_frame_into(&fixture.demod, &mut frame);
+    assert!(consumed.is_some());
+
+    let sync_positions = recon.latest_sync_positions();
+    assert!(!sync_positions.is_empty());
+
+    let base_active_lines =
+        orecchiette_fpv_drone_analog_rs::vbi::consts::NTSC_BASE_ACTIVE_START_LINES;
+    let tbc_scale = recon.line_width as f64 / recon.line_period as f64;
+
+    // Normal evaluation: sub-pixel error
+    let mut normal_errors = Vec::new();
+    for (row, &pos) in sync_positions.iter().enumerate() {
+        let expected_line = base_active_lines + row as f64;
+        let pulse = fixture
+            .ground_truth_pulses
+            .iter()
+            .find(|p| {
+                p.field_index == 0
+                    && p.kind == PulseKind::Horizontal
+                    && (p.line_in_field - expected_line).abs() < 1e-4
+            })
+            .expect("Expected ground truth pulse for row");
+        let decoded_sample = pos as f64;
+        let err_tbc = (decoded_sample - pulse.center_sample).abs() * tbc_scale;
+        normal_errors.push(err_tbc);
+    }
+    let p95_normal = normal_errors[(normal_errors.len() as f64 * 0.95) as usize];
+    assert!(
+        p95_normal < 1.0,
+        "Normal decode error must be < 1.0 TBC pixel, got {p95_normal}"
+    );
+
+    // Deliberate 1-line slip perturbation: add exactly 1 line period to reported sync positions
+    let mut slipped_errors = Vec::new();
+    for (row, &pos) in sync_positions.iter().enumerate() {
+        let expected_line = base_active_lines + row as f64;
+        let pulse = fixture
+            .ground_truth_pulses
+            .iter()
+            .find(|p| {
+                p.field_index == 0
+                    && p.kind == PulseKind::Horizontal
+                    && (p.line_in_field - expected_line).abs() < 1e-4
+            })
+            .expect("Expected ground truth pulse for row");
+        let displaced_sample = pos as f64 + recon.line_period as f64; // +1 full line period displacement
+        let err_tbc = (displaced_sample - pulse.center_sample).abs() * tbc_scale;
+        slipped_errors.push(err_tbc);
+    }
+    let p95_slipped = slipped_errors[(slipped_errors.len() as f64 * 0.95) as usize];
+    // Must report approximately 858 TBC pixels (one full line width), NOT sub-sample error!
+    assert!(
+        (p95_slipped - recon.line_width as f64).abs() < 2.0,
+        "Whole-line slip must report ~{} TBC samples of error, got {:.2}",
+        recon.line_width,
+        p95_slipped
+    );
+    assert!(
+        p95_slipped > 800.0,
+        "Line slip error must not collapse to sub-sample: {p95_slipped}"
     );
 }

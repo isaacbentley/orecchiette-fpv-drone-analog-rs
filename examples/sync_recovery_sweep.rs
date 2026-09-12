@@ -25,7 +25,24 @@ struct Scenario {
     n_fields: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+struct SweepReport {
+    commit_analog: String,
+    commit_viewer: Option<String>,
+    target_os: String,
+    target_arch: String,
+    generator_configuration: GeneratorProvenance,
+    results: Vec<ScenarioResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct GeneratorProvenance {
+    test_pattern: &'static str,
+    deviation_hz: f32,
+    seed_derivation: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 struct ScenarioResult {
     name: &'static str,
     is_pal: bool,
@@ -35,7 +52,7 @@ struct ScenarioResult {
     fields_decoded: usize,
     first_field_sample: Option<usize>,
     mean_sync_quality: f32,
-    p95_h_error_samples: f64,
+    p95_h_error_tbc_samples: f64,
     signal_duration_s: f64,
     cpu_time_s: f64,
     cpu_ratio: f64, // cpu_time / signal_duration
@@ -67,60 +84,111 @@ fn run_scenario(sc: &Scenario) -> ScenarioResult {
     let mut recon = FrameReconstructor::new(sc.sample_rate, sc.is_pal, 3_000_000.0, false);
     let mut frame = vec![0u32; recon.width * recon.height];
 
-    // Decode in field-sized slices to simulate streaming buffer arrival
-    let samples_per_field = (sc.sample_rate as f64 / if sc.is_pal { 15625.0 } else { 15734.2657 }
-        * (if sc.is_pal { 312.5 } else { 262.5 })) as usize;
-    let slice_window = samples_per_field + (samples_per_field / 10);
+    // Gating threshold matching production worker in fpv-viewer-rs:
+    // ~13 ms at 15.36 MSPS, requiring enough samples before asking reconstructor to commit.
+    let min_samples_per_field = {
+        let line_rate = if sc.is_pal {
+            orecchiette_fpv_drone_analog_rs::timing::PAL_NOMINAL_LINE_HZ
+        } else {
+            orecchiette_fpv_drone_analog_rs::timing::NTSC_NOMINAL_LINE_HZ
+        };
+        let lines = (if sc.is_pal { 288 } else { 240 } + 22) as f64;
+        ((sc.sample_rate as f64 / line_rate) * lines) as usize
+    };
+
+    // Realistic SDR / pipeline streaming chunk size (~16 ms) and production buffer bounds
+    let chunk_size = (sc.sample_rate as usize / 60).max(16_384);
+    let live_region_cap = sc.sample_rate as usize / 12; // ~83 ms live cap
+    let keep_on_skip = sc.sample_rate as usize / 60; // ~16 ms kept on safety skip
 
     let start_time = Instant::now();
-    let mut cursor = 0usize;
+    let mut consumed_cursor = 0usize;
+    let mut available_samples = chunk_size.min(fixture.demod.len());
     let mut fields_decoded = 0usize;
     let mut sync_qualities = Vec::new();
     let mut first_field_sample = None;
     let mut h_errors = Vec::new();
 
-    while cursor < fixture.demod.len() {
-        let end = (cursor + slice_window).min(fixture.demod.len());
-        let slice = &fixture.demod[cursor..end];
-        if slice.len() < samples_per_field {
-            break;
+    while consumed_cursor < fixture.demod.len() {
+        // Attempt reconstruction on currently available streaming input
+        while available_samples.saturating_sub(consumed_cursor) >= min_samples_per_field {
+            let slice = &fixture.demod[consumed_cursor..available_samples];
+            if let Some(consumed) = recon.reconstruct_frame_into(slice, &mut frame) {
+                if first_field_sample.is_none() {
+                    first_field_sample = Some(consumed_cursor);
+                }
+                fields_decoded += 1;
+                sync_qualities.push(recon.latest_sync_quality());
+
+                // Evaluate horizontal timing error across all rendered lines,
+                // matching measurements strictly by ground-truth field and line identity.
+                let sync_positions = recon.latest_sync_positions();
+                if !sync_positions.is_empty() {
+                    let field_active_start = consumed_cursor as f64 + sync_positions[0] as f64;
+                    if let Some(gt_field) = fixture.ground_truth_fields.iter().min_by(|a, b| {
+                        (a.active_video_start_sample as f64 - field_active_start)
+                            .abs()
+                            .partial_cmp(
+                                &(b.active_video_start_sample as f64 - field_active_start).abs(),
+                            )
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }) {
+                        let field_idx = gt_field.field_index;
+                        let base_active_lines = if sc.is_pal {
+                            orecchiette_fpv_drone_analog_rs::vbi::consts::PAL_BASE_ACTIVE_START_LINES
+                        } else {
+                            orecchiette_fpv_drone_analog_rs::vbi::consts::NTSC_BASE_ACTIVE_START_LINES
+                        };
+                        let active_start_lines = base_active_lines
+                            + if gt_field.parity == FieldParity::Second {
+                                0.5
+                            } else {
+                                0.0
+                            };
+
+                        // Scale factor converting input-sample errors to TBC output-sample units (pixels)
+                        let tbc_scale = recon.line_width as f64 / recon.line_period as f64;
+
+                        for (row, &pos) in sync_positions.iter().enumerate() {
+                            let expected_line = active_start_lines + row as f64;
+                            if let Some(pulse) = fixture.ground_truth_pulses.iter().find(|p| {
+                                p.field_index == field_idx
+                                    && p.kind == orecchiette_fpv_drone_analog_rs::vbi::PulseKind::Horizontal
+                                    && (p.line_in_field - expected_line).abs() < 1e-4
+                            }) {
+                                let decoded_sample = consumed_cursor as f64 + pos as f64;
+                                let err_input = (decoded_sample - pulse.center_sample).abs();
+                                let err_tbc = err_input * tbc_scale;
+                                h_errors.push(err_tbc);
+                            }
+                        }
+                    }
+                }
+
+                // Advance consumption exactly as reported by the decoder
+                consumed_cursor += consumed;
+            } else {
+                // When reconstructor returns None, retain input and await further streaming arrivals
+                break;
+            }
         }
 
-        if let Some(consumed) = recon.reconstruct_frame_into(slice, &mut frame) {
-            if first_field_sample.is_none() {
-                first_field_sample = Some(cursor);
-            }
-            fields_decoded += 1;
-            sync_qualities.push(recon.latest_sync_quality());
-
-            // Measure horizontal position error: compare reconstructor's sync phase against
-            // the nearest ground truth H-sync pulse in this field
-            let decoded_sync_phase = cursor as f64 + recon.sync_phase as f64;
-            if let Some(nearest_pulse) = fixture
-                .ground_truth_pulses
-                .iter()
-                .filter(|p| p.kind == orecchiette_fpv_drone_analog_rs::vbi::PulseKind::Horizontal)
-                .min_by(|a, b| {
-                    (a.center_sample - decoded_sync_phase)
-                        .abs()
-                        .partial_cmp(&(b.center_sample - decoded_sync_phase).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                let err = (nearest_pulse.center_sample - decoded_sync_phase).abs();
-                h_errors.push(err);
-            }
-
-            cursor += consumed.max(samples_per_field / 2);
+        if available_samples < fixture.demod.len() {
+            // Simulate stream progression: next chunk arrives
+            available_samples = (available_samples + chunk_size).min(fixture.demod.len());
         } else {
-            // Advance by half a field if no frame decoded
-            cursor += samples_per_field / 2;
+            // End of fixture stream reached; check if unconsumed region exceeds live capacity
+            if available_samples.saturating_sub(consumed_cursor) > live_region_cap {
+                consumed_cursor = available_samples.saturating_sub(keep_on_skip);
+            } else {
+                break;
+            }
         }
     }
     let cpu_time_s = start_time.elapsed().as_secs_f64();
 
     h_errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p95_h_error_samples = if !h_errors.is_empty() {
+    let p95_h_error_tbc_samples = if !h_errors.is_empty() {
         let idx = ((h_errors.len() as f64 * 0.95) as usize).min(h_errors.len() - 1);
         h_errors[idx]
     } else {
@@ -148,7 +216,7 @@ fn run_scenario(sc: &Scenario) -> ScenarioResult {
         fields_decoded,
         first_field_sample,
         mean_sync_quality,
-        p95_h_error_samples,
+        p95_h_error_tbc_samples,
         signal_duration_s,
         cpu_time_s,
         cpu_ratio,
@@ -156,9 +224,28 @@ fn run_scenario(sc: &Scenario) -> ScenarioResult {
 }
 
 fn main() {
+    let commit_analog = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let commit_viewer = std::process::Command::new("git")
+        .args(["-C", "../fpv-viewer-rs", "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+
     println!("════════════════════════════════════════════════════════════════════════════════");
     println!(" NTSC/PAL Sync Recovery Baseline Sweep");
-    println!(" Commit Analog: 5c9232b | Commit Viewer: bf93c8c | Seed: 42");
+    println!(
+        " Commit Analog: {} | Commit Viewer: {} | Seed Formula: 0x1234_5678_9abc_def0 ^ ...",
+        commit_analog,
+        commit_viewer.as_deref().unwrap_or("n/a")
+    );
     println!("════════════════════════════════════════════════════════════════════════════════");
 
     let scenarios = vec![
@@ -300,11 +387,11 @@ fn main() {
     ];
 
     println!(
-        "{:<30} | {:>6} | {:>6} | {:>8} | {:>8} | {:>8}",
-        "Scenario", "Gen", "Dec", "SyncQ", "P95 H-Err", "CPU s/s"
+        "{:<30} | {:>6} | {:>6} | {:>8} | {:>9} | {:>8}",
+        "Scenario", "Gen", "Dec", "SyncQ", "P95 TBCpx", "CPU s/s"
     );
     println!(
-        "{:-<30}-+-{:-<6}-+-{:-<6}-+-{:-<8}-+-{:-<8}-+-{:-<8}",
+        "{:-<30}-+-{:-<6}-+-{:-<6}-+-{:-<8}-+-{:-<9}-+-{:-<8}",
         "", "", "", "", "", ""
     );
 
@@ -312,52 +399,33 @@ fn main() {
     for sc in &scenarios {
         let res = run_scenario(sc);
         println!(
-            "{:<30} | {:>6} | {:>6} | {:>8.3} | {:>8.2} | {:>8.4}",
+            "{:<30} | {:>6} | {:>6} | {:>8.3} | {:>9.2} | {:>8.4}",
             res.name,
             res.fields_generated,
             res.fields_decoded,
             res.mean_sync_quality,
-            res.p95_h_error_samples,
+            res.p95_h_error_tbc_samples,
             res.cpu_ratio
         );
         results.push(res);
     }
 
+    let report = SweepReport {
+        commit_analog,
+        commit_viewer,
+        target_os: std::env::consts::OS.to_string(),
+        target_arch: std::env::consts::ARCH.to_string(),
+        generator_configuration: GeneratorProvenance {
+            test_pattern: "Flat(50.0)",
+            deviation_hz: 3_000_000.0,
+            seed_derivation: "0x1234_5678_9abc_def0 ^ (out_len * 0x9e3779b97f4a7c15)",
+        },
+        results,
+    };
+
     println!("\n════════════════════════════════════════════════════════════════════════════════");
     println!(" Structured JSON Output");
     println!("════════════════════════════════════════════════════════════════════════════════");
-
-    println!("{{");
-    println!("  \"commit_analog\": \"5c9232b\",");
-    println!("  \"commit_viewer\": \"bf93c8c\",");
-    println!("  \"seed\": 42,");
-    println!("  \"target_os\": {:?},", std::env::consts::OS);
-    println!("  \"target_arch\": {:?},", std::env::consts::ARCH);
-    println!("  \"results\": [");
-    for (i, r) in results.iter().enumerate() {
-        let comma = if i + 1 < results.len() { "," } else { "" };
-        println!("    {{");
-        println!("      \"name\": {:?},", r.name);
-        println!("      \"is_pal\": {},", r.is_pal);
-        println!("      \"sample_rate\": {},", r.sample_rate);
-        println!("      \"clock_error_ppm\": {},", r.clock_error_ppm);
-        println!("      \"fields_generated\": {},", r.fields_generated);
-        println!("      \"fields_decoded\": {},", r.fields_decoded);
-        println!("      \"first_field_sample\": {:?},", r.first_field_sample);
-        println!("      \"mean_sync_quality\": {:.4},", r.mean_sync_quality);
-        println!(
-            "      \"p95_h_error_samples\": {:.4},",
-            if r.p95_h_error_samples.is_nan() {
-                -1.0
-            } else {
-                r.p95_h_error_samples
-            }
-        );
-        println!("      \"signal_duration_s\": {:.4},", r.signal_duration_s);
-        println!("      \"cpu_time_s\": {:.4},", r.cpu_time_s);
-        println!("      \"cpu_ratio\": {:.5}", r.cpu_ratio);
-        println!("    }}{}", comma);
-    }
-    println!("  ]");
-    println!("}}");
+    let json_output = serde_json::to_string_pretty(&report).expect("Valid JSON serialization");
+    println!("{}", json_output);
 }

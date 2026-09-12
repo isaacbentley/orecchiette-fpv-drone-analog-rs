@@ -983,6 +983,7 @@ dependencies = [
  "rayon",
  "rustfft",
  "serde",
+ "serde_json",
  "wgpu",
  "wide",
 ]
