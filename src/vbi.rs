@@ -39,6 +39,33 @@ pub enum FieldParity {
     Second,
 }
 
+impl FieldParity {
+    #[inline]
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::First => Self::Second,
+            Self::Second => Self::First,
+        }
+    }
+
+    #[inline]
+    pub const fn from_index(idx: usize) -> Self {
+        if idx.is_multiple_of(2) {
+            Self::First
+        } else {
+            Self::Second
+        }
+    }
+
+    #[inline]
+    pub const fn to_index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
+}
+
 pub mod consts {
     //! Timing constants, in seconds and line-counts, for NTSC and PAL
     //! vertical sync. See the module-level doc for how these were

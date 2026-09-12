@@ -508,6 +508,7 @@ pub struct FrameReconstructor {
     /// [`DROPOUT_EXIT_THRESHOLD`], so a marginal-SNR field hovering at
     /// the threshold doesn't flicker the denoise mode frame to frame.
     in_dropout: bool,
+    pub(crate) timing_tracker: crate::timing::TimingTracker,
 }
 
 #[inline]
@@ -809,7 +810,18 @@ impl FrameReconstructor {
             history: FrameHistory::new(DEFAULT_TEMPORAL_WINDOW, field_pixels),
             field_counter: 0,
             in_dropout: false,
+            timing_tracker: crate::timing::TimingTracker::new(sample_rate, is_pal),
         }
+    }
+
+    /// Access the internal persistent timing and holdover tracker.
+    pub fn timing_tracker(&self) -> &crate::timing::TimingTracker {
+        &self.timing_tracker
+    }
+
+    /// Access mutable reference to internal timing tracker.
+    pub fn timing_tracker_mut(&mut self) -> &mut crate::timing::TimingTracker {
+        &mut self.timing_tracker
     }
 
     /// Override the temporal history window size. Default is
@@ -862,6 +874,8 @@ impl FrameReconstructor {
         // reacquisition costs vertical detail for one field rather than
         // showing black bars.
         self.interlace_reacquiring = true;
+        let next_epoch = self.timing_tracker.continuity_epoch.wrapping_add(1);
+        self.timing_tracker.reset_discontinuity(next_epoch);
     }
 
     /// Builder-style: returns `self` so callers can chain with
@@ -997,11 +1011,78 @@ impl FrameReconstructor {
         Some((frame, consumed))
     }
 
+    /// Reconstruct one field into `frame`.
+    ///
+    /// Synchronous convenience entry point. Returns `Some(consumed_samples)` if a
+    /// field was successfully decoded and rendered into `frame`, or `None` if
+    /// sync could not be acquired or the input was invalid.
     pub fn reconstruct_frame_into(
         &mut self,
         demod_data: &[f32],
         frame: &mut [u32],
     ) -> Option<usize> {
+        self.reconstruct_field_internal(demod_data, frame, 0)
+            .map(|(consumed, _timing)| consumed)
+    }
+
+    /// Reconstruct one field from a timestamped demodulation slice.
+    ///
+    /// Streaming entry point with monotonic sample indices, explicit continuity
+    /// epochs, and holdover tracking.
+    pub fn reconstruct_timed_into(
+        &mut self,
+        slice: crate::timing::TimedDemodSlice<'_>,
+        frame: &mut [u32],
+    ) -> Result<crate::timing::DecodeStep, crate::timing::DecodeValidationError> {
+        if slice.samples.is_empty() {
+            return Err(crate::timing::DecodeValidationError::EmptyBuffer);
+        }
+        if frame.len() != self.width * self.height {
+            return Err(crate::timing::DecodeValidationError::FrameBufferTooSmall {
+                required: self.width * self.height,
+                actual: frame.len(),
+            });
+        }
+
+        let is_discontinuous = slice.is_discontinuous
+            || (self.timing_tracker.is_locked
+                && slice.first_sample != self.timing_tracker.last_processed_sample);
+        if is_discontinuous {
+            self.forget_history();
+        }
+
+        if let Some((consumed, timing)) =
+            self.reconstruct_field_internal(slice.samples, frame, slice.first_sample)
+        {
+            self.timing_tracker.last_processed_sample = slice.first_sample + consumed as u64;
+            Ok(crate::timing::DecodeStep::Advance {
+                consumed_samples: consumed,
+                field: Some(timing),
+            })
+        } else {
+            let min_required = self.samples_per_line * (self.field_lines / 2);
+            if slice.samples.len() < min_required {
+                Ok(crate::timing::DecodeStep::NeedMoreData {
+                    consumed_samples: 0,
+                })
+            } else {
+                let advance_step = (self.samples_per_line * 8).min(slice.samples.len());
+                self.timing_tracker.last_processed_sample =
+                    slice.first_sample + advance_step as u64;
+                Ok(crate::timing::DecodeStep::Advance {
+                    consumed_samples: advance_step,
+                    field: None,
+                })
+            }
+        }
+    }
+
+    fn reconstruct_field_internal(
+        &mut self,
+        demod_data: &[f32],
+        frame: &mut [u32],
+        slice_first_sample: u64,
+    ) -> Option<(usize, crate::timing::FieldTiming)> {
         if demod_data.is_empty() {
             return None;
         }
@@ -1085,6 +1166,7 @@ impl FrameReconstructor {
 
         let first_sync_center;
         let required_samples;
+        let vbi_offset_sample: f64;
         if let Some(info) = &vbi_info {
             if let Some(parity) = info.parity {
                 self.field_parity = match parity {
@@ -1095,6 +1177,7 @@ impl FrameReconstructor {
             first_sync_center = info.field_active_start;
             required_samples = (info.field_active_start.max(0.0) as usize)
                 + self.samples_per_line * (self.field_lines + 2);
+            vbi_offset_sample = info.broad_start as f64;
             if self.debug_dump {
                 let _ = writeln!(
                     std::io::stdout(),
@@ -1138,6 +1221,7 @@ impl FrameReconstructor {
                 }
             }
             let v_idx = v_sync_idx?;
+            vbi_offset_sample = v_idx as f64;
             required_samples = v_idx + self.samples_per_line * (20 + self.field_lines + 2);
             if demod_data.len() >= required_samples {
                 // Search for first H-sync tip after V-sync + blanking lines.
@@ -2294,8 +2378,27 @@ impl FrameReconstructor {
         // `line_period > samples_per_line` and the buffer is only just long
         // enough, `consumed` can land a fraction of a line past
         // `demod_data.len()`. The caller advances its cursor by `consumed`
-        // and re-slices `[consumed..]`, so an overshoot would panic. Clamp.
-        Some(consumed.min(demod_data.len()))
+        let parity = crate::vbi::FieldParity::from_index(rendered_parity as usize);
+        let has_observed_timing_evidence = vbi_info.is_some() && sync_quality >= 0.5;
+        let timing = crate::timing::FieldTiming {
+            origin_sample: slice_first_sample,
+            vbi_sample_offset: vbi_offset_sample,
+            line_period_samples: self.line_period as f64,
+            parity,
+            has_observed_timing_evidence,
+            coasted_field_count: 0,
+            confidence: sync_quality,
+            uncertainty_seconds: 0.0,
+        };
+        if has_observed_timing_evidence {
+            self.timing_tracker.record_observed_field(
+                slice_first_sample,
+                vbi_offset_sample,
+                self.line_period as f64,
+                parity,
+            );
+        }
+        Some((consumed.min(demod_data.len()), timing))
     }
 
     pub fn save_ppm_frame(&self, frame: &[u32], path: &str) -> std::io::Result<()> {

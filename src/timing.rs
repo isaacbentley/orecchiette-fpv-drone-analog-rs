@@ -201,3 +201,195 @@ impl CalibratedCoordinateMap {
         (self.back_porch_s * self.sample_rate as f64).round() as usize
     }
 }
+
+use crate::vbi::FieldParity;
+
+/// Timed demodulation slice with monotonic sample origin and continuity metadata.
+#[derive(Debug, Clone)]
+pub struct TimedDemodSlice<'a> {
+    pub samples: &'a [f32],
+    pub first_sample: u64,
+    pub sample_rate: u32,
+    pub is_discontinuous: bool,
+}
+
+impl<'a> TimedDemodSlice<'a> {
+    pub fn new(
+        samples: &'a [f32],
+        first_sample: u64,
+        sample_rate: u32,
+        is_discontinuous: bool,
+    ) -> Self {
+        Self {
+            samples,
+            first_sample,
+            sample_rate,
+            is_discontinuous,
+        }
+    }
+}
+
+/// Timing and lock telemetry for a decoded field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldTiming {
+    /// Monotonic sample index origin of the slice where this field was found.
+    pub origin_sample: u64,
+    /// Offset in samples from `origin_sample` to the VBI serration anchor.
+    pub vbi_sample_offset: f64,
+    /// Measured or tracked line period in samples.
+    pub line_period_samples: f64,
+    /// Interlace field parity.
+    pub parity: FieldParity,
+    /// True if qualified VBI pulses and horizontal sync grid were observed directly.
+    pub has_observed_timing_evidence: bool,
+    /// Number of consecutive fields generated via holdover/coasting without observed VBI.
+    pub coasted_field_count: u32,
+    /// Field sync confidence metric in [0.0, 1.0].
+    pub confidence: f32,
+    /// Estimated timing uncertainty accumulated in seconds.
+    pub uncertainty_seconds: f64,
+}
+
+/// Result of a timed decode step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecodeStep {
+    Advance {
+        consumed_samples: usize,
+        field: Option<FieldTiming>,
+    },
+    NeedMoreData {
+        consumed_samples: usize,
+    },
+}
+
+/// Validation errors returned by `reconstruct_timed_into`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeValidationError {
+    EmptyBuffer,
+    FrameBufferTooSmall { required: usize, actual: usize },
+    DiscontinuousBuffer,
+}
+
+impl std::fmt::Display for DecodeValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyBuffer => write!(f, "input demodulation slice is empty"),
+            Self::FrameBufferTooSmall { required, actual } => {
+                write!(
+                    f,
+                    "frame buffer too small: required {required}, actual {actual}"
+                )
+            }
+            Self::DiscontinuousBuffer => write!(f, "stream discontinuity was detected"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeValidationError {}
+
+/// Persistent timing and holdover tracker across fields.
+///
+/// Timestamps are preserved using an integer sample anchor (`anchor_sample`)
+/// plus a fractional sub-sample offset (`fractional_offset`). Predictions are
+/// derived from the unrounded anchor plus elapsed half-lines to eliminate
+/// cumulative rounding drift over long sequences.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimingTracker {
+    pub is_pal: bool,
+    pub sample_rate: u32,
+    pub anchor_sample: u64,
+    pub fractional_offset: f64,
+    pub elapsed_half_lines: u64,
+    pub line_period: f64,
+    pub field_parity: FieldParity,
+    pub coasted_fields: u32,
+    pub h_sync_coasted_fields: u32,
+    pub continuity_epoch: u64,
+    pub last_processed_sample: u64,
+    pub uncertainty_seconds: f64,
+    pub is_locked: bool,
+}
+
+impl TimingTracker {
+    pub fn new(sample_rate: u32, is_pal: bool) -> Self {
+        let nominal_period = nominal_line_period_samples(sample_rate, is_pal);
+        Self {
+            is_pal,
+            sample_rate,
+            anchor_sample: 0,
+            fractional_offset: 0.0,
+            elapsed_half_lines: 0,
+            line_period: nominal_period,
+            field_parity: FieldParity::First,
+            coasted_fields: 0,
+            h_sync_coasted_fields: 0,
+            continuity_epoch: 0,
+            last_processed_sample: 0,
+            uncertainty_seconds: 0.0,
+            is_locked: false,
+        }
+    }
+
+    #[inline]
+    pub fn half_lines_per_field(&self) -> usize {
+        Standard::from_is_pal(self.is_pal).half_lines_per_field()
+    }
+
+    /// Calculate predicted VBI serration sample as an absolute unrounded sample index.
+    #[inline]
+    pub fn predict_vbi_sample_absolute(&self) -> f64 {
+        self.anchor_sample as f64
+            + self.fractional_offset
+            + (self.elapsed_half_lines as f64) * (self.line_period * 0.5)
+    }
+
+    /// Calculate slice-relative predicted VBI sample as an `f32`.
+    #[inline]
+    pub fn predict_vbi_sample_relative(&self, slice_first_sample: u64) -> f32 {
+        (self.predict_vbi_sample_absolute() - slice_first_sample as f64) as f32
+    }
+
+    /// Record an observed field with qualified VBI and H-sync evidence.
+    pub fn record_observed_field(
+        &mut self,
+        slice_first_sample: u64,
+        vbi_sample_offset: f64,
+        line_period: f64,
+        parity: FieldParity,
+    ) {
+        let abs_vbi = slice_first_sample as f64 + vbi_sample_offset;
+        let floor_sample = abs_vbi.floor();
+        self.anchor_sample = floor_sample.max(0.0) as u64;
+        self.fractional_offset = abs_vbi - floor_sample;
+        self.elapsed_half_lines = 0;
+        self.line_period = line_period;
+        self.field_parity = parity;
+        self.coasted_fields = 0;
+        self.h_sync_coasted_fields = 0;
+        self.uncertainty_seconds = 0.0;
+        self.is_locked = true;
+    }
+
+    /// Advance tracker by one field when coasting/holdover is active.
+    pub fn advance_predicted_field(&mut self) {
+        self.elapsed_half_lines += self.half_lines_per_field() as u64;
+        self.field_parity = self.field_parity.toggle();
+        self.coasted_fields += 1;
+        let field_duration_s = (self.half_lines_per_field() as f64 * 0.5)
+            / Standard::from_is_pal(self.is_pal).nominal_line_hz();
+        // Accumulate uncertainty with 50 ppm drift estimate
+        self.uncertainty_seconds += field_duration_s * 50e-6;
+    }
+
+    /// Reset tracking state upon stream discontinuity or gap.
+    pub fn reset_discontinuity(&mut self, new_epoch: u64) {
+        self.is_locked = false;
+        self.anchor_sample = 0;
+        self.fractional_offset = 0.0;
+        self.elapsed_half_lines = 0;
+        self.coasted_fields = 0;
+        self.h_sync_coasted_fields = 0;
+        self.uncertainty_seconds = 0.0;
+        self.continuity_epoch = new_epoch;
+    }
+}

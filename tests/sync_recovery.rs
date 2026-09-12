@@ -5,6 +5,7 @@ use orecchiette_fpv_drone_analog_rs::synthetic::{
     ExtendedSyntheticConfig, ImpairmentSchedule, SyntheticVideoConfig, TestPattern,
     generate_extended_fixture,
 };
+use orecchiette_fpv_drone_analog_rs::timing::{DecodeStep, DecodeValidationError, TimedDemodSlice};
 use orecchiette_fpv_drone_analog_rs::vbi::{FieldParity, PulseKind};
 use orecchiette_fpv_drone_analog_rs::video::FrameReconstructor;
 
@@ -258,5 +259,166 @@ fn baseline_pure_noise_rejection() {
     assert!(
         res.is_none(),
         "Pure noise must never achieve field lock in baseline"
+    );
+}
+
+#[test]
+fn timed_reconstruct_validation_errors() {
+    let sample_rate = 15_360_000;
+    let mut recon = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0u32; recon.width * recon.height];
+
+    // Empty buffer error
+    let empty_slice = TimedDemodSlice::new(&[], 0, sample_rate, false);
+    let res = recon.reconstruct_timed_into(empty_slice, &mut frame);
+    assert_eq!(res, Err(DecodeValidationError::EmptyBuffer));
+
+    // Frame buffer too small error
+    let dummy_samples = vec![0.0f32; 1000];
+    let slice = TimedDemodSlice::new(&dummy_samples, 0, sample_rate, false);
+    let mut small_frame = vec![0u32; 10];
+    let res = recon.reconstruct_timed_into(slice, &mut small_frame);
+    assert_eq!(
+        res,
+        Err(DecodeValidationError::FrameBufferTooSmall {
+            required: recon.width * recon.height,
+            actual: 10,
+        })
+    );
+}
+
+#[test]
+fn timed_reconstruct_pure_noise_and_short_slices() {
+    let sample_rate = 15_360_000;
+    let mut recon = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0u32; recon.width * recon.height];
+
+    // Very short slice -> NeedMoreData { consumed_samples: 0 }
+    let short_samples = vec![0.0f32; 500];
+    let short_slice = TimedDemodSlice::new(&short_samples, 0, sample_rate, false);
+    let res = recon.reconstruct_timed_into(short_slice, &mut frame);
+    assert_eq!(
+        res,
+        Ok(DecodeStep::NeedMoreData {
+            consumed_samples: 0
+        })
+    );
+
+    // Long pure noise -> Advance with field: None (safe non-blocking drain)
+    let mut rng = 0xbeef_cafe_1234_5678u64;
+    let noise: Vec<f32> = (0..sample_rate as usize / 10)
+        .map(|_| orecchiette_fpv_drone_analog_rs::synthetic::gaussian_noise(&mut rng) * 0.5)
+        .collect();
+    let noise_slice = TimedDemodSlice::new(&noise, 10_000, sample_rate, false);
+    let res = recon.reconstruct_timed_into(noise_slice, &mut frame);
+    match res {
+        Ok(DecodeStep::Advance {
+            consumed_samples,
+            field,
+        }) => {
+            assert!(
+                consumed_samples > 0,
+                "Noise slice must consume samples to prevent freezing"
+            );
+            assert!(
+                field.is_none(),
+                "Noise slice must not produce a decoded field"
+            );
+        }
+        other => panic!("Expected Advance with None field on noise, got {other:?}"),
+    }
+}
+
+#[test]
+fn timed_reconstruct_clean_ntsc_and_idempotence() {
+    let sample_rate = 15_360_000;
+    let base = SyntheticVideoConfig {
+        sample_rate,
+        is_pal: false,
+        deviation_hz: 3_000_000.0,
+        pattern: TestPattern::Bars,
+        start_field: FieldParity::First,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    };
+    let cfg = ExtendedSyntheticConfig::new(base);
+    let fixture = generate_extended_fixture(&cfg, 2);
+
+    let mut recon1 = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut recon2 = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame1 = vec![0u32; recon1.width * recon1.height];
+    let mut frame2 = vec![0u32; recon2.width * recon2.height];
+
+    let slice1 = TimedDemodSlice::new(&fixture.demod, 1_000_000, sample_rate, false);
+    let slice2 = TimedDemodSlice::new(&fixture.demod, 1_000_000, sample_rate, false);
+
+    let res1 = recon1.reconstruct_timed_into(slice1, &mut frame1).unwrap();
+    let res2 = recon2.reconstruct_timed_into(slice2, &mut frame2).unwrap();
+
+    // Idempotence: both reconstructors produce identical results
+    assert_eq!(res1, res2, "Reconstruction must be deterministic");
+    assert_eq!(
+        frame1, frame2,
+        "Decoded frames must be byte-for-byte identical"
+    );
+
+    // Check telemetry fields
+    match res1 {
+        DecodeStep::Advance {
+            consumed_samples,
+            field: Some(timing),
+        } => {
+            assert!(consumed_samples > 0);
+            assert_eq!(timing.origin_sample, 1_000_000);
+            assert!(timing.has_observed_timing_evidence);
+            assert!(timing.confidence >= 0.90);
+            assert_eq!(timing.coasted_field_count, 0);
+            assert!(recon1.timing_tracker().is_locked);
+            assert_eq!(
+                recon1.timing_tracker().last_processed_sample,
+                1_000_000 + consumed_samples as u64
+            );
+        }
+        other => panic!("Expected Advance with Some(field), got {other:?}"),
+    }
+}
+
+#[test]
+fn timed_reconstruct_handles_discontinuity() {
+    let sample_rate = 15_360_000;
+    let base = SyntheticVideoConfig {
+        sample_rate,
+        is_pal: false,
+        deviation_hz: 3_000_000.0,
+        pattern: TestPattern::Bars,
+        start_field: FieldParity::First,
+        noise_sigma: 0.0,
+        dc_offset: 0.0,
+    };
+    let cfg = ExtendedSyntheticConfig::new(base);
+    let fixture = generate_extended_fixture(&cfg, 2);
+
+    let mut recon = FrameReconstructor::new(sample_rate, false, 3_000_000.0, false);
+    let mut frame = vec![0u32; recon.width * recon.height];
+
+    // Field 0: normal decode
+    let slice0 = TimedDemodSlice::new(&fixture.demod, 0, sample_rate, false);
+    let res0 = recon.reconstruct_timed_into(slice0, &mut frame).unwrap();
+    let consumed0 = match res0 {
+        DecodeStep::Advance {
+            consumed_samples, ..
+        } => consumed_samples,
+        _ => panic!("Expected field 0 to decode"),
+    };
+    assert_eq!(recon.timing_tracker().continuity_epoch, 0);
+
+    // Discontinuous slice with explicit flag: epoch must increment and history reset
+    let slice1 = TimedDemodSlice::new(&fixture.demod[consumed0..], 5_000_000, sample_rate, true);
+    let res1 = recon.reconstruct_timed_into(slice1, &mut frame).unwrap();
+    assert!(matches!(res1, DecodeStep::Advance { .. }));
+    assert_eq!(
+        recon.timing_tracker().continuity_epoch,
+        1,
+        "Epoch must increment upon discontinuity"
     );
 }
