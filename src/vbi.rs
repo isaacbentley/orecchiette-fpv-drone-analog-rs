@@ -44,23 +44,21 @@ pub mod consts {
     //! vertical sync. See the module-level doc for how these were
     //! chosen and why they're shared between the generator and parser.
 
-    /// Horizontal line rate (Hz). Matches [`crate::video::FrameReconstructor::new`]'s
-    /// `line_rate` exactly — the generator and reconstructor must agree
-    /// on this or their line-period assumptions diverge.
-    pub const NTSC_LINE_HZ: f64 = 15734.0;
-    pub const PAL_LINE_HZ: f64 = 15625.0;
+    /// Horizontal line rate (Hz).
+    pub const NTSC_LINE_HZ: f64 = crate::timing::NTSC_NOMINAL_LINE_HZ;
+    pub const PAL_LINE_HZ: f64 = crate::timing::PAL_NOMINAL_LINE_HZ;
 
     /// Total field duration, in lines. Standard values (262.5 / 312.5)
     /// — always a half-integer, which is the whole mechanism behind
     /// interlace: two fields of a half-integer line count tile into a
     /// whole-integer frame.
-    pub const NTSC_FIELD_TOTAL_LINES: f64 = 262.5;
-    pub const PAL_FIELD_TOTAL_LINES: f64 = 312.5;
+    pub const NTSC_FIELD_TOTAL_LINES: f64 = crate::timing::NTSC_FIELD_TOTAL_LINES;
+    pub const PAL_FIELD_TOTAL_LINES: f64 = crate::timing::PAL_FIELD_TOTAL_LINES;
 
     /// Active (visible) picture lines per field. Matches
     /// [`crate::video::FrameReconstructor::new`]'s `field_lines`.
-    pub const NTSC_ACTIVE_LINES: usize = 240;
-    pub const PAL_ACTIVE_LINES: usize = 288;
+    pub const NTSC_ACTIVE_LINES: usize = crate::timing::NTSC_ACTIVE_LINES;
+    pub const PAL_ACTIVE_LINES: usize = crate::timing::PAL_ACTIVE_LINES;
 
     /// Pulse counts in each of the three vertical-sync groups
     /// (pre-equalizing, serrated-broad, post-equalizing). Each pulse

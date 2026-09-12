@@ -712,8 +712,13 @@ fn robust_sync_tip_center(
 
 impl FrameReconstructor {
     pub fn new(sample_rate: u32, is_pal: bool, fm_deviation: f32, debug_dump: bool) -> Self {
-        let line_rate = if is_pal { 15625.0 } else { 15734.0 };
-        let samples_per_line = (sample_rate as f32 / line_rate).round() as usize;
+        let line_rate = if is_pal {
+            crate::timing::PAL_NOMINAL_LINE_HZ
+        } else {
+            crate::timing::NTSC_NOMINAL_LINE_HZ
+        };
+        let nominal_period = crate::timing::nominal_line_period_samples(sample_rate, is_pal);
+        let samples_per_line = nominal_period.round() as usize;
         let field_lines = if is_pal { 288 } else { 240 };
         let line_width = if is_pal { 864 } else { 858 }; // Exact standard pixels per line
         let width = 720;
@@ -721,7 +726,8 @@ impl FrameReconstructor {
 
         let field_pixels = field_lines * line_width;
 
-        let tbc_fs = line_width as f32 / (if is_pal { 64.0e-6 } else { 63.5555e-6 });
+        let line_duration_s = 1.0 / line_rate;
+        let tbc_fs = line_width as f32 / line_duration_s as f32;
 
         let w0 =
             2.0 * std::f32::consts::PI * (if is_pal { 4.43361875e6 } else { 3.579545e6 }) / tbc_fs;
@@ -786,7 +792,7 @@ impl FrameReconstructor {
             temporal_enabled: DEFAULT_TEMPORAL_WINDOW > 1,
             interlace_reacquiring: false,
             sync_phase: 0.0,
-            line_period: samples_per_line as f32,
+            line_period: nominal_period as f32,
             period_history: Vec::with_capacity(8),
 
             notch_b0,

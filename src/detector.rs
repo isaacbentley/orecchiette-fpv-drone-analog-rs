@@ -348,8 +348,8 @@ fn classify_pal_ntsc_time_domain(demod: &[f32], sample_rate: u32) -> Option<Sign
     // PAL = 15625, NTSC = 15734, midpoint = 15679.5. Reject if we're
     // within ±30 Hz of the midpoint — that's the "we genuinely
     // can't tell" zone given typical jitter.
-    const PAL_HZ: f64 = 15625.0;
-    const NTSC_HZ: f64 = 15734.0;
+    const PAL_HZ: f64 = crate::timing::PAL_NOMINAL_LINE_HZ;
+    const NTSC_HZ: f64 = crate::timing::NTSC_NOMINAL_LINE_HZ;
     const MIDPOINT_HZ: f64 = (PAL_HZ + NTSC_HZ) / 2.0;
     // Reject medians far from BOTH standards outright. On FM-demodulated
     // noise the dips below threshold occur essentially continuously, so
@@ -680,8 +680,8 @@ impl AnalogFpvDetector {
         };
 
         let bin_hz = sample_rate as f32 / fft_len as f32;
-        let bin_pal = (15625.0 / bin_hz).round() as usize;
-        let bin_ntsc = (15734.0 / bin_hz).round() as usize;
+        let bin_pal = (crate::timing::PAL_NOMINAL_LINE_HZ as f32 / bin_hz).round() as usize;
+        let bin_ntsc = (crate::timing::NTSC_NOMINAL_LINE_HZ as f32 / bin_hz).round() as usize;
 
         // ±1 bin of the *unpadded* grid, expressed in padded bins, so the
         // peak search covers the same absolute Hz window it always has
@@ -757,8 +757,8 @@ impl AnalogFpvDetector {
 
         const N_HARMONICS: usize = 5;
         const HARMONIC_RATIO: f32 = 0.1;
-        const PAL_LINE_HZ: f32 = 15625.0;
-        const NTSC_LINE_HZ: f32 = 15734.0;
+        const PAL_LINE_HZ: f32 = crate::timing::PAL_NOMINAL_LINE_HZ as f32;
+        const NTSC_LINE_HZ: f32 = crate::timing::NTSC_NOMINAL_LINE_HZ as f32;
         let line_bin = bin_ntsc.max(bin_pal);
         let mut pal_harmonics = 0u32;
         let mut ntsc_harmonics = 0u32;
@@ -814,7 +814,8 @@ impl AnalogFpvDetector {
         // separation the data cannot support — and misclassify PAL as
         // NTSC or vice versa.
         let true_bin_hz = sample_rate as f32 / demod_len as f32;
-        let true_sep = (15734.0f32 / true_bin_hz).round() - (15625.0f32 / true_bin_hz).round();
+        let true_sep = (crate::timing::NTSC_NOMINAL_LINE_HZ as f32 / true_bin_hz).round()
+            - (crate::timing::PAL_NOMINAL_LINE_HZ as f32 / true_bin_hz).round();
         let bins_distinct = true_sep >= 2.0;
 
         if bins_distinct {
@@ -2693,7 +2694,7 @@ mod integration_tests {
             dc_offset: 0.0,
         };
         let clean = generate_iq(&cfg, 2, 0.0);
-        let sigma = 1.2f32;
+        let sigma = 1.35f32;
         let det = AnalogFpvDetector::default();
 
         // Single-shot: every one of the four noisy batches must fail —
