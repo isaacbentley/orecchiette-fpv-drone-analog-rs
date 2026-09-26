@@ -1,5 +1,10 @@
 # orecchiette-fpv-drone-analog-rs
 
+> **Moved to [Specola](https://github.com/isaacbentley/specola).** This repository now lives at
+> [`crates/fpv-drone-analog`](https://github.com/isaacbentley/specola/tree/main/crates/fpv-drone-analog) (package `fpv-drone-analog`), with its full
+> history; its tags there carry a prefix. Development continues there, and this repository is
+> no longer updated.
+
 [![CI](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-fpv-drone-analog-rs/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/isaacbentley/orecchiette-fpv-drone-analog-rs)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-fpv-drone-analog-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
